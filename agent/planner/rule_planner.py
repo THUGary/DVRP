@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Deque, List, Tuple
+from typing import Deque, List, Tuple, Optional
 from collections import deque
 from .base import BasePlanner, AgentState, Target
 
@@ -10,23 +10,27 @@ class RuleBasedPlanner(BasePlanner):
 	Assign agents one by one. For each agent, pick the nearest available demand
 	(not yet assigned in this planning call). If no demand remains, send to depot.
 	Returns a queue (length 1) per agent.
+	
+	节点数据结构: (x, y, t_arrival, t_due, demand)
 	"""
 
 	def plan(
 		self,
-		observations: List[Tuple[int, int, int, int]],
+		observations: List[Tuple[int, int, int, int, int]],  # [(x, y, t_arrival, c, t_due), ...]
 		agent_states: List[AgentState],
 		depot: Tuple[int, int],
 		t: int,
 		horizon: int = 1,
+		current_plans: Optional[List[Deque[Target]]] = None,
+		global_nodes: Optional[List[Tuple[int, int, int, int, int]]] = None,
+		serve_mark: Optional[List[int]] = None,
+		unserved_count: Optional[int] = None,
 	) -> List[Deque[Target]]:
+		
 		# Build unique set of demand coordinates only (ignore duplicates on same cell)
-		# Compatible with obs tuple length 4 or 5: (x,y,t,c) or (x,y,t,c,end_t)
 		available: List[Target] = []
 		seen = set()
-		for d in observations:
-			# unpack first 4 fields
-			x, y, _t, c = d[:4]
+		for (x, y, t_arrival, c, t_due) in observations:
 			if c <= 0:
 				continue
 			key = (x, y)

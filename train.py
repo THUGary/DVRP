@@ -8,6 +8,7 @@ from agent.generator import RuleBasedGenerator
 from agent.planner import RuleBasedPlanner
 from agent.controller import RuleBasedController
 from utils.pygame_renderer import PygameRenderer
+from utils.state_manager import PlanningState, update_planning_state
 
 
 def build_env(cfg: Config) -> Tuple[GridEnvironment, RuleBasedGenerator, RuleBasedPlanner, RuleBasedController]:
@@ -34,25 +35,61 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10)
 	done = False
 	step = 0
 	renderer = None
+	
+	# 初始化规划状态管理器
+	planning_state = PlanningState()
+	planning_state.reset(cfg.num_agents)
+	
+	# 记录上一步的需求，用于检测新增需求
+	prev_demands = []
+	
 	if render:
 		renderer = PygameRenderer(cfg.width, cfg.height)
 		renderer.init()
+	
 	while not done:
-		# Plan targets using current observation
+		# 检测新增的需求
+		# obs["demands"] 格式: [(x, y, t, c, end_t), ...]
+		current_demands = obs["demands"]
+		new_demands = [d for d in current_demands if d not in prev_demands]
+		
+		# 更新规划状态（在规划之前）
 		agent_states = obs["agent_states"]  # list of (x,y,s)
+		update_planning_state(
+			planning_state=planning_state,
+			agent_states=agent_states,
+			new_demands=new_demands,
+			obs_demands=current_demands,
+		)
+		
+		# Plan targets using current observation with enhanced information
 		agents = [type("S", (), {"x": x, "y": y, "s": s}) for (x, y, s) in agent_states]
 		targets = planner.plan(
-			observations=obs["demands"],
-			agent_states=agents,  # uses x,y,s only
+			observations=obs["demands"],  # [(x, y, t_arrival, c, t_due), ...]
+			agent_states=agents,
 			depot=obs["depot"],
 			t=obs["time"],
 			horizon=1,
+			current_plans=planning_state.current_plans,  # 新增：当前规划路径
+			global_nodes=planning_state.global_nodes.nodes,  # 新增：全局节点列表 [(x, y, t_arrival, t_due, demand), ...]
+			serve_mark=planning_state.global_nodes.serve_mark,  # 新增：服务标记
+			unserved_count=planning_state.get_unserved_count(),  # 新增：未服务节点数量
 		)
+		
+		# 更新规划结果到状态管理器
+		planning_state.update_plans(targets)
+		
 		# Controller decides per-agent move
 		actions: List[Tuple[int, int]] = []
 		for i, (x, y, s) in enumerate(agent_states):
 			actions.append(controller.act((x, y), targets[i]))
+		
+		# 执行动作并更新环境
 		obs, reward, done, info = env.step(actions)
+		
+		# 更新上一步的需求记录
+		prev_demands = list(current_demands)
+		
 		if renderer is not None:
 			if not renderer.render(obs):
 				break
@@ -63,7 +100,8 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10)
 		total_reward += reward
 		step += 1
 		if step % 10 == 0 or done:
-			print(f"Step {step:03d} | time={obs['time']} | reward={reward:.0f} | total={total_reward:.0f} | demands={len(obs['demands'])}")
+			unserved = planning_state.get_unserved_count()
+			print(f"Step {step:03d} | time={obs['time']} | reward={reward:.0f} | total={total_reward:.0f} | demands={len(obs['demands'])} | unserved={unserved}")
 	print(f"Episode done in {step} steps. Total reward={total_reward:.0f}")
 	if renderer is not None:
 		renderer.close()
