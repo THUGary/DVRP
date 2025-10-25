@@ -5,13 +5,16 @@ from typing import List, Tuple
 from configs import get_default_config, Config
 from environment.env import GridEnvironment
 from agent.generator import RuleBasedGenerator
-from agent.planner import RuleBasedPlanner
 from agent.controller import RuleBasedController
 from utils.pygame_renderer import PygameRenderer
 from utils.state_manager import PlanningState, update_planning_state
 
+from agent.planner import RuleBasedPlanner
+from agent.planner import FastReactiveInserter
+from agent.planner import RepairBasedStabilityOptimizer
+from agent.planner import DistributedCooperativePlanner
 
-def build_env(cfg: Config) -> Tuple[GridEnvironment, RuleBasedGenerator, RuleBasedPlanner, RuleBasedController]:
+def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, RuleBasedGenerator, RuleBasedPlanner, RuleBasedController]:
 	gen = RuleBasedGenerator(cfg.width, cfg.height, **cfg.generator_params)
 	env = GridEnvironment(
 		width=cfg.width,
@@ -23,13 +26,27 @@ def build_env(cfg: Config) -> Tuple[GridEnvironment, RuleBasedGenerator, RuleBas
 		max_time=cfg.max_time,
 	)
 	env.num_agents = cfg.num_agents
-	planner = RuleBasedPlanner(**cfg.planner_params)
+	if planner_type == "greedy":
+		# 使用 Rule-based Planner
+		planner = RuleBasedPlanner(**cfg.planner_params)
+	elif planner_type == "fri":
+		# 使用 Fast Reactive Inserter
+		planner = FastReactiveInserter()
+	elif planner_type == "rbso":
+		# 使用 Repair-based Stability Optimizer（带参数）
+		planner = RepairBasedStabilityOptimizer(destroy_ratio=0.3, local_search_iters=10)
+	elif planner_type == "dcp":
+		# 使用 Distributed Cooperative Planner（带参数）
+		planner = DistributedCooperativePlanner(auction_rounds=5, bid_strategy='time_urgency')
+	else:
+		raise ValueError(f"Unknown planner type: {planner_type}")
+
 	controller = RuleBasedController(**cfg.controller_params)
 	return env, gen, planner, controller
 
 
-def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10) -> None:
-	env, gen, planner, controller = build_env(cfg)
+def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10, planner: str = "greedy") -> None:
+	env, gen, planner, controller = build_env(cfg, planner_type=planner)
 	obs = env.reset(seed)
 	total_reward = 0.0
 	done = False
@@ -112,10 +129,12 @@ def main() -> None:
 	parser.add_argument("--seed", type=int, default=0)
 	parser.add_argument("--render", action="store_true", help="Use pygame to visualize")
 	parser.add_argument("--fps", type=int, default=10, help="Render FPS when --render")
+	parser.add_argument("--planner", type=str, default="greedy", help="Planner type: greedy, fri, rbso, dcp")
 	args = parser.parse_args()
 	cfg = get_default_config()
-	run_episode(cfg, seed=args.seed, render=args.render, fps=args.fps)
+	run_episode(cfg, seed=args.seed, render=args.render, fps=args.fps, planner=args.planner)
 
 
 if __name__ == "__main__":
 	main()
+	

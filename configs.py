@@ -6,8 +6,8 @@ from typing import Dict, Any, Tuple
 @dataclass
 class Config:
 	# Environment
-	width: int = 30
-	height: int = 30
+	width: int = 20
+	height: int = 20
 	num_agents: int = 5
 	capacity: int = 10
 	depot: Tuple[int, int] = (0, 0)
