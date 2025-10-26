@@ -1,6 +1,6 @@
 from __future__ import annotations
 import argparse
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 from configs import get_default_config, Config
 from environment.env import GridEnvironment
@@ -13,6 +13,21 @@ from agent.planner import RuleBasedPlanner
 from agent.planner import FastReactiveInserter
 from agent.planner import RepairBasedStabilityOptimizer
 from agent.planner import DistributedCooperativePlanner
+
+def _palette(n: int):
+	base = [
+		(255, 179, 186),  # soft pink
+		(255, 223, 186),  # peach
+		(255, 255, 186),  # light yellow
+		(186, 255, 201),  # mint green
+		(186, 225, 255),  # sky blue
+		(220, 186, 255),  # lavender
+		(255, 206, 237),  # light rose
+		(191, 255, 249),  # pale aqua
+		(255, 244, 209),  # cream
+		(232, 243, 255),  # very light blue
+	]
+	return [base[i % len(base)] for i in range(n)]
 
 def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, RuleBasedGenerator, RuleBasedPlanner, RuleBasedController]:
 	gen = RuleBasedGenerator(cfg.width, cfg.height, **cfg.generator_params)
@@ -63,10 +78,10 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 	if render:
 		renderer = PygameRenderer(cfg.width, cfg.height)
 		renderer.init()
+	colors = _palette(cfg.num_agents)
 	
 	while not done:
 		# 检测新增的需求
-		# obs["demands"] 格式: [(x, y, t, c, end_t), ...]
 		current_demands = obs["demands"]
 		new_demands = [d for d in current_demands if d not in prev_demands]
 		
@@ -103,14 +118,13 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 		
 		# 执行动作并更新环境
 		obs, reward, done, info = env.step(actions)
-		
-		# 更新上一步的需求记录
 		prev_demands = list(current_demands)
 		
 		if renderer is not None:
-			if not renderer.render(obs):
+			# 构造 planned_tasks 以对齐渲染接口
+			planned_tasks: Dict[int, List[Tuple[int,int]]] = {i: list(targets[i]) for i in range(cfg.num_agents)}
+			if not renderer.render(obs, agent_colors=colors, planned_tasks=planned_tasks):
 				break
-			# throttle
 			if fps > 0:
 				import time
 				time.sleep(1.0 / fps)
@@ -137,4 +151,3 @@ def main() -> None:
 
 if __name__ == "__main__":
 	main()
-	

@@ -1,4 +1,26 @@
 from __future__ import annotations
+import os
+from typing import Dict, List, Tuple, Optional, Any
+
+import torch
+from torch.utils.data import Dataset
+
+# 说明：
+# - 保留原有 DVRPSyntheticDataset 与 dvrp_collate（单步监督、单 agent 标签）
+# - 离线数据生成与加载工具：
+#     generate_and_save(...)  将样本生成并保存到 data/ 目录
+#     HDDataset(path)         从 .pt 文件读取并以 Dataset 形式提供
+#     load_datasets_from_files(...)  返回 train/val Dataset
+#
+# 文件格式（.pt）：
+#   {
+#     "samples": List[Dict{ "nodes","node_mask","agent","depot","label" }],  # 与 __getitem__ 返回一致
+#     "meta": {
+#         "map_wid","map_hei","agent_num","total","val_ratio","seed","prefix"
+#     }
+#   }
+
+
 import math
 import random
 from typing import Dict, List, Tuple, Optional
@@ -95,7 +117,7 @@ class DVRPSyntheticDataset(Dataset):
             mask = (demand > cap) or (t_arrival > t_now)
             node_mask.append(mask)
 
-        # 计算标签
+        # 计算标签（贪心+迟到惩罚）
         best_score = float("inf")
         best_idx = -1
         for i, (x, y, t_arrival, demand, t_due) in enumerate(nodes):
@@ -133,11 +155,10 @@ def dvrp_collate(batch: List[Dict]) -> Dict[str, torch.Tensor]:
       agents:    [B, 1, 4]
       depot:     [B, 1, 3]
       labels:    [B]  (范围 [0..N_i]，其中 N_i 变长；在 pad 后，超过实际 N_i 的 label 仍表示 depot 的位置：N_i)
-    实现中我们把 depot 的索引固定为样本自身的 N_i，训练时会动态构建每个样本的有效长度并将无效位置 logits 置 -inf。
+      valid_N:   [B]  每条样本真实节点数
     """
     B = len(batch)
-    maxN = max(len(item["nodes"]) for item in batch)
-    device = torch.device("cpu")
+    maxN = max(len(item["nodes"]) for item in batch) if B > 0 else 0
 
     nodes = torch.zeros(B, maxN, 5, dtype=torch.float32)
     node_mask = torch.ones(B, maxN, dtype=torch.bool)  # 先全 True，再对有效长度置为各自 mask
@@ -165,3 +186,112 @@ def dvrp_collate(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         "labels": labels,
         "valid_N": valid_N,
     }
+
+
+# =========================
+# 新增：离线数据生成与加载
+# =========================
+
+class HDDataset(Dataset):
+    """基于已保存 .pt 文件的 Dataset 封装。
+    文件格式参考 generate_and_save 的输出。
+    """
+    def __init__(self, path: str):
+        super().__init__()
+        blob = torch.load(path, map_location="cpu")
+        self.samples: List[Dict[str, Any]] = blob["samples"]
+        self.meta: Dict[str, Any] = blob.get("meta", {})
+        self._path = path
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        return self.samples[idx]
+
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+@torch.no_grad()
+def generate_and_save(
+    output_dir: str = "data",
+    total_samples: int = 100_000,
+    val_ratio: float = 0.1,
+    map_wid: int = 20,
+    map_hei: int = 20,
+    agent_num: int = 1,
+    seed: int = 42,
+    max_nodes: int = 30,
+    min_nodes: int = 5,
+    max_demand: int = 3,
+    max_capacity: int = 10,
+    t_horizon: int = 50,
+    due_min_slack: int = 3,
+    due_max_slack: int = 15,
+    lambda_late: float = 1.0,
+    prefix: str = "planner",
+) -> Dict[str, str]:
+    """使用贪心启发式离线生成训练/验证数据并保存到 data/。
+    返回：{"train": <path>, "val": <path>}
+    """
+    _ensure_dir(output_dir)
+    n_val = int(total_samples * val_ratio)
+    n_trn = total_samples - n_val
+
+    # 用 DVRPSyntheticDataset 的单步启发式逻辑生成原子样本
+    def _make(ds_size: int, seed0: int) -> List[Dict]:
+        ds = DVRPSyntheticDataset(
+            size=ds_size,
+            grid_w=map_wid,
+            grid_h=map_hei,
+            max_nodes=max_nodes,
+            min_nodes=min_nodes,
+            max_demand=max_demand,
+            max_capacity=max_capacity,
+            t_horizon=t_horizon,
+            due_min_slack=due_min_slack,
+            due_max_slack=due_max_slack,
+            lambda_late=lambda_late,
+            seed=seed0,
+            depot_xy=(0, 0),
+        )
+        samples: List[Dict] = []
+        for i in range(ds_size):
+            samples.append(ds[i])
+        return samples
+
+    trn_samples = _make(n_trn, seed)
+    val_samples = _make(n_val, seed + 1)
+
+    meta = dict(
+        map_wid=map_wid, map_hei=map_hei, agent_num=agent_num,
+        total=total_samples, val_ratio=val_ratio, seed=seed, prefix=prefix,
+        max_nodes=max_nodes, min_nodes=min_nodes, max_demand=max_demand,
+        max_capacity=max_capacity, t_horizon=t_horizon,
+        due_min_slack=due_min_slack, due_max_slack=due_max_slack, lambda_late=lambda_late,
+    )
+
+    train_path = os.path.join(output_dir, f"{prefix}_train_{map_wid}_{agent_num}.pt")
+    val_path = os.path.join(output_dir, f"{prefix}_val_{map_wid}_{agent_num}.pt")
+
+    torch.save({"samples": trn_samples, "meta": meta}, train_path)
+    torch.save({"samples": val_samples, "meta": meta}, val_path)
+    return {"train": train_path, "val": val_path}
+
+
+def load_datasets_from_files(
+    data_dir: str = "data",
+    map_wid: int = 20,
+    agent_num: int = 1,
+    prefix: str = "planner",
+) -> Tuple[HDDataset, HDDataset, Dict[str, Any]]:
+    """从 data/ 加载离线生成的训练/验证集。"""
+    train_path = os.path.join(data_dir, f"{prefix}_train_{map_wid}_{agent_num}.pt")
+    val_path = os.path.join(data_dir, f"{prefix}_val_{map_wid}_{agent_num}.pt")
+    if not (os.path.exists(train_path) and os.path.exists(val_path)):
+        raise FileNotFoundError(f"未找到数据文件：{train_path} 或 {val_path}，请先调用 generate_and_save 生成。")
+    trn = HDDataset(train_path)
+    val = HDDataset(val_path)
+    return trn, val, trn.meta

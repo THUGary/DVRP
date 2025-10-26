@@ -9,20 +9,15 @@ import torch
 from models.planner_model import DVRPNet, prepare_features
 _TORCH_OK = True
 
-# 尝试导入 torch，若不可用则使用启发式回退
-# try:
-#     import torch
-#     from models import DVRPNet, prepare_features
-#     _TORCH_OK = True
-# except Exception:
-#     _TORCH_OK = False
-
 
 class ModelPlanner(BasePlanner):
     """
     使用学习模型进行动态规划的 Planner。
-    - 当需要重新规划时，编码一次，然后顺序解码多轮，直到所有 agent 的时间 t_i > base_t + time_plan
-    - 若无需重新规划，则可直接返回 current_plans（由调用方判断）
+    - 多轮解码：每轮为每个 agent 选择一个目标；更新 mask/时间/容量
+    - 直到所有 agent 的时间 t_i > base_t + time_plan 或无可选节点
+    - 若无需重新规划（外层判断），可沿用 current_plans
+    新增：
+    - load_from_ckpt(ckpt_path): 载入已训练模型权重
     """
 
     def __init__(self, d_model: int = 128, nhead: int = 8, nlayers: int = 2, time_plan: int = 6,
@@ -44,6 +39,15 @@ class ModelPlanner(BasePlanner):
             self._model = DVRPNet(d_model=d_model, nhead=nhead, nlayers=nlayers).to(device)
             self._model.eval()
 
+    def load_from_ckpt(self, ckpt_path: str) -> None:
+        """从 checkpoints 加载 DVRPNet 权重。"""
+        if self._model is None:
+            self._model = DVRPNet(d_model=self.d_model, nhead=self.nhead, nlayers=self.nlayers).to(self.device)
+        blob = torch.load(ckpt_path, map_location=self.device)
+        state = blob.get("model", blob)  # 兼容只存 state_dict 或 dict{model:...}
+        self._model.load_state_dict(state, strict=False)
+        self._model.eval()
+
     def plan(
         self,
         observations: List[Tuple[int, int, int, int, int]],  # [(x,y,t_arrival,demand,t_due), ...]
@@ -60,101 +64,71 @@ class ModelPlanner(BasePlanner):
         返回每个 agent 的目标队列（deque[(x,y), ...]）
         """
         num_agents = len(agent_states)
-        if current_plans is None:
-            current_plans = [deque() for _ in range(num_agents)]
 
-        # 构建候选节点列表（按当前可见）
+        # 候选节点列表（当前可见）
         nodes: List[Tuple[int, int, int, int, int]] = list(observations)
 
         # 若 torch 不可用，用启发式回退（贪心最近邻，顺序解码）
         if not _TORCH_OK or self._model is None:
             return self._heuristic_plan(nodes, agent_states, depot, t)
 
-        # 模型驱动规划
-        # 初始化mask：节点唯一访问。mask[i]=True 表示第 i 个节点不可选
+        # 初始化 mask/时间/位置/容量
         N = len(nodes)
-        mask = [False] * N  # depot 不在这个 mask 中
-
-        # 初始化每个agent的时间与位置（各agent时间起点为全局 t）
+        mask = [False] * N  # 节点唯一访问；depot 不在 mask 内
         agent_times = [t for _ in range(num_agents)]
         agent_pos = [(a.x, a.y) for a in agent_states]
         agent_cap = [a.s for a in agent_states]
-
-        # 规划结果（队列）
         out_plans: List[Deque[Target]] = [deque() for _ in range(num_agents)]
-
-        # 截止时间：本次规划覆盖的窗口
         plan_until = t + max(1, int(self.time_plan))
 
-        # 连续多轮，每轮为每个agent选一个下一目标
-        # 直到所有 agent 的时间超过 plan_until，或没有可选节点
+        # 多轮解码：每轮每个 agent 选择一个候选
         while True:
-            # 终止条件1：所有 agent 的时间超过 plan_until
             if all(at > plan_until for at in agent_times):
                 break
-            # 终止条件2：所有节点都被选完
             if all(mask_i for mask_i in mask) or N == 0:
                 break
 
-            # 逐个 agent 顺序解码一次
             for i in range(num_agents):
-                # 若该 agent 的时间已超过 plan_until，则跳过
                 if agent_times[i] > plan_until:
                     continue
 
-                # 在剩余容量为0时，允许选择 depot，以便回仓；也可直接跳过
-                # 准备特征张量
                 with torch.no_grad():
                     feats = prepare_features(
                         nodes=nodes,
                         node_mask=mask,
                         agents=[(agent_pos[i][0], agent_pos[i][1], agent_cap[i], agent_times[i])],
-                        depot=(depot[0], depot[1], agent_times[i]),  # depot 特征里放入当前 agent 时间
+                        depot=(depot[0], depot[1], agent_times[i]),
                         d_model=self.d_model,
                         device=self.device,
                     )
-                    # 模型前向，得到 logits over [nodes, depot]，其中 depot 固定在最后一个位置（或第0维）
-                    # 此处我们将 candidates = [nodes..., depot]，并在内部保证 depot 不mask
                     logits = self._model.decode_step(
                         feats,
                         lateness_lambda=self.lateness_lambda,
                         current_time=agent_times[i],
-                    )  # shape [1, N+1]
-
-                    # 构造mask: 节点按 mask[i] True 则屏蔽；depot 不屏蔽
-                    node_mask_tensor = torch.tensor(mask, dtype=torch.bool, device=self.device).unsqueeze(0)  # [1, N]
-                    # 拼出 [nodes, depot] 的mask
-                    full_mask = torch.cat([node_mask_tensor, torch.zeros(1, 1, dtype=torch.bool, device=self.device)], dim=1)  # [1, N+1]
+                    )  # [1, N+1]
+                    node_mask_tensor = torch.tensor(mask, dtype=torch.bool, device=self.device).unsqueeze(0)  # [1,N]
+                    full_mask = torch.cat([node_mask_tensor, torch.zeros(1, 1, dtype=torch.bool, device=self.device)], dim=1)
                     logits = logits.masked_fill(full_mask, float("-inf"))
-                    # 选择
-                    sel_idx = int(torch.argmax(logits, dim=-1).item())  # 0..N 表示 N 为 depot
+                    sel_idx = int(torch.argmax(logits, dim=-1).item())
 
-                # 解析选择
                 if sel_idx == N:
-                    # 选择了 depot
                     target = depot
                 else:
                     target = (nodes[sel_idx][0], nodes[sel_idx][1])
 
-                # 更新计划
                 out_plans[i].append(target)
-
-                # 更新时间、位置、容量与mask
                 dt = travel_time(agent_pos[i], target)
                 agent_times[i] += dt
                 agent_pos[i] = target
                 if sel_idx != N:
-                    # 消耗容量
-                    demand = nodes[sel_idx][3]  # (x,y,t_arrival,demand,t_due)
+                    demand = nodes[sel_idx][3]
                     agent_cap[i] = max(0, agent_cap[i] - demand)
-                    # 屏蔽该节点（唯一访问）
                     mask[sel_idx] = True
 
-            # 若本轮所有 agent 都未能添加目标（极端情况），避免死循环
-            if all(len(out_plans[i]) == 0 for i in range(num_agents)):
+            # 防死循环：若本轮所有 agent 都未添加目标
+            if all(len(q) == 0 for q in out_plans):
                 break
 
-        # 兜底：若某些 agent 仍没有目标，给一个 depot
         for i in range(num_agents):
             if len(out_plans[i]) == 0:
                 out_plans[i].append(depot)
@@ -168,9 +142,7 @@ class ModelPlanner(BasePlanner):
         depot: Tuple[int, int],
         t: int,
     ) -> List[Deque[Target]]:
-        """
-        torch 不可用时的简易启发式：顺序为每个 agent 选择距离最近的未访问节点，直到超过 time_plan。
-        """
+        """启发式回退：最近邻+容量约束，直到超过 time_plan。"""
         N = len(nodes)
         num_agents = len(agent_states)
         visited = [False] * N
@@ -188,7 +160,6 @@ class ModelPlanner(BasePlanner):
             for i in range(num_agents):
                 if agent_times[i] > plan_until:
                     continue
-                # 找最近且可承载的
                 best_j, best_d = -1, 1e9
                 for j in range(N):
                     if visited[j]:
@@ -201,7 +172,6 @@ class ModelPlanner(BasePlanner):
                         best_d = d
                         best_j = j
                 if best_j == -1:
-                    # 回仓
                     out[i].append(depot)
                     agent_times[i] += travel_time(agent_pos[i], depot)
                     agent_pos[i] = depot

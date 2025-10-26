@@ -20,7 +20,7 @@ class BasePlanner(ABC):
     - plan(observations, agent_states, depot, t, horizon, current_plans, global_nodes, serve_mark, unserved_count) 
       -> list[deque[Target]]
     
-    节点数据结构: (x, y, t_arrival, t_due, demand)
+    节点数据结构: (x, y, t_arrival, c, t_due)
     """
 
     def __init__(self, **params) -> None:
