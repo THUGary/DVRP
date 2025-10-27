@@ -12,20 +12,27 @@ from utils.state_manager import PlanningState, update_planning_state
 
 
 def build_env(cfg: Config) -> Tuple[GridEnvironment, RuleBasedGenerator, RuleBasedPlanner, RuleBasedController]:
-	gen = RuleBasedGenerator(cfg.width, cfg.height, **cfg.generator_params)
-	env = GridEnvironment(
-		width=cfg.width,
-		height=cfg.height,
-		num_agents=cfg.num_agents,
-		capacity=cfg.capacity,
-		depot=cfg.depot,
-		generator=gen,
-		max_time=cfg.max_time,
-	)
-	env.num_agents = cfg.num_agents
-	planner = RuleBasedPlanner(**cfg.planner_params)
-	controller = RuleBasedController(**cfg.controller_params)
-	return env, gen, planner, controller
+    # choose generator class by config
+    if cfg.generator_type == "net":
+        # lazy import to avoid unnecessary dependencies when not used
+        from agent.generator.net_generator import NetDemandGenerator as GenClass
+    else:
+        from agent.generator import RuleBasedGenerator as GenClass
+
+    gen = GenClass(cfg.width, cfg.height, **cfg.generator_params)
+    env = GridEnvironment(
+        width=cfg.width,
+        height=cfg.height,
+        num_agents=cfg.num_agents,
+        capacity=cfg.capacity,
+        depot=cfg.depot,
+        generator=gen,
+        max_time=cfg.max_time,
+    )
+    env.num_agents = cfg.num_agents
+    planner = RuleBasedPlanner(**cfg.planner_params)
+    controller = RuleBasedController(**cfg.controller_params)
+    return env, gen, planner, controller
 
 
 def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10) -> None:

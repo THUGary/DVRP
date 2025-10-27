@@ -2,7 +2,7 @@ from __future__ import annotations
 from os import times
 import random
 import math
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 from .base import BaseDemandGenerator, Demand
 import numpy as np
 
@@ -30,7 +30,7 @@ class Neighborhood:
         
         # Generate demand point numbers for all time steps in advance
         self.events_count, self.time_series = self._sample_poisson_process(max_time=self.max_time, delta_t=1.0)
-        print(f"number of events sampled: {self.events_count}")
+        # print(f"number of events sampled: {self.events_count}")
         self.demands=self._generate_demands(distribution=self.params.get("distribution"), count=self.events_count)
         
     def sample(self, t: int) -> List[Demand]:
@@ -42,13 +42,18 @@ class Neighborhood:
                 demand_t.append(demand)
         return demand_t
 
-    def _sample_poisson_process(self,max_time:float,delta_t:float=1.0) -> List[int]:
+    def _sample_poisson_process(self,max_time:float,delta_t:float=1.0) -> Tuple[int, np.ndarray]:
         """Sample demand temporal points using Poisson process"""
         
         if self.lambda_param <= 0 or max_time <= 0 or delta_t <= 0:
-            return []
+            return 0, np.array([])
 
         events_count=np.random.poisson(self.lambda_param * max_time)
+        
+        # Handle the case where no events are generated
+        if events_count == 0:
+            return 0, np.array([])
+            
         time_series=np.random.uniform(0, max_time, size=events_count)
         time_series= ((time_series-min(time_series)) // delta_t).astype(int)
         
@@ -72,7 +77,7 @@ class Neighborhood:
             c = np.random.randint(1, self.max_c + 1)
             lifetime = np.random.randint(self.min_lifetime, self.max_lifetime + 1)
             end_t = self.time_series[i] + lifetime
-            demand = Demand(x=px, y=py, t=i, c=c, end_t=end_t)
+            demand = Demand(x=px, y=py, t=self.time_series[i], c=c, end_t=end_t)
             demands.append(demand)
         return demands
     
@@ -212,7 +217,7 @@ class RuleBasedGenerator(BaseDemandGenerator):
 
     def sample(self, t: int) -> List[Demand]:
         """Sample all demand points at the current time step."""
-        print(f"Remaining total_demand: {self.total_demand}")
+        # print(f"Remaining total_demand: {self.total_demand}")
 
         if getattr(self, "total_demand", 0) <= 0:
             return []
@@ -235,7 +240,7 @@ class RuleBasedGenerator(BaseDemandGenerator):
     def _merge_demands_by_grid(self, demands: List[Demand]) -> List[Demand]:
         """Merge demands fallen into the same grid cell."""
        
-        merged_demands = {}
+        merged_demands: Dict[Tuple[int, int, int], Demand] = {}
         max_c = self.params.get("max_c")
         
         for demand in demands:
@@ -243,9 +248,17 @@ class RuleBasedGenerator(BaseDemandGenerator):
             if key not in merged_demands:
                 merged_demands[key] = demand
             else:
-                cur_c = merged_demands[key].c
-                merged_demands[key].c = min(cur_c + demand.c, max_c)
-                cur_end_t = merged_demands[key].end_t
-                merged_demands[key].end_t = max(cur_end_t, demand.end_t)
+                existing_demand = merged_demands[key]
+                new_c = min(existing_demand.c + demand.c, max_c)
+                new_end_t = max(existing_demand.end_t, demand.end_t)
+                
+                # Create a new Demand object instead of modifying the old one
+                merged_demands[key] = Demand(
+                    x=demand.x,
+                    y=demand.y,
+                    t=demand.t,
+                    c=new_c,
+                    end_t=new_end_t
+                )
 
         return list(merged_demands.values())
