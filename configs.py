@@ -16,10 +16,16 @@ class Config:
 	# Generator params
 	generator_type: str = "rule"  # "rule" | "net"
 	generator_params: Dict[str, Any] = field(default_factory=lambda: {
-		"max_per_step": 2,
-		"max_c": 2,
-		"min_lifetime": 5,
-		"max_lifetime": 15,
+		"max_per_step": 2, # not used in rule-based generator
+		"total_demand":50,
+		"max_time":50, 
+		"max_c": 5, # from 1 to 10
+		"min_lifetime": 40,
+		"max_lifetime": 50,
+
+		"num_centers": 6,
+		"distribution": "uniform",  # "uniform" | "gaussian" | "cluster"
+		"neighborhood_size": 3, # 3-15, the average radius of the concentrated generation areas
 	})
 
 	# Planner params

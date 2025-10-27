@@ -26,6 +26,7 @@ class BaseDemandGenerator(ABC):
         self.width = width
         self.height = height
         self.params = params
+        self.total_demand=int(params.get("total_demand",1))
 
     def reset(self, seed: Optional[int] = None) -> None:
         """Reset internal state. Implementations may use seed for RNG."""
