@@ -10,9 +10,9 @@ class Config:
 	width: int = 30
 	height: int = 30
 	num_agents: int = 5
-	capacity: int = 10
+	capacity: int = 200
 	depot: Tuple[int, int] = (0, 0)
-	max_time: int = 50
+	max_time: int = 100
 
 	# Generator params
 	generator_type: str = "net"  # "rule" | "net"
@@ -27,6 +27,8 @@ class Config:
 		"num_centers": 6,
 		"distribution": "uniform",  # "uniform" | "gaussian" | "cluster"
 		"neighborhood_size": 3, # 3-15, the average radius of the concentrated generation areas
+        # add checkpoint path for the network-based generator
+		"model_path": "checkpoints/diffusion_model.pth",
 	})
 
 	# Planner params

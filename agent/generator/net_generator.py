@@ -33,7 +33,7 @@ class NetDemandGenerator(BaseDemandGenerator):
         # 1. Load the trained model (if not already loaded)
         if self._model is None:
             self._model = DemandDiffusionModel(condition_dim=CONDITION_DIM)
-            model_path = self.params.get("model_path", "models/generator_model/diffusion_model.pth")
+            model_path = self.params.get("model_path", "checkpoints/diffusion_model.pth")
             try:
                 # Load the trained model weights
                 self._model.load_state_dict(torch.load(model_path, map_location=device))
