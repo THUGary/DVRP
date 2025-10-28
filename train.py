@@ -42,8 +42,8 @@ def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, RuleBase
 	)
 	env.num_agents = cfg.num_agents
 	if planner_type == "greedy":
-		# 使用 Rule-based Planner
-		planner = RuleBasedPlanner(**cfg.planner_params)
+		# 使用 Rule-based Planner（需要显式传入 full_capacity 来自 Config.capacity）
+		planner = RuleBasedPlanner(full_capacity=cfg.capacity, **cfg.planner_params)
 	elif planner_type == "fri":
 		# 使用 Fast Reactive Inserter
 		planner = FastReactiveInserter()
