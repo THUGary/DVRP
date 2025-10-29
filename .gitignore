@@ -126,3 +126,5 @@ docker-compose.override.yml
 
 checkpoints/planner/*.pt
 data/plans_*.pt
+data/
+*.zip

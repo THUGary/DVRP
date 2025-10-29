@@ -1,6 +1,5 @@
 from __future__ import annotations
-from typing import Tuple, List, Dict
-import math
+from typing import Tuple, List
 
 try:
     import pygame
@@ -10,16 +9,19 @@ except Exception as e:  # pragma: no cover - handled at runtime
 else:
     _import_error = None
 
+
 Color = Tuple[int, int, int]
 
-class PygameRenderer:
-    """Pygame 渲染器（对齐新接口）
 
-    render(obs, agent_colors=None, planned_tasks=None)
-      - obs: {time,depot,agent_states,demands,width,height}
-      - agent_colors: List[RGB] 每个 agent 的颜色
-      - planned_tasks: Dict[agent_idx, List[(x,y)]] 将需求节点渲染为与该 agent 相同颜色（圆形）
-      - agent: 星形
+class PygameRenderer:
+    """Simple Pygame-based renderer for the DVRP grid environment.
+
+    Usage:
+      r = PygameRenderer(width, height, cell_size=32)
+      r.init()
+      while running:
+          r.render(obs)  # obs: {time,depot,agent_states,demands,width,height}
+      r.close()
     """
 
     def __init__(self, width: int, height: int, cell_size: int = 32, margin: int = 1, caption: str = "DVRP") -> None:
@@ -69,7 +71,7 @@ class PygameRenderer:
                 return False
         return True
 
-    def render(self, obs: dict, agent_colors: List[Color] | None = None, planned_tasks: Dict[int, List[Tuple[int,int]]] | None = None) -> bool:
+    def render(self, obs: dict) -> bool:
         """Render one frame. Returns False if the window should close."""
         if not self._inited:
             self.init()
@@ -78,11 +80,15 @@ class PygameRenderer:
             return False
 
         self._screen.fill(self.BG)
-        # draw grid
+        # grid origin
+        ox = self.margin
+        oy = self.margin
+
+        # draw grid cells
         for y in range(self.height):
             for x in range(self.width):
-                rx = self.margin + x * (self.cell_size + self.margin)
-                ry = self.margin + y * (self.cell_size + self.margin)
+                rx = ox + x * (self.cell_size + self.margin)
+                ry = oy + y * (self.cell_size + self.margin)
                 pygame.draw.rect(
                     self._screen,
                     self.GRID,
@@ -90,30 +96,19 @@ class PygameRenderer:
                     width=1,
                 )
 
-        # draw depot (square)
+        # draw depot
         depot = tuple(obs.get("depot", (0, 0)))
         self._draw_square(depot, color=self.DEPOT)
 
-        # Build demand color map from planned_tasks
-        demand_color: Dict[Tuple[int,int], Color] = {}
-        if planned_tasks and agent_colors:
-            for i, seq in planned_tasks.items():
-                col = agent_colors[i % len(agent_colors)]
-                for (tx, ty) in seq:
-                    demand_color[(tx, ty)] = col
-
-        # draw demands as circles
-        tnow = obs.get("time", 0)
+        # draw demands (support 4-tuple or 5-tuple with end_t)
         for d in obs.get("demands", []):
-            dx, dy, dt, dc = d[:4]  # (x,y,t,c, ...)
-            if dt <= tnow:
-                col = demand_color.get((dx, dy), self.DEMAND)
-                self._draw_circle((dx, dy), color=col, radius_ratio=0.35)
+            dx, dy, dt, dc = d[:4]
+            if dt <= obs.get("time", 0):
+                self._draw_circle((dx, dy), color=self.DEMAND, radius_ratio=0.35)
 
-        # draw agents as stars
+        # draw agents
         for idx, (ax, ay, s) in enumerate(obs.get("agent_states", [])):
-            col = self.AGENT if agent_colors is None else agent_colors[idx % len(agent_colors)]
-            self._draw_star((ax, ay), color=col, r_outer=self.cell_size * 0.45, r_inner=self.cell_size * 0.22, n=5)
+            self._draw_circle((ax, ay), color=self.AGENT, radius_ratio=0.45)
             # id label
             label = self._font.render(str(idx), True, self.TEXT)
             cx, cy = self._cell_center((ax, ay))
@@ -121,7 +116,7 @@ class PygameRenderer:
 
         # HUD
         hud = self._font.render(
-            f"t={tnow}  demands={len(obs.get('demands', []))}  agents={len(obs.get('agent_states', []))}",
+            f"t={obs.get('time', 0)}  demands={len(obs.get('demands', []))}  agents={len(obs.get('agent_states', []))}",
             True,
             self.TEXT,
         )
@@ -151,16 +146,3 @@ class PygameRenderer:
         cx, cy = self._cell_center(pos)
         radius = int(self.cell_size * radius_ratio)
         pygame.draw.circle(self._screen, color, (cx, cy), radius)
-
-    def _draw_star(self, pos: Tuple[int,int], color: Color, r_outer: float, r_inner: float, n: int = 5) -> None:
-        """绘制星形（n=5）"""
-        assert pygame is not None and self._screen is not None
-        cx, cy = self._cell_center(pos)
-        pts: List[Tuple[int,int]] = []
-        for i in range(n * 2):
-            r = r_outer if i % 2 == 0 else r_inner
-            a = math.pi * i / n
-            px = int(cx + r * math.sin(a))
-            py = int(cy - r * math.cos(a))
-            pts.append((px, py))
-        pygame.draw.polygon(self._screen, color, pts)
