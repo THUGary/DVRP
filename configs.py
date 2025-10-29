@@ -7,8 +7,8 @@ import itertools
 @dataclass
 class Config:
 	# Environment
-	width: int = 30
-	height: int = 30
+	width: int = 20
+	height: int = 20
 	num_agents: int = 5
 	capacity: int = 200
 	depot: Tuple[int, int] = (0, 0)

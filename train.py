@@ -1,65 +1,80 @@
 from __future__ import annotations
 import argparse
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 from configs import get_default_config, Config
 from environment.env import GridEnvironment
 from agent.generator import RuleBasedGenerator
-from agent.planner import RuleBasedPlanner
 from agent.controller import RuleBasedController
 from utils.pygame_renderer import PygameRenderer
 from utils.state_manager import PlanningState, update_planning_state
+from agent.planner import RuleBasedPlanner
+from agent.planner import FastReactiveInserter
+from agent.planner import RepairBasedStabilityOptimizer
+from agent.planner import DistributedCooperativePlanner
 
 
-def build_env(cfg: Config) -> Tuple[GridEnvironment, RuleBasedGenerator, RuleBasedPlanner, RuleBasedController]:
-    # choose generator class by config
-    if cfg.generator_type == "net":
-        # lazy import to avoid unnecessary dependencies when not used
-        from agent.generator.net_generator import NetDemandGenerator as GenClass
-    else:
-        from agent.generator import RuleBasedGenerator as GenClass
+def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, RuleBasedGenerator, RuleBasedPlanner, RuleBasedController]:
+	# choose generator class by config
+	if cfg.generator_type == "net":
+		# lazy import to avoid unnecessary dependencies when not used
+		from agent.generator.net_generator import NetDemandGenerator as GenClass
+	else:
+		from agent.generator import RuleBasedGenerator as GenClass
 
-    gen = GenClass(cfg.width, cfg.height, **cfg.generator_params)
-    env = GridEnvironment(
-        width=cfg.width,
-        height=cfg.height,
-        num_agents=cfg.num_agents,
-        capacity=cfg.capacity,
-        depot=cfg.depot,
-        generator=gen,
-        max_time=cfg.max_time,
-    )
-    env.num_agents = cfg.num_agents
-    planner = RuleBasedPlanner(full_capacity=cfg.capacity, **cfg.planner_params)
-    controller = RuleBasedController(**cfg.controller_params)
-    return env, gen, planner, controller
+	gen = GenClass(cfg.width, cfg.height, **cfg.generator_params)
+	env = GridEnvironment(
+		width=cfg.width,
+		height=cfg.height,
+		num_agents=cfg.num_agents,
+		capacity=cfg.capacity,
+		depot=cfg.depot,
+		generator=gen,
+		max_time=cfg.max_time,
+	)
+	env.num_agents = cfg.num_agents
+	if planner_type == "greedy":
+		# 使用 Rule-based Planner（需要显式传入 full_capacity 来自 Config.capacity）
+		planner = RuleBasedPlanner(full_capacity=cfg.capacity, **cfg.planner_params)
+	elif planner_type == "fri":
+		# 使用 Fast Reactive Inserter
+		planner = FastReactiveInserter()
+	elif planner_type == "rbso":
+		# 使用 Repair-based Stability Optimizer（带参数）
+		planner = RepairBasedStabilityOptimizer(destroy_ratio=0.3, local_search_iters=10)
+	elif planner_type == "dcp":
+		# 使用 Distributed Cooperative Planner（带参数）
+		planner = DistributedCooperativePlanner(auction_rounds=5, bid_strategy='time_urgency')
+	else:
+		raise ValueError(f"Unknown planner type: {planner_type}")
+	controller = RuleBasedController(**cfg.controller_params)
+	return env, gen, planner, controller
 
 
-def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10) -> None:
-	env, gen, planner, controller = build_env(cfg)
+def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10, planner: str = "greedy") -> None:
+	env, gen, planner, controller = build_env(cfg, planner_type=planner)
 	obs = env.reset(seed)
 	total_reward = 0.0
 	done = False
 	step = 0
 	renderer = None
-	
+
 	# 初始化规划状态管理器
 	planning_state = PlanningState()
 	planning_state.reset(cfg.num_agents)
-	
+
 	# 记录上一步的需求，用于检测新增需求
 	prev_demands = []
-	
+
 	if render:
 		renderer = PygameRenderer(cfg.width, cfg.height)
 		renderer.init()
-	
+
 	while not done:
 		# 检测新增的需求
-		# obs["demands"] 格式: [(x, y, t, c, end_t), ...]
 		current_demands = obs["demands"]
 		new_demands = [d for d in current_demands if d not in prev_demands]
-		
+
 		# 更新规划状态（在规划之前）
 		agent_states = obs["agent_states"]  # list of (x,y,s)
 		update_planning_state(
@@ -68,7 +83,7 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10)
 			new_demands=new_demands,
 			obs_demands=current_demands,
 		)
-		
+
 		# Plan targets using current observation with enhanced information
 		agents = [type("S", (), {"x": x, "y": y, "s": s}) for (x, y, s) in agent_states]
 		targets = planner.plan(
@@ -82,21 +97,19 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10)
 			serve_mark=planning_state.global_nodes.serve_mark,  # 新增：服务标记
 			unserved_count=planning_state.get_unserved_count(),  # 新增：未服务节点数量
 		)
-		
+
 		# 更新规划结果到状态管理器
 		planning_state.update_plans(targets)
-		
+
 		# Controller decides per-agent move
 		actions: List[Tuple[int, int]] = []
 		for i, (x, y, s) in enumerate(agent_states):
 			actions.append(controller.act((x, y), targets[i]))
-		
+
 		# 执行动作并更新环境
 		obs, reward, done, info = env.step(actions)
-		
-		# 更新上一步的需求记录
 		prev_demands = list(current_demands)
-		
+
 		if renderer is not None:
 			if not renderer.render(obs):
 				break
@@ -119,9 +132,10 @@ def main() -> None:
 	parser.add_argument("--seed", type=int, default=0)
 	parser.add_argument("--render", action="store_true", help="Use pygame to visualize")
 	parser.add_argument("--fps", type=int, default=10, help="Render FPS when --render")
+	parser.add_argument("--planner", type=str, default="greedy", help="Planner type: greedy, fri, rbso, dcp")
 	args = parser.parse_args()
 	cfg = get_default_config()
-	run_episode(cfg, seed=args.seed, render=args.render, fps=args.fps)
+	run_episode(cfg, seed=args.seed, render=args.render, fps=args.fps, planner=args.planner)
 
 
 if __name__ == "__main__":
