@@ -21,7 +21,7 @@ class ModelPlanner(BasePlanner):
     """
 
     def __init__(self, d_model: int = 128, nhead: int = 8, nlayers: int = 2, time_plan: int = 6,
-                 lateness_lambda: float = 0.0, device: str = "cpu", **params) -> None:
+                 lateness_lambda: float = 0.0, device: str = "cpu", full_capacity: int | None = None, **params) -> None:
         """
         lateness_lambda: 若 >0，会对 logits 添加 -lambda * lateness 的偏置（ETA>due 的软惩罚）
         time_plan: 每次重规划覆盖未来的仿真时间窗口
@@ -33,6 +33,8 @@ class ModelPlanner(BasePlanner):
         self.time_plan = time_plan
         self.lateness_lambda = lateness_lambda
         self.device = device
+        # 满容量：若提供则在返回 depot 时将容量恢复到该值；否则退化为各 agent 初始 s
+        self.full_capacity = full_capacity
 
         self._model: Optional["DVRPNet"] = None
         if _TORCH_OK:
@@ -68,121 +70,51 @@ class ModelPlanner(BasePlanner):
         # 候选节点列表（当前可见）
         nodes: List[Tuple[int, int, int, int, int]] = list(observations)
 
-        # 若 torch 不可用，用启发式回退（贪心最近邻，顺序解码）
-        if not _TORCH_OK or self._model is None:
-            return self._heuristic_plan(nodes, agent_states, depot, t)
-
-        # 初始化 mask/时间/位置/容量
+        # 组装批次（B=1）与初始 mask
         N = len(nodes)
-        mask = [False] * N  # 节点唯一访问；depot 不在 mask 内
-        agent_times = [t for _ in range(num_agents)]
-        agent_pos = [(a.x, a.y) for a in agent_states]
-        agent_cap = [a.s for a in agent_states]
+
+        # 如果节点数为0，直接返回所有 agent 回 depot，horizon个depot
+        if N == 0:
+            return [deque([depot] * horizon) for _ in range(num_agents)]
+
+        mask = [False] * N
+        agents_tensor = [
+            (a.x, a.y, a.s, t) for a in agent_states
+        ]  # [A,4]
+        # cap_full: [1,A]，必须由构造时提供的 full_capacity 指定（来自 Config.capacity）
+        if self.full_capacity is None:
+            raise RuntimeError("ModelPlanner requires full_capacity (Config.capacity) at construction; pass full_capacity=cfg.capacity.")
+        cap_full = torch.full((1, len(agent_states)), float(self.full_capacity), dtype=torch.float32, device=self.device)
+
+        with torch.no_grad():
+            feats = prepare_features(
+                nodes=[nodes],                 # [1,N,5]
+                node_mask=[mask],              # [1,N]
+                depot=[(depot[0], depot[1], t)],  # [1,1,3]
+                d_model=self.d_model,
+                device=self.device,
+            )
+            agents_t = torch.tensor([agents_tensor], dtype=torch.float32, device=self.device)  # [1,A,4]
+            k = max(1, int(horizon))
+            out = self._model.forward(
+                feats=feats,
+                agents=agents_t,
+                k=k,
+                lateness_lambda=self.lateness_lambda,
+                cap_full=cap_full,  # 回 depot 恢复容量
+            )
+
+        # 解析输出到每个 agent 的 deque
+        coords = out["coords"].squeeze(0)  # [A,k,2]
         out_plans: List[Deque[Target]] = [deque() for _ in range(num_agents)]
-        plan_until = t + max(1, int(self.time_plan))
+        for aidx in range(num_agents):
+            for step in range(coords.size(1)):
+                x, y = int(coords[aidx, step, 0].item()), int(coords[aidx, step, 1].item())
+                out_plans[aidx].append((x, y))
 
-        # 多轮解码：每轮每个 agent 选择一个候选
-        while True:
-            if all(at > plan_until for at in agent_times):
-                break
-            if all(mask_i for mask_i in mask) or N == 0:
-                break
-
-            for i in range(num_agents):
-                if agent_times[i] > plan_until:
-                    continue
-
-                with torch.no_grad():
-                    feats = prepare_features(
-                        nodes=nodes,
-                        node_mask=mask,
-                        agents=[(agent_pos[i][0], agent_pos[i][1], agent_cap[i], agent_times[i])],
-                        depot=(depot[0], depot[1], agent_times[i]),
-                        d_model=self.d_model,
-                        device=self.device,
-                    )
-                    logits = self._model.decode_step(
-                        feats,
-                        lateness_lambda=self.lateness_lambda,
-                        current_time=agent_times[i],
-                    )  # [1, N+1]
-                    node_mask_tensor = torch.tensor(mask, dtype=torch.bool, device=self.device).unsqueeze(0)  # [1,N]
-                    full_mask = torch.cat([node_mask_tensor, torch.zeros(1, 1, dtype=torch.bool, device=self.device)], dim=1)
-                    logits = logits.masked_fill(full_mask, float("-inf"))
-                    sel_idx = int(torch.argmax(logits, dim=-1).item())
-
-                if sel_idx == N:
-                    target = depot
-                else:
-                    target = (nodes[sel_idx][0], nodes[sel_idx][1])
-
-                out_plans[i].append(target)
-                dt = travel_time(agent_pos[i], target)
-                agent_times[i] += dt
-                agent_pos[i] = target
-                if sel_idx != N:
-                    demand = nodes[sel_idx][3]
-                    agent_cap[i] = max(0, agent_cap[i] - demand)
-                    mask[sel_idx] = True
-
-            # 防死循环：若本轮所有 agent 都未添加目标
-            if all(len(q) == 0 for q in out_plans):
-                break
-
+        # 若某个 agent 未得到目标，至少回仓
         for i in range(num_agents):
             if len(out_plans[i]) == 0:
                 out_plans[i].append(depot)
 
         return out_plans
-
-    def _heuristic_plan(
-        self,
-        nodes: List[Tuple[int, int, int, int, int]],
-        agent_states: List[AgentState],
-        depot: Tuple[int, int],
-        t: int,
-    ) -> List[Deque[Target]]:
-        """启发式回退：最近邻+容量约束，直到超过 time_plan。"""
-        N = len(nodes)
-        num_agents = len(agent_states)
-        visited = [False] * N
-        agent_times = [t for _ in range(num_agents)]
-        agent_pos = [(a.x, a.y) for a in agent_states]
-        agent_cap = [a.s for a in agent_states]
-        plan_until = t + max(1, int(self.time_plan))
-        out = [deque() for _ in range(num_agents)]
-
-        while True:
-            if all(at > plan_until for at in agent_times):
-                break
-            if all(visited) or N == 0:
-                break
-            for i in range(num_agents):
-                if agent_times[i] > plan_until:
-                    continue
-                best_j, best_d = -1, 1e9
-                for j in range(N):
-                    if visited[j]:
-                        continue
-                    demand = nodes[j][3]
-                    if agent_cap[i] < demand:
-                        continue
-                    d = abs(agent_pos[i][0] - nodes[j][0]) + abs(agent_pos[i][1] - nodes[j][1])
-                    if d < best_d:
-                        best_d = d
-                        best_j = j
-                if best_j == -1:
-                    out[i].append(depot)
-                    agent_times[i] += travel_time(agent_pos[i], depot)
-                    agent_pos[i] = depot
-                else:
-                    out[i].append((nodes[best_j][0], nodes[best_j][1]))
-                    agent_times[i] += best_d
-                    agent_pos[i] = (nodes[best_j][0], nodes[best_j][1])
-                    agent_cap[i] -= nodes[best_j][3]
-                    visited[best_j] = True
-
-        for i in range(num_agents):
-            if len(out[i]) == 0:
-                out[i].append(depot)
-        return out

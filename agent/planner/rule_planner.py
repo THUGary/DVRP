@@ -8,13 +8,19 @@ class RuleBasedPlanner(BasePlanner):
 	"""Greedy planner with unique assignment per step and capacity feasibility.
 
 	Assign agents one by one. At each planning step, for each agent, pick the nearest
-	available demand whose demand is strictly less than the agent's remaining capacity
-	(capacity > demand). Ensure uniqueness: a node is assigned to at most one agent in
-	the same step, and once assigned it is removed from the pool for subsequent steps.
-	If no demand remains, send the agent to depot. Returns a queue per agent with up to
-	`horizon` targets.
+	available demand whose demand is feasible under remaining capacity (capacity >= demand).
+	Ensure uniqueness: a node is assigned to at most one agent in the same step, and once
+	assigned it is removed from the pool for subsequent steps. If no feasible demand remains
+	for an agent in a step, send this agent to depot for that step (restoring its capacity
+	to full). If globally no demands remain, send all agents to depot for the remaining steps.
+	Returns a queue per agent with up to `horizon` targets.
 	
-	节点数据结构: (x, y, t_arrival, t_due, demand)
+	节点数据结构: (x, y, t_arrival, c, t_due) 其中 c 表示该节点需求量
+
+	索引约定（用于与模型/数据的标签对齐）:
+	- 模型与数据标签中，depot 的类别索引固定为 0
+	- nodes 的类别索引为 1..N，并与 nodes 列表中的下标 0..N-1 一一对应（i -> i+1）
+	- 本规划器仅返回目标坐标，不产生索引；索引映射由上层数据拼装（data_gen）来完成
 	"""
 
 	def __init__(self, full_capacity: int | None = None) -> None:
@@ -52,10 +58,11 @@ class RuleBasedPlanner(BasePlanner):
 		# Initialize per-agent output queues and current positions
 		A = len(agent_states)
 		out: List[Deque[Target]] = [deque() for _ in range(A)]
-		cur_pos: List[Tuple[int, int]] = [(a.x, a.y) for a in agent_states]
-		cur_cap: List[int] = [int(a.s) for a in agent_states]
-		# 满容量优先使用构造时提供的 full_capacity；否则退化为各 agent 初始 s
-		# 满容量必须由构造时提供的 full_capacity 指定；不再退化为各 agent 初始 s
+		# snapshot agent states (copy values instead of referencing AgentState objects)
+		snapshot: List[Tuple[int, int, int]] = [(int(a.x), int(a.y), int(a.s)) for a in agent_states]
+		cur_pos: List[Tuple[int, int]] = [(x, y) for (x, y, _s) in snapshot]
+		cur_cap: List[int] = [s for (_x, _y, s) in snapshot]
+		# 满容量必须由构造时提供的 full_capacity 指定
 		full_cap: List[int] = [int(self.full_capacity) for _ in agent_states]
 
 		steps = max(1, int(horizon))

@@ -35,7 +35,7 @@ def main():
     ap.add_argument("--agent_num", type=int, default=2)
     ap.add_argument("--render", action="store_true")
     ap.add_argument("--fps", type=int, default=10)
-    ap.add_argument("--time_plan", type=int, default=6)
+    ap.add_argument("--time_plan", type=int, default=3)
     args = ap.parse_args()
 
     cfg = get_default_config()
@@ -44,7 +44,7 @@ def main():
     cfg.num_agents = args.agent_num
 
     env = build_env(cfg)
-    planner = ModelPlanner(time_plan=args.time_plan, device="cpu")
+    planner = ModelPlanner(time_plan=args.time_plan, device="cpu", full_capacity=cfg.capacity)
     # 需要 ModelPlanner 实现 load_from_ckpt(path)
     if hasattr(planner, "load_from_ckpt"):
         planner.load_from_ckpt(args.ckpt)
@@ -81,7 +81,7 @@ def main():
                 depot=obs["depot"],
                 t=obs["time"],
                 current_plans=current_plans,
-                horizon=1,
+                horizon=max(1, int(args.time_plan)),
             )
             current_plans = targets
 

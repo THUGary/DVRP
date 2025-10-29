@@ -124,4 +124,5 @@ yarn-error.log
 docker-compose.override.yml
 *.env.*.local
 
-checkpoints/*.pt
+checkpoints/planner/*.pt
+data/plans_*.pt

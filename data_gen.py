@@ -24,9 +24,9 @@ def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def _build_planner(planner_type: str):
+def _build_planner(planner_type: str, capacity: int | None = None):
     if planner_type == "greedy":
-        return RuleBasedPlanner()
+        return RuleBasedPlanner(full_capacity=capacity)
     if planner_type == "fri":
         return FastReactiveInserter()
     if planner_type == "rbso":
@@ -37,10 +37,12 @@ def _build_planner(planner_type: str):
 
 
 def _unique_nodes_by_xy(observations: List[Tuple[int, int, int, int, int]]) -> List[Tuple[int, int, int, int, int]]:
-    """去重：按 (x,y) 保留第一条"""
+    """去重：按 (x,y) 保留第一条，且忽略 c<=0 的点（与 RuleBasedPlanner 的可行性过滤一致）。"""
     seen = set()
     uniq: List[Tuple[int, int, int, int, int]] = []
     for (x, y, t_arrival, c, t_due) in observations:
+        if c <= 0:
+            continue
         key = (x, y)
         if key in seen:
             continue
@@ -49,19 +51,30 @@ def _unique_nodes_by_xy(observations: List[Tuple[int, int, int, int, int]]) -> L
     return uniq
 
 
-def _targets_to_next_label(
-    next_target: Tuple[int, int] | None,
+def _target_to_label(
+    target: Tuple[int, int] | None,
     nodes_unique: List[Tuple[int, int, int, int, int]],
 ) -> int:
-    """将下一目标坐标映射为分类标签索引。未匹配则返回 N 表示 depot。"""
+    """将目标坐标映射为分类标签索引。约定 depot=0，nodes 为 1..N（对应 nodes_unique[0..N-1]）。"""
     N = len(nodes_unique)
-    if next_target is None:
-        return N
-    tx, ty = next_target
+    if target is None:
+        return 0
+    tx, ty = target
     for i, (x, y, *_rest) in enumerate(nodes_unique):
         if (x, y) == (tx, ty):
-            return i
-    return N  # 不在节点中，视为 depot
+            return i + 1
+    return 0
+
+def _targets_to_k_labels(
+    tgt_deque: deque[Tuple[int, int]],
+    nodes_unique: List[Tuple[int, int, int, int, int]],
+    k: int,
+) -> List[int]:
+    labels: List[int] = []
+    for step in range(k):
+        xy = tgt_deque[step] if step < len(tgt_deque) else None
+        labels.append(_target_to_label(xy, nodes_unique))
+    return labels
 
 
 def collect_rows_from_call(
@@ -69,45 +82,112 @@ def collect_rows_from_call(
     observations: List[Tuple[int, int, int, int, int]],
     agent_states_xyz: List[Tuple[int, int, int]],
     depot_xy: Tuple[int, int],
-    horizon: int,
+    k: int,
     current_plans: List[deque[Tuple[int, int]]],
     global_nodes: List[Tuple[int, int, int, int, int]] | None,
     serve_mark: List[int] | None,
     unserved_count: int | None,
     targets: List[deque[Tuple[int, int]]],
     meta: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    """从一次 planner 调用组装每个 agent 的监督样本 row"""
+    full_capacity: int,
+) -> Dict[str, Any]:
+    """从一次 planner 调用组装一个包含所有 agents 的监督样本 row：labels 形状为 [A, K]。"""
     nodes_unique = _unique_nodes_by_xy(observations)
+    # 校验：禁止需求点与 depot 坐标重合（硬错误，避免错误样本进入数据集）
+    for (x, y, _ta, _c, _due) in nodes_unique:
+        if (x, y) == tuple(depot_xy):
+            raise ValueError(
+                f"[DATA-CHECK][depot-overlap] Encountered a demand at depot position {depot_xy} at time={time_now}. "
+                f"Please adjust generator or map size to avoid overlaps."
+            )
     N = len(nodes_unique)
-    rows: List[Dict[str, Any]] = []
+    A = len(agent_states_xyz)
 
+    # agents 列表与二位标签 [A, K]
+    agents_list: List[Tuple[int, int, int, int]] = []
+    labels_ak: List[List[int]] = []
     for agent_id, (ax, ay, s) in enumerate(agent_states_xyz):
-        # 下一目标：队首，若空 None
-        next_xy = targets[agent_id][0] if len(targets[agent_id]) > 0 else None
-        label = _targets_to_next_label(next_xy, nodes_unique)
+        agents_list.append((ax, ay, s, time_now))
+        labels_k = _targets_to_k_labels(targets[agent_id], nodes_unique, k)
+        # debug
+        # print(f"Agent {agent_id} targets: {list(targets[agent_id])} -> labels: {labels_k}")
+        labels_ak.append(labels_k)
 
-        row = {
-            "nodes": nodes_unique,                    # List[(x, y, t_arrival, c, t_due)]
-            "node_mask": [False] * N,                 # 简化版，全部可选；pad 时会额外mask
-            "agent": (ax, ay, s, time_now),           # (x, y, s, t_agent)
-            "depot": (depot_xy[0], depot_xy[1], time_now),
-            "label": label,                           # 0..N, N==depot
-            "valid_N": N,
-            "planner_inputs": {
-                "time": time_now,
-                "horizon": horizon,
-                "current_plans": [list(q) for q in current_plans],
-                # 注意：global_nodes 在 state_manager 中为 (x,y,t_arrival,t_due,demand)
-                "global_nodes": list(global_nodes) if global_nodes is not None else [],
-                "serve_mark": list(serve_mark) if serve_mark is not None else None,
-                "unserved_count": int(unserved_count) if unserved_count is not None else None,
-                "depot": depot_xy,
-            },
-            "meta": meta | {"agent_id": agent_id},
-        }
-        rows.append(row)
-    return rows
+    # 基本行数据
+    row: Dict[str, Any] = {
+        "nodes": nodes_unique,                    # List[(x, y, t_arrival, c, t_due)]
+        "node_mask": [False] * N,                 # 简化版，全部可选；pad 时会额外mask
+        "agents": agents_list,                    # List[(x, y, s, t_agent)], 长度 A
+        "depot": (depot_xy[0], depot_xy[1], time_now),
+        "labels_ak": labels_ak,                   # List[List[int]], 形状 [A, K]，N==depot
+        "full_capacity": int(full_capacity),      # 每个 agent 回 depot 恢复的满容量
+        "valid_N": N,
+        "planner_inputs": {
+            "time": time_now,
+            "k": k,
+            "current_plans": [list(q) for q in current_plans],
+            # 注意：global_nodes 在 state_manager 中为 (x,y,t_arrival,t_due,demand)
+            "global_nodes": list(global_nodes) if global_nodes is not None else [],
+            "serve_mark": list(serve_mark) if serve_mark is not None else None,
+            "unserved_count": int(unserved_count) if unserved_count is not None else None,
+            "depot": depot_xy,
+        },
+        "meta": meta | {"agent_num": A},
+    }
+    # 调试输出（可按需开启）
+    # print(f"[DATA-COLLECT] ep={meta.get('episode_id')} step={meta.get('step_id')}")
+    # print(f"agents: {agents_list}")
+    # print(f"depot: {depot_xy} {time_now}")
+    # print(f"labels_ak: {labels_ak}")
+    # print(f"nodes_unique: {nodes_unique}")
+
+    # 额外一致性校验（仅日志，不修改标签）：确保 labels_ak 不违反容量约束
+    # 规则：从各自 agent 的当前空间 s 出发，按 labels_ak 顺序执行；若命中 depot(0)，则将空间恢复为 full_capacity；
+    # 若命中某节点 i (1<=i<=N)，则需要 nodes_unique[i-1][3] <= 当前空间。
+    try:
+        demands_vec = [int(x[3]) for x in nodes_unique]  # c 字段
+        for a_idx, (ax, ay, s, _ta) in enumerate(agents_list):
+            space = int(s)
+            trace_space_before: List[int] = []
+            trace_space_after: List[int] = []
+            trace_labels: List[int] = []
+            trace_demands: List[int] = []
+            violated_detail = None
+            for step_idx, lab in enumerate(labels_ak[a_idx]):
+                trace_space_before.append(space)
+                trace_labels.append(lab)
+                if lab == 0:
+                    trace_demands.append(-1)
+                    space = int(full_capacity)
+                    trace_space_after.append(space)
+                    continue
+                if 1 <= lab <= N:
+                    req = demands_vec[lab - 1]
+                    trace_demands.append(int(req))
+                    if req > space and violated_detail is None:
+                        violated_detail = (step_idx, lab, int(req), int(space))
+                    space = max(0, space - req)
+                    trace_space_after.append(space)
+                else:
+                    trace_demands.append(-2)
+                    space = int(full_capacity)
+                    trace_space_after.append(space)
+            if violated_detail is not None:
+                v_step, v_lab, v_req, v_space = violated_detail
+                # 输出更详细的轨迹，便于定位原因
+                print(
+                    f"[DATA-CHECK][cap-violation] ep={meta.get('episode_id')} step={meta.get('step_id')} agent={a_idx} "
+                    f"k={v_step} label_node={v_lab} demand={v_req} space={v_space} — labels imply demand>space\n"
+                    f"  labels_k={trace_labels}\n  demands@labels={trace_demands}\n  space_before={trace_space_before}\n  space_after={trace_space_after}"
+                )
+                # 返回错误
+                raise ValueError(
+                    f"Capacity violation detected for agent {a_idx} at step {v_step} in episode {meta.get('episode_id')} step {meta.get('step_id')}: "
+                    f"label_node={v_lab}, demand={v_req}, available_space={v_space}."
+                )
+    except Exception as e:
+        print(f"[DATA-CHECK] capacity validation skipped due to error: {e}")
+    return row
 
 
 def generate_dataset(
@@ -118,6 +198,7 @@ def generate_dataset(
     out_dir: str,
     val_ratio: float,
     replan_policy: str = "always",  # "always" | "on_new_or_empty"
+    k: int = 3,
 ) -> Dict[str, str]:
     """运行 episodes，收集 rows 并落盘"""
     _ensure_dir(out_dir)
@@ -125,7 +206,8 @@ def generate_dataset(
     rng = None
 
     for ep in range(episodes):
-        gen = RuleBasedGenerator(cfg.width, cfg.height, **cfg.generator_params)
+        # 将 depot 传入生成器，避免生成与 depot 重叠的需求
+        gen = RuleBasedGenerator(cfg.width, cfg.height, depot=cfg.depot, **cfg.generator_params)
         env = GridEnvironment(
             width=cfg.width,
             height=cfg.height,
@@ -136,7 +218,7 @@ def generate_dataset(
             max_time=cfg.max_time,
         )
         env.num_agents = cfg.num_agents
-        planner = _build_planner(planner_type)
+        planner = _build_planner(planner_type, capacity=cfg.capacity)
         controller = RuleBasedController(**cfg.controller_params)
 
         obs = env.reset(seed + ep)
@@ -171,7 +253,7 @@ def generate_dataset(
                     agent_states=agents,
                     depot=obs["depot"],
                     t=obs["time"],
-                    horizon=1,
+                    horizon=k,
                     current_plans=planning_state.current_plans,
                     global_nodes=planning_state.global_nodes.nodes,
                     serve_mark=planning_state.global_nodes.serve_mark,
@@ -192,20 +274,21 @@ def generate_dataset(
                 "capacity": cfg.capacity,
                 "max_time": cfg.max_time,
             }
-            rows = collect_rows_from_call(
+            row = collect_rows_from_call(
                 time_now=obs["time"],
                 observations=demands,
                 agent_states_xyz=agent_states,
                 depot_xy=obs["depot"],
-                horizon=1,
+                k=k,
                 current_plans=planning_state.current_plans,
                 global_nodes=planning_state.global_nodes.nodes,
                 serve_mark=planning_state.global_nodes.serve_mark,
                 unserved_count=planning_state.get_unserved_count(),
                 targets=targets,
                 meta=meta,
+                full_capacity=cfg.capacity,
             )
-            all_rows.extend(rows)
+            all_rows.append(row)
 
             # 环境前进一步
             # 让每个 agent 朝队首目标移动一步（与 train.py 一致）
@@ -252,6 +335,7 @@ def main():
     ap.add_argument("--val_ratio", type=float, default=0.1)
     ap.add_argument("--out_dir", type=str, default="data")
     ap.add_argument("--replan_policy", type=str, default="always", choices=["always", "on_new_or_empty"])
+    ap.add_argument("--k", type=int, default=3, help="每个监督样本的未来步数标签")
     args = ap.parse_args()
 
     cfg = get_default_config()
@@ -267,6 +351,7 @@ def main():
         out_dir=args.out_dir,
         val_ratio=args.val_ratio,
         replan_policy=args.replan_policy,
+        k=args.k,
     )
 
 
