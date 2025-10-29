@@ -43,15 +43,42 @@ class GridEnvironment:
 		self.expiry_penalty_scale = expiry_penalty_scale
 		self._state: Optional[EnvState] = None
 
+		# cache for resolved full capacity to avoid repeated imports
+		self._resolved_full_capacity: Optional[int] = None
+
+	def _full_capacity(self) -> int:
+		"""Return the vehicle full capacity.
+
+		Priority:
+		1) self.capacity if available
+		2) configs.capacity (from project-level configs.py) as a fallback
+		"""
+		# Fast path: explicitly provided on init
+		if getattr(self, "capacity", None) is not None:
+			return int(self.capacity)
+		# Cached fallback if already resolved once
+		if self._resolved_full_capacity is not None:
+			return int(self._resolved_full_capacity)
+		# Try to import from configs.py
+		try:
+			import configs  # type: ignore
+			value = int(getattr(configs, "capacity"))
+			self._resolved_full_capacity = value
+			return value
+		except Exception:
+			# Last-resort default to 0 to avoid crashes; callers should handle if needed
+			self._resolved_full_capacity = 0
+			return 0
+
 	# --- Core API ---
 	def reset(self, seed: Optional[int] = None) -> Dict:
 		if self._generator:
 			self._generator.reset(seed)
-		agent_states = [AgentState(x=self.depot[0], y=self.depot[1], s=self.capacity) for _ in range(self._num_agents)] if hasattr(self, "_num_agents") else []
+		agent_states = [AgentState(x=self.depot[0], y=self.depot[1], s=self._full_capacity()) for _ in range(self._num_agents)] if hasattr(self, "_num_agents") else []
 		# If num_agents was not set via property yet, default to 1
 		if not agent_states:
 			self._num_agents = 1
-			agent_states = [AgentState(x=self.depot[0], y=self.depot[1], s=self.capacity)]
+			agent_states = [AgentState(x=self.depot[0], y=self.depot[1], s=self._full_capacity())]
 		self._state = EnvState(time=0, agent_states=agent_states, depot=self.depot, demands=[])
 		# initialize episode-level statistics
 		self._episode_stats = {
@@ -102,7 +129,11 @@ class GridEnvironment:
 			a = self._state.agent_states[i]
 			nx = max(0, min(self.width - 1, a.x + max(-1, min(1, dx))))
 			ny = max(0, min(self.height - 1, a.y + max(-1, min(1, dy))))
-			self._state.agent_states[i] = AgentState(x=nx, y=ny, s=a.s)
+			# if agent arrives at depot, refill to full capacity
+			new_s = a.s
+			if (nx, ny) == self.depot:
+				new_s = self._full_capacity()
+			self._state.agent_states[i] = AgentState(x=nx, y=ny, s=new_s)
 		# 3) serve demands when an agent arrives on a demand cell (simplified: remove demand entirely)
 		remaining: List[Demand] = []
 		pos_to_agent_idx = {(a.x, a.y): idx for idx, a in enumerate(self._state.agent_states)}

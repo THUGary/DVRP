@@ -30,7 +30,7 @@ def build_env(cfg: Config) -> Tuple[GridEnvironment, RuleBasedGenerator, RuleBas
         max_time=cfg.max_time,
     )
     env.num_agents = cfg.num_agents
-    planner = RuleBasedPlanner(**cfg.planner_params)
+    planner = RuleBasedPlanner(full_capacity=cfg.capacity, **cfg.planner_params)
     controller = RuleBasedController(**cfg.controller_params)
     return env, gen, planner, controller
 
