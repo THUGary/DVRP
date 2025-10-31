@@ -43,6 +43,9 @@ class GridEnvironment:
 		self.expiry_penalty_scale = expiry_penalty_scale
 		self._state: Optional[EnvState] = None
 
+		# cache for resolved full capacity to avoid repeated imports
+		self._resolved_full_capacity: Optional[int] = None
+
 	def _full_capacity(self) -> int:
 		"""Return the vehicle full capacity.
 
@@ -66,16 +69,16 @@ class GridEnvironment:
 			# Last-resort default to 0 to avoid crashes; callers should handle if needed
 			self._resolved_full_capacity = 0
 			return 0
-		
+
 	# --- Core API ---
 	def reset(self, seed: Optional[int] = None) -> Dict:
 		if self._generator:
 			self._generator.reset(seed)
-		agent_states = [AgentState(x=self.depot[0], y=self.depot[1], s=self.capacity) for _ in range(self._num_agents)] if hasattr(self, "_num_agents") else []
+		agent_states = [AgentState(x=self.depot[0], y=self.depot[1], s=self._full_capacity()) for _ in range(self._num_agents)] if hasattr(self, "_num_agents") else []
 		# If num_agents was not set via property yet, default to 1
 		if not agent_states:
 			self._num_agents = 1
-			agent_states = [AgentState(x=self.depot[0], y=self.depot[1], s=self.capacity)]
+			agent_states = [AgentState(x=self.depot[0], y=self.depot[1], s=self._full_capacity())]
 		self._state = EnvState(time=0, agent_states=agent_states, depot=self.depot, demands=[])
 		# initialize episode-level statistics
 		self._episode_stats = {

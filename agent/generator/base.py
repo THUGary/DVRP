@@ -26,7 +26,15 @@ class BaseDemandGenerator(ABC):
         self.width = width
         self.height = height
         self.params = params
-        self.total_demand=int(params.get("total_demand",1))
+        # Depot coordinate (optional). When provided, generators may avoid producing demands at depot.
+        depot = params.get("depot")
+        try:
+            self.depot = tuple(depot) if depot is not None else None
+        except Exception:
+            print("[Generator] Warning: no depot input, demand generator may produce demands at depot.")
+            self.depot = None
+        # Remaining total demand budget (for certain generators)
+        self.total_demand = int(params.get("total_demand", 1))
 
     def reset(self, seed: Optional[int] = None) -> None:
         """Reset internal state. Implementations may use seed for RNG."""

@@ -14,9 +14,15 @@ from agent.planner import RepairBasedStabilityOptimizer
 from agent.planner import DistributedCooperativePlanner
 
 
-
 def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, RuleBasedGenerator, RuleBasedPlanner, RuleBasedController]:
-	gen = RuleBasedGenerator(cfg.width, cfg.height, **cfg.generator_params)
+	# choose generator class by config
+	if cfg.generator_type == "net":
+		# lazy import to avoid unnecessary dependencies when not used
+		from agent.generator.net_generator import NetDemandGenerator as GenClass
+	else:
+		from agent.generator import RuleBasedGenerator as GenClass
+
+	gen = GenClass(cfg.width, cfg.height, **cfg.generator_params)
 	env = GridEnvironment(
 		width=cfg.width,
 		height=cfg.height,
@@ -41,7 +47,6 @@ def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, RuleBase
 		planner = DistributedCooperativePlanner(auction_rounds=5, bid_strategy='time_urgency')
 	else:
 		raise ValueError(f"Unknown planner type: {planner_type}")
-
 	controller = RuleBasedController(**cfg.controller_params)
 	return env, gen, planner, controller
 
@@ -53,23 +58,23 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 	done = False
 	step = 0
 	renderer = None
-	
+
 	# 初始化规划状态管理器
 	planning_state = PlanningState()
 	planning_state.reset(cfg.num_agents)
-	
+
 	# 记录上一步的需求，用于检测新增需求
 	prev_demands = []
-	
+
 	if render:
 		renderer = PygameRenderer(cfg.width, cfg.height)
 		renderer.init()
-	
+
 	while not done:
 		# 检测新增的需求
 		current_demands = obs["demands"]
 		new_demands = [d for d in current_demands if d not in prev_demands]
-		
+
 		# 更新规划状态（在规划之前）
 		agent_states = obs["agent_states"]  # list of (x,y,s)
 		update_planning_state(
@@ -78,7 +83,7 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 			new_demands=new_demands,
 			obs_demands=current_demands,
 		)
-		
+
 		# Plan targets using current observation with enhanced information
 		agents = [type("S", (), {"x": x, "y": y, "s": s}) for (x, y, s) in agent_states]
 		targets = planner.plan(
@@ -92,19 +97,19 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 			serve_mark=planning_state.global_nodes.serve_mark,  # 新增：服务标记
 			unserved_count=planning_state.get_unserved_count(),  # 新增：未服务节点数量
 		)
-		
+
 		# 更新规划结果到状态管理器
 		planning_state.update_plans(targets)
-		
+
 		# Controller decides per-agent move
 		actions: List[Tuple[int, int]] = []
 		for i, (x, y, s) in enumerate(agent_states):
 			actions.append(controller.act((x, y), targets[i]))
-		
+
 		# 执行动作并更新环境
 		obs, reward, done, info = env.step(actions)
 		prev_demands = list(current_demands)
-		
+
 		if renderer is not None:
 			if not renderer.render(obs):
 				break

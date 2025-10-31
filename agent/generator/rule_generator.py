@@ -42,6 +42,32 @@ class Neighborhood:
                 demand_t.append(demand)
         return demand_t
 
+    def sample_one_xy(self) -> Tuple[int, int]:
+        """Sample a single (x,y) according to this neighborhood's configured distribution.
+        Falls back to uniform on the whole grid if distribution params are missing.
+        """
+        dist = self.params.get("distribution")
+        xy = None
+        try:
+            if dist == "uniform":
+                arr = self._sample_uniform_2d(1)
+                xy = (int(arr[0, 0]), int(arr[0, 1])) if arr is not None and len(arr) > 0 else None
+            elif dist == "gaussian":
+                arr = self._sample_gaussian_2d(1)
+                xy = (int(arr[0, 0]), int(arr[0, 1])) if arr is not None and len(arr) > 0 else None
+            elif dist == "cluster":
+                arr = self._sample_cluster_2d(1)
+                xy = (int(arr[0, 0]), int(arr[0, 1])) if arr is not None and len(arr) > 0 else None
+        except Exception:
+            xy = None
+
+        if xy is None:
+            # fallback: uniform over the whole map
+            x = int(np.random.randint(0, max(1, int(self.width))))
+            y = int(np.random.randint(0, max(1, int(self.height))))
+            xy = (x, y)
+        return xy
+
     def _sample_poisson_process(self,max_time:float,delta_t:float=1.0) -> Tuple[int, np.ndarray]:
         """Sample demand temporal points using Poisson process"""
         
@@ -225,12 +251,40 @@ class RuleBasedGenerator(BaseDemandGenerator):
         all_demands = []
 
         # Sample demand points from all concentrated generation areas
+        # and resample those coinciding with depot (with attempt limit)
+        max_tries = int(self.params.get("resample_depot_overlap_max_tries", 8))
+        depot_xy = tuple(self.depot) if getattr(self, "depot", None) is not None else None
         for neighborhood in self.neighborhoods:
             demands = neighborhood.sample(t)
-            all_demands.extend(demands)
+            if depot_xy is None or len(demands) == 0:
+                all_demands.extend(demands)
+                continue
+
+            dx, dy = depot_xy
+            for d in demands:
+                if d.x == dx and d.y == dy:
+                    # resample location up to max_tries
+                    new_xy = (d.x, d.y)
+                    ok = False
+                    for _ in range(max_tries):
+                        sx, sy = neighborhood.sample_one_xy()
+                        if sx == dx and sy == dy:
+                            continue
+                        new_xy = (sx, sy)
+                        ok = True
+                        break
+                    if ok:
+                        all_demands.append(Demand(x=int(new_xy[0]), y=int(new_xy[1]), t=d.t, c=d.c, end_t=d.end_t))
+                    else:
+                        # give up: drop this demand (rare)
+                        continue
+                else:
+                    all_demands.append(d)
 
         # Merge demands fallen into the same grid cell
         merged_demands = self._merge_demands_by_grid(all_demands)
+        
+        # After per-neighborhood resampling, merged_demands should no longer contain depot-overlapping points
 
         total_c = sum(d.c for d in merged_demands)
         self.total_demand -= total_c

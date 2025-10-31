@@ -5,6 +5,12 @@ from typing import List, Tuple, Dict, Any
 from collections import deque
 
 import torch
+import math
+
+try:
+    import numpy as _np  # 仅用于保存前的类型规整；加载时无需 numpy
+except Exception:  # numpy 可选依赖
+    _np = None
 
 from configs import get_default_config, Config
 from environment.env import GridEnvironment
@@ -22,6 +28,72 @@ from utils.state_manager import PlanningState, update_planning_state
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def _to_builtin_number(x: Any) -> Any:
+    """将 numpy 标量/torch 标量 转换为内置 Python number，其他类型原样返回。"""
+    # numpy 标量
+    if _np is not None and isinstance(x, _np.generic):
+        return x.item()
+    # torch 标量张量
+    if isinstance(x, torch.Tensor) and x.dim() == 0:
+        return x.item()
+    return x
+
+
+def _sanitize_for_torch_save(obj: Any) -> Any:
+    """
+    递归地将对象转换为 PyTorch 2.6+ 在默认 weights_only 加载下也安全/可兼容的结构：
+    - 仅包含基础类型(int/float/bool/str/None)、
+      以及由 list/tuple/dict 组合的容器；
+    - 对 numpy.ndarray 转换为嵌套 Python 列表（其中元素再递归规整为内置标量）；
+    - 对 numpy 标量/torch 0D 张量转换为内置标量；
+    - 对 torch 张量保留为张量（weights_only 允许张量）；
+    - 对 deque/set 转换为 list。
+    注意：不引入任何用户自定义类实例，避免触发反序列化限制。
+    """
+    # None 或基础类型
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        # 防止 NaN/Inf 作为 float 落盘造成解析差异：统一为 Python float
+        if isinstance(obj, float):
+            if math.isnan(obj):
+                return float("nan")
+            if math.isinf(obj):
+                return float("inf") if obj > 0 else float("-inf")
+        return obj
+
+    # numpy 数组
+    if _np is not None and isinstance(obj, _np.ndarray):
+        # 转换为嵌套 list，并递归规整元素
+        return _sanitize_for_torch_save(obj.tolist())
+
+    # numpy 标量 / torch 标量
+    builtin_num = _to_builtin_number(obj)
+    if builtin_num is not obj:
+        return builtin_num
+
+    # torch 张量（非标量）
+    if isinstance(obj, torch.Tensor):
+        return obj.contiguous()
+
+    # 容器类型
+    if isinstance(obj, (list, tuple, set, deque)):
+        seq = list(obj)  # 统一为 list
+        return [_sanitize_for_torch_save(v) for v in seq]
+
+    if isinstance(obj, dict):
+        # 键尽量转为 str，值递归规整
+        new_dict: Dict[str, Any] = {}
+        for k, v in obj.items():
+            if isinstance(k, (int, float, bool)):
+                k = str(k)
+            elif not isinstance(k, str):
+                k = str(k)
+            new_dict[k] = _sanitize_for_torch_save(v)
+        return new_dict
+
+    # 元组(如坐标)可能出现在上面的分支；若落到这里，兜底转字符串避免自定义类型
+    return str(obj)
 
 
 def _build_planner(planner_type: str, capacity: int | None = None):
@@ -314,12 +386,21 @@ def generate_dataset(
     prefix = "plans"
     train_path = os.path.join(out_dir, f"{prefix}_train_{cfg.width}_{cfg.num_agents}.pt")
     val_path = os.path.join(out_dir, f"{prefix}_val_{cfg.width}_{cfg.num_agents}.pt")
+    # 保存前进行类型规整，确保不包含 numpy 标量/数组、deque 或自定义对象
     payload = {
         "rows": trn_rows,
-        "meta": {"total_rows": len(trn_rows), "val_rows": len(val_rows), "version": "v1"},
+        "meta": {
+            "total_rows": len(trn_rows),
+            "val_rows": len(val_rows),
+            "version": "v2",
+            "weights_only_compatible": True,
+        },
     }
-    torch.save(payload, train_path)
-    torch.save({"rows": val_rows, "meta": payload["meta"]}, val_path)
+    safe_train = _sanitize_for_torch_save(payload)
+    safe_val = _sanitize_for_torch_save({"rows": val_rows, "meta": payload["meta"]})
+
+    torch.save(safe_train, train_path)
+    torch.save(safe_val, val_path)
     print(f"[DATA] saved train={train_path} ({len(trn_rows)}) val={val_path} ({len(val_rows)})")
     return {"train": train_path, "val": val_path}
 
