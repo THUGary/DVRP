@@ -53,13 +53,13 @@ class Neighborhood:
         # Handle the case where no events are generated
         if events_count == 0:
             return 0, np.array([])
-            
-        time_series=np.random.uniform(0, max_time, size=events_count)
-        time_series= ((time_series-min(time_series)) // delta_t).astype(int)
-        
-        # return sorted time series
-        return events_count, np.sort(time_series)
-    
+
+        time_series=np.random.randint(0, max_time, size=events_count)
+        time_series.sort()
+        time_series=time_series-time_series[0]
+
+        return events_count, time_series
+
     def _generate_demands(self, distribution: str, count: int) -> List[Demand]:
         """Generate demand points at time t."""
 

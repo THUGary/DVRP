@@ -12,14 +12,14 @@ class Config:
 	num_agents: int = 5
 	capacity: int = 200
 	depot: Tuple[int, int] = (0, 0)
-	max_time: int = 100
+	max_time: int = 100 # the value has to be consistent with generator_params' max_time
 
 	# Generator params
 	generator_type: str = "net"  # "rule" | "net"
 	generator_params: Dict[str, Any] = field(default_factory=lambda: {
 		"max_per_step": 2, # not used in rule-based generator
 		"total_demand":50,
-		"max_time":50, 
+		"max_time": "__MAX_TIME__",  # placeholder to be replaced with Config.max_time
 		"max_c": 5, # from 1 to 10
 		"min_lifetime": 40,
 		"max_lifetime": 50,
@@ -38,6 +38,10 @@ class Config:
 	# Controller params
 	controller_type: str = "rule"
 	controller_params: Dict[str, Any] = field(default_factory=dict)
+      
+	def __post_init__(self):
+		if self.generator_params.get("max_time") == "__MAX_TIME__":
+			self.generator_params["max_time"] = self.max_time
 
 
 def get_default_config() -> Config:
