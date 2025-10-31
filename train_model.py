@@ -294,6 +294,8 @@ def main():
     # 数据路径
     train_path = os.path.join(args.data_dir, f"{args.prefix}_train_{args.map_wid}_{args.agent_num}.pt")
     val_path = os.path.join(args.data_dir, f"{args.prefix}_val_{args.map_wid}_{args.agent_num}.pt")
+    # debug
+    # print(f"Train data path: {train_path}")
     if not (os.path.exists(train_path) and os.path.exists(val_path)):
         raise FileNotFoundError(f"Missing data files: {train_path} or {val_path}. Run data_gen.py first.")
 
