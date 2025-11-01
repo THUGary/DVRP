@@ -8,45 +8,66 @@ import numpy as np
 
 
 class Neighborhood:
-    """Neighborhood for generating demand points"""
+    """Neighborhood for generating demands (2Dpositions, timestamps, quantities, lifetimes).\n
+    **require params:**
+    - center coordinates in `(center_x, center_y)`
+    - rng: random.Random instance
+    - local_params: dict, keys including: `distribution` (with its related parameters), \n
+        `lambda_param`, `max_c`, `min_lifetime`, `max_lifetime`
+    - env_params: dict, keys including: `width`, `height`, `depot`, `max_time`
+    - burst_params: dict, keys including: `burst_mode` (bool), `burst_prob` (float, 0~1)
+    """
     
-    def __init__(self, center_x: float, center_y: float, width: int, height: int, 
-                 rng: random.Random, params: dict) -> None:
-        self.center_x = center_x
-        self.center_y = center_y
-        self.width = width
-        self.height = height
+    def __init__(self, center: tuple [float, float],  
+                 rng: random.Random, local_params: dict, env_params: dict, burst_params: dict) -> None:
+        self.center_x = center[0]
+        self.center_y = center[1]
         self.rng = rng
-        self.params = params
+        self.local_params= local_params
+        self.env_params = env_params
+        self.burst_params = burst_params
 
         # Poisson Process parameters
-        self.lambda_param = params.get("lambda_param", 0.5)
+        self.lambda_param = local_params.get("lambda_param", 0.5)
         
 		# Demand generation parameters
-        self.max_c = int(params.get("max_c", 1))
-        self.min_lifetime = int(params.get("min_lifetime", 5))
-        self.max_lifetime = int(params.get("max_lifetime", 15))
-        self.max_time=float(params.get("max_time",10))
+        self.max_c = int(local_params.get("max_c", 1))
+        self.min_lifetime = int(local_params.get("min_lifetime", 5))
+        self.max_lifetime = int(local_params.get("max_lifetime", 15))
+        self.max_time=float(env_params.get("max_time",10))
+        self.width=env_params.get("width",10)
+        self.height=env_params.get("height",10)
         
-        # Generate demand point numbers for all time steps in advance
-        self.events_count, self.time_series = self._sample_poisson_process(max_time=self.max_time, delta_t=1.0)
-        # print(f"number of events sampled: {self.events_count}")
-        self.demands=self._generate_demands(distribution=self.params.get("distribution"), count=self.events_count)
+
+        # Generate Basic demands and Burst demands IN ADVANCE
+        self.basic_demands, self.burst_demands = \
+            self._generate_demands(self.local_params.get("distribution"),
+                                   burst_mode=self.burst_params.get("burst_mode", False))
         
     def sample(self, t: int) -> List[Demand]:
         """Sample demand points for current time step"""
 
         demand_t = []
-        for i, demand in enumerate(self.demands):
-            if self.time_series[i] == t:
+        for demand in self.basic_demands:
+            if demand.t==t:
                 demand_t.append(demand)
+        # remove sampled basic demands, which always come first in the list
+        num_basic=len(demand_t)
+        self.basic_demands=self.basic_demands[num_basic:]
+
+        for demand in self.burst_demands:
+            if demand.t==t:
+                demand_t.append(demand)
+        num_burst=len(demand_t)-num_basic
+        self.burst_demands=self.burst_demands[num_burst:]
+
         return demand_t
 
     def sample_one_xy(self) -> Tuple[int, int]:
         """Sample a single (x,y) according to this neighborhood's configured distribution.
         Falls back to uniform on the whole grid if distribution params are missing.
         """
-        dist = self.params.get("distribution")
+        dist = self.local_params.get("distribution")
         xy = None
         try:
             if dist == "uniform":
@@ -68,27 +89,55 @@ class Neighborhood:
             xy = (x, y)
         return xy
 
-    def _sample_poisson_process(self,max_time:float,delta_t:float=1.0) -> Tuple[int, np.ndarray]:
-        """Sample demand temporal points using Poisson process"""
-        
-        if self.lambda_param <= 0 or max_time <= 0 or delta_t <= 0:
+    def _sample_poisson_process(self,max_time:int, lambda_param: float) -> Tuple[int, np.ndarray]:
+        """Sample demand temporal points using Poisson process.\n
+        returns events_count, time_series in chronical order. 
+        """
+
+        if lambda_param <= 0 or max_time <= 0:
             return 0, np.array([])
 
-        events_count=np.random.poisson(self.lambda_param * max_time)
-        
+        events_count = np.random.poisson(lambda_param * max_time)
+
         # Handle the case where no events are generated
         if events_count == 0:
             return 0, np.array([])
 
-        time_series=np.random.randint(0, max_time, size=events_count)
+        time_series = np.random.randint(0, max_time, size=events_count)
         time_series.sort()
-        time_series=time_series-time_series[0]
+        time_series = time_series - time_series[0]
 
         return events_count, time_series
 
-    def _generate_demands(self, distribution: str, count: int) -> List[Demand]:
-        """Generate demand points at time t."""
+    def _generate_demands(self, distribution: str, burst_mode: bool=False) -> Tuple[List[Demand], List[Demand]]:
+        """Generate demands according to the specified distribution.\n
+        returns basic_demands, burst_demands (empty if burst_mode is False)
+        """
 
+        if burst_mode:
+            burst_prob = self.burst_params.get("burst_prob")
+            if burst_prob is not None:
+                _ , burst_timestamps = self._sample_poisson_process(
+                    max_time=self.max_time, lambda_param=burst_prob * self.lambda_param)
+                burst_demands = self._burst_demand(distribution=distribution, time_series=burst_timestamps)
+            else:
+                burst_prob=0.0
+                burst_demands=[]
+                print("No burst probability parameter! Set to 0.0 by default.")
+        else:
+            burst_prob = 0.0
+            burst_demands = []
+        
+        _, basic_timestamps = self._sample_poisson_process(
+            max_time=self.max_time, lambda_param=(1 - burst_prob) * self.lambda_param)
+        
+        basic_demands=self._basic_demands(distribution=distribution, time_series=basic_timestamps)
+        return basic_demands, burst_demands
+
+    def _basic_demands(self, distribution: str, time_series: list[int]) -> List[Demand]:
+        """Generate basic demands"""
+
+        count=len(time_series)
         if distribution == "uniform":
             samples = self._sample_uniform_2d(count)
         elif distribution == "gaussian":
@@ -102,18 +151,40 @@ class Neighborhood:
         for i, (px, py) in enumerate(samples):
             c = np.random.randint(1, self.max_c + 1)
             lifetime = np.random.randint(self.min_lifetime, self.max_lifetime + 1)
-            end_t = self.time_series[i] + lifetime
-            demand = Demand(x=px, y=py, t=self.time_series[i], c=c, end_t=end_t)
+            end_t = time_series[i] + lifetime
+            demand = Demand(x=px, y=py, t=time_series[i], c=c, end_t=end_t)
             demands.append(demand)
         return demands
     
-    def _sample_uniform_2d(self,n_points:int) -> tuple[float, float]:
+    def _burst_demand(self,distribution: str, time_series:List[int]) -> List[Demand]:
+        """Generate burst demands"""
+
+        count=len(time_series)
+        if distribution == "uniform":
+            samples = self._sample_uniform_2d(count,burst_mode=True)
+        elif distribution == "gaussian":
+            samples= self._sample_gaussian_2d(count,burst_mode=True)
+        elif distribution == "cluster":
+            samples = self._sample_cluster_2d(count,burst_mode=True)
+        else:
+            raise ValueError(f"Unknown distribution: {distribution}")
+        demands = []
+        for i, (px,py) in enumerate(samples):
+            c=self.max_c
+            end_t=time_series[i]+self.max_lifetime
+            demand = Demand(x=px, y=py, t=time_series[i], c=c, end_t=end_t)
+            demands.append(demand)
+        return demands
+    
+    def _sample_uniform_2d(self,n_points:int, burst_mode: bool=False) -> tuple[float, float]:
         """sample uniform 2D points around the center"""
         
-        size=self.params.get("size")
+        size=self.local_params.get("size")
         if size is None:
             print("No uniform distribution params!")
             return None
+        if burst_mode:
+            size=np.ceil(np.sqrt(n_points))
 
         x_low=max(0,math.floor(self.center_x-size))
         x_high=min(self.width-1,math.ceil(self.center_x+size))
@@ -124,15 +195,18 @@ class Neighborhood:
         # print(f"Uniform samples x in [{x_low},{x_high}], y in [{y_low},{y_high}]")
         return np.column_stack((gx, gy))
 
-    def _sample_gaussian_2d(self,n_points:int) -> tuple[float, float]:
+    def _sample_gaussian_2d(self,n_points:int, burst_mode: bool=False) -> tuple[float, float]:
         """sample a 2D Gaussian point around the center"""
 
-        sigma1=self.params.get("sigma1")
-        sigma2=self.params.get("sigma2")
-        rho=self.params.get("rho")
+        sigma1=self.local_params.get("sigma1")
+        sigma2=self.local_params.get("sigma2")
+        rho=self.local_params.get("rho") # 0 by default
         if sigma1 is None or sigma2 is None or rho is None:
             print("No Gaussian distribution params!")
             return None
+        if burst_mode:
+            sigma1=np.ceil(np.sqrt(n_points)/3)
+            sigma2=sigma1
 
         mean=np.array([self.center_x, self.center_y])
         cov=rho * sigma1 * sigma2
@@ -146,13 +220,16 @@ class Neighborhood:
         gy = np.clip(gy, 0, int(self.height) - 1)
         return np.column_stack((gx, gy))
     
-    def _sample_cluster_2d(self, n_points: int) -> np.ndarray:
+    def _sample_cluster_2d(self, n_points: int, burst_mode:bool=False) -> np.ndarray:
         """sample points in 2D with exponential decay from center"""
 
-        scale_factor= self.params.get("scale_factor")
+        scale_factor= self.local_params.get("scale_factor")
         if scale_factor is None:
             print("No cluster distribution params!")
             return None
+        
+        if burst_mode:
+            scale_factor=np.sqrt(n_points)/5.0
         
         W, H = self.width, self.height
         
@@ -173,6 +250,7 @@ class Neighborhood:
         y_selected = indices // W
         
         return np.column_stack((x_selected, y_selected))
+
 
 
 class RuleBasedGenerator(BaseDemandGenerator):
@@ -217,7 +295,7 @@ class RuleBasedGenerator(BaseDemandGenerator):
             elif distribution=="cluster":
                 distribution_params={
                     "distribution":"cluster",
-                    "scale_factor":50*size,
+                    "scale_factor":size/5.0,
                 }
 
             local_params={
@@ -225,17 +303,24 @@ class RuleBasedGenerator(BaseDemandGenerator):
                 "max_c":local_max_c,
                 "min_lifetime":self.params.get("min_lifetime",10),
                 "max_lifetime":self.params.get("max_lifetime",25),
-                "max_time":self.params.get("max_time",50),
                 **distribution_params,
             }
-           
+            env_params={
+                "width":self.width,
+                "height":self.height,
+                "depot":self.depot,
+                "max_time":self.max_time,
+            }
+            burst_params={
+                "burst_mode": True,
+                "burst_prob": random.uniform(0.1,0.2),
+            }
             neighborhood = Neighborhood(
-                center_x=center_x,
-                center_y=center_y,
-                width=self.width,
-                height=self.height,
+                (center_x, center_y),
                 rng=self._rng,
-                params=local_params,
+                local_params=local_params,
+                env_params=env_params,
+                burst_params=burst_params,
             )
             neighborhoods.append(neighborhood)
         

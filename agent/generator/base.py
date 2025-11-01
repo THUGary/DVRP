@@ -35,6 +35,7 @@ class BaseDemandGenerator(ABC):
             self.depot = None
         # Remaining total demand budget (for certain generators)
         self.total_demand = int(params.get("total_demand", 1))
+        self.max_time = int(params.get("max_time", 0))
 
     def reset(self, seed: Optional[int] = None) -> None:
         """Reset internal state. Implementations may use seed for RNG."""
