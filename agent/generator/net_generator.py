@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 import torch
 import numpy as np
 
@@ -86,6 +86,8 @@ class NetDemandGenerator(BaseDemandGenerator):
         min_lifetime = self.params["min_lifetime"]
         max_lifetime = self.params["max_lifetime"]
 
+        depot_xy: Optional[Tuple[int, int]] = tuple(self.depot) if getattr(self, "depot", None) is not None else None
+
         for demand_data in demands_np:
             # Use the utility function to un-normalize
             t_unnorm = unnormalize_value(demand_data[0], 0, max_time - 1)
@@ -103,9 +105,44 @@ class NetDemandGenerator(BaseDemandGenerator):
             
             end_t = t + lifetime
 
+            if depot_xy is not None and (x, y) == depot_xy:
+                relocated = self._relocate_from_depot(x, y)
+                if relocated is None:
+                    continue
+                x, y = relocated
+
             demand = Demand(x=x, y=y, t=t, c=c, end_t=end_t)
 
             # Store the demand in a dictionary keyed by its appearance time
             if t not in self.pre_generated_demands:
                 self.pre_generated_demands[t] = []
             self.pre_generated_demands[t].append(demand)
+
+    def _relocate_from_depot(self, x: int, y: int) -> Optional[Tuple[int, int]]:
+        """Find a nearby alternative cell when a demand collides with the depot."""
+        depot = getattr(self, "depot", None)
+        if depot is None:
+            return (x, y)
+
+        dx, dy = tuple(depot)
+        if (x, y) != (dx, dy):
+            return (x, y)
+
+        max_radius = max(self.width, self.height)
+        for radius in range(1, max_radius + 1):
+            x_min = max(0, x - radius)
+            x_max = min(self.width - 1, x + radius)
+            y_min = max(0, y - radius)
+            y_max = min(self.height - 1, y + radius)
+            for ny in range(y_min, y_max + 1):
+                for nx in range(x_min, x_max + 1):
+                    if (nx, ny) == (dx, dy):
+                        continue
+                    return (nx, ny)
+
+        for ny in range(self.height):
+            for nx in range(self.width):
+                if (nx, ny) != (dx, dy):
+                    return (nx, ny)
+
+        return None

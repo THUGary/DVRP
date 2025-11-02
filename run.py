@@ -1,0 +1,181 @@
+from __future__ import annotations
+import argparse
+import random
+from typing import List, Tuple
+
+from configs import get_default_config, Config
+from environment.env import GridEnvironment
+from agent.controller import RuleBasedController
+from utils.pygame_renderer import PygameRenderer
+from utils.state_manager import PlanningState, update_planning_state
+from agent.generator.base import BaseDemandGenerator
+from agent.planner.base import BasePlanner
+from agent.planner import RuleBasedPlanner
+from agent.planner import FastReactiveInserter
+from agent.planner import RepairBasedStabilityOptimizer
+from agent.planner import DistributedCooperativePlanner
+from agent.planner import ModelPlanner
+
+
+def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, BaseDemandGenerator, BasePlanner, RuleBasedController]:
+	# choose generator class by config
+	if cfg.generator_type == "net":
+		# lazy import to avoid unnecessary dependencies when not used
+		from agent.generator.net_generator import NetDemandGenerator as GenClass
+	else:
+		from agent.generator import RuleBasedGenerator as GenClass
+
+	gen = GenClass(cfg.width, cfg.height, **cfg.generator_params)
+	env = GridEnvironment(
+		width=cfg.width,
+		height=cfg.height,
+		num_agents=cfg.num_agents,
+		capacity=cfg.capacity,
+		depot=cfg.depot,
+		generator=gen,
+		max_time=cfg.max_time,
+	)
+	env.num_agents = cfg.num_agents
+	if planner_type == "greedy":
+		# 使用 Rule-based Planner（需要显式传入 full_capacity 来自 Config.capacity）
+		planner = RuleBasedPlanner(full_capacity=cfg.capacity, **cfg.planner_params)
+	elif planner_type == "fri":
+		# 使用 Fast Reactive Inserter
+		planner = FastReactiveInserter()
+	elif planner_type == "rbso":
+		# 使用 Repair-based Stability Optimizer（带参数）
+		planner = RepairBasedStabilityOptimizer(destroy_ratio=0.3, local_search_iters=10)
+	elif planner_type == "dcp":
+		# 使用 Distributed Cooperative Planner（带参数）
+		planner = DistributedCooperativePlanner(auction_rounds=5, bid_strategy='time_urgency')
+	elif planner_type == "model":
+		planner_params = dict(cfg.planner_params)
+		ckpt_path = planner_params.pop("ckpt", None)
+		planner = ModelPlanner(full_capacity=cfg.capacity, **planner_params)
+		if ckpt_path:
+			if hasattr(planner, "load_from_ckpt"):
+				planner.load_from_ckpt(ckpt_path)
+			else:
+				raise RuntimeError("Selected planner does not support checkpoint loading.")
+	else:
+		raise ValueError(f"Unknown planner type: {planner_type}")
+	controller = RuleBasedController(**cfg.controller_params)
+	return env, gen, planner, controller
+
+
+def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10, planner: str = "greedy") -> None:
+	# deterministically randomize depot location per episode
+	rng = random.Random(seed)
+	depot = (rng.randint(0, cfg.width - 1), rng.randint(0, cfg.height - 1))
+	cfg.depot = depot
+	cfg.generator_params = {**cfg.generator_params, "depot": depot}
+
+	planner_type = planner
+	env, gen, planner_impl, controller = build_env(cfg, planner_type=planner_type)
+	obs = env.reset(seed)
+	total_reward = 0.0
+	done = False
+	step = 0
+	renderer = None
+
+	# 初始化规划状态管理器
+	planning_state = PlanningState()
+	planning_state.reset(cfg.num_agents)
+
+	# 记录上一步的需求，用于检测新增需求
+	prev_demands = []
+
+	if render:
+		renderer = PygameRenderer(cfg.width, cfg.height)
+		renderer.init()
+
+	while not done:
+		# 检测新增的需求
+		current_demands = obs["demands"]
+		new_demands = [d for d in current_demands if d not in prev_demands]
+
+		# 更新规划状态（在规划之前）
+		agent_states = obs["agent_states"]  # list of (x,y,s)
+		update_planning_state(
+			planning_state=planning_state,
+			agent_states=agent_states,
+			new_demands=new_demands,
+			obs_demands=current_demands,
+		)
+
+		# Plan targets using current observation with enhanced information
+		agents = [type("S", (), {"x": x, "y": y, "s": s}) for (x, y, s) in agent_states]
+		plan_horizon = 1
+		if planner_type == "model":
+			plan_horizon = max(1, int(cfg.planner_params.get("time_plan", 1)))
+		targets = planner_impl.plan(
+			observations=obs["demands"],  # [(x, y, t_arrival, c, t_due), ...]
+			agent_states=agents,
+			depot=obs["depot"],
+			t=obs["time"],
+			horizon=plan_horizon,
+			current_plans=planning_state.current_plans,  # 新增：当前规划路径
+			global_nodes=planning_state.global_nodes.nodes,  # 新增：全局节点列表 [(x, y, t_arrival, t_due, demand), ...]
+			serve_mark=planning_state.global_nodes.serve_mark,  # 新增：服务标记
+			unserved_count=planning_state.get_unserved_count(),  # 新增：未服务节点数量
+		)
+
+		# 更新规划结果到状态管理器
+		planning_state.update_plans(targets)
+
+		# Controller decides per-agent move
+		actions: List[Tuple[int, int]] = []
+		for i, (x, y, s) in enumerate(agent_states):
+			actions.append(controller.act((x, y), targets[i]))
+
+		# 执行动作并更新环境
+		obs, reward, done, info = env.step(actions)
+		prev_demands = list(current_demands)
+
+		if renderer is not None:
+			if not renderer.render(obs):
+				break
+			# throttle
+			if fps > 0:
+				import time
+				time.sleep(1.0 / fps)
+		total_reward += reward
+		step += 1
+		if step % 10 == 0 or done:
+			unserved = planning_state.get_unserved_count()
+			print(f"Step {step:03d} | time={obs['time']} | reward={reward:.0f} | total={total_reward:.0f} | demands={len(obs['demands'])} | unserved={unserved}")
+	print(f"Episode done in {step} steps. Total reward={total_reward:.0f}")
+	if renderer is not None:
+		renderer.close()
+
+
+def main() -> None:
+	parser = argparse.ArgumentParser(description="Train skeleton (rule-based run)")
+	parser.add_argument("--seed", type=int, default=2025)
+	parser.add_argument("--render", action="store_true", help="Use pygame to visualize")
+	parser.add_argument("--fps", type=int, default=10, help="Render FPS when --render")
+	parser.add_argument("--planner", type=str, default="greedy", choices=["greedy", "fri", "rbso", "dcp", "model"], help="Planner type: greedy, fri, rbso, dcp, model")
+	parser.add_argument("--ckpt", type=str, default="checkpoints/planner/planner_20_2_200.pt", help="Checkpoint path for --planner model")
+	parser.add_argument("--time-plan", dest="time_plan", type=int, default=3, help="Planning horizon for --planner model")
+	parser.add_argument("--planner-device", dest="planner_device", type=str, default="cpu", choices=["cpu", "cuda"], help="Device for --planner model")
+	parser.add_argument("--lateness-lambda", dest="lateness_lambda", type=float, default=0.0, help="Lateness penalty for --planner model")
+	parser.add_argument("--d-model", dest="d_model", type=int, default=128, help="Transformer hidden size for --planner model")
+	parser.add_argument("--nhead", dest="nhead", type=int, default=8, help="Number of attention heads for --planner model")
+	parser.add_argument("--nlayers", dest="nlayers", type=int, default=2, help="Number of transformer layers for --planner model")
+	args = parser.parse_args()
+	cfg = get_default_config()
+	if args.planner == "model":
+		cfg.planner_params = {
+			"time_plan": args.time_plan,
+			"device": args.planner_device,
+			"lateness_lambda": args.lateness_lambda,
+			"d_model": args.d_model,
+			"nhead": args.nhead,
+			"nlayers": args.nlayers,
+			"ckpt": args.ckpt,
+		}
+	run_episode(cfg, seed=args.seed, render=args.render, fps=args.fps, planner=args.planner)
+
+
+if __name__ == "__main__":
+	main()
