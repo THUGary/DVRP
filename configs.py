@@ -18,7 +18,7 @@ class Config:
 	generator_type: str = "rule"  # "rule" | "net"
 	generator_params: Dict[str, Any] = field(default_factory=lambda: {
 		"max_per_step": 2, # not used in rule-based generator
-		"depot": "__depot__",  # placeholder to be replaced with Config.depot
+		"depot": "__DEPOT__",  # placeholder to be replaced with Config.depot
 		"max_time": "__MAX_TIME__",  # placeholder to be replaced with Config.max_time
 		"total_demand":50,
 		"max_c": 5, # from 1 to 10
@@ -28,6 +28,7 @@ class Config:
 		"num_centers": 6,
 		"distribution": "uniform",  # "uniform" | "gaussian" | "cluster"
 		"neighborhood_size": 3, # 3-15, the average radius of the concentrated generation areas
+		"burst_prob":0.1, # 0.0 -1.0, probability of bursting demands among all demands
         # add checkpoint path for the network-based generator
 		"model_path": "checkpoints/diffusion_model.pth",
 	})
@@ -43,7 +44,7 @@ class Config:
 	def __post_init__(self):
 		if self.generator_params.get("max_time") == "__MAX_TIME__":
 			self.generator_params["max_time"] = self.max_time
-		if self.generator_params.get("depot") == "__depot__":
+		if self.generator_params.get("depot") == "__DEPOT__":
 			self.generator_params["depot"] = self.depot
 
 
