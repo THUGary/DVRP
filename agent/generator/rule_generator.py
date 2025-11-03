@@ -72,6 +72,12 @@ class Neighborhood:
             elif dist == "cluster":
                 arr = self._sample_cluster_2d(1)
                 xy = (int(arr[0, 0]), int(arr[0, 1])) if arr is not None and len(arr) > 0 else None
+            elif dist == "explosion":##########
+                arr = self._sample_explosion_2d(1)
+                xy = (int(arr[0, 0]), int(arr[0, 1])) if arr is not None and len(arr) > 0 else None
+            elif dist == "implosion":#########
+                arr = self._sample_implosion_2d(1)
+                xy = (int(arr[0, 0]), int(arr[0, 1])) if arr is not None and len(arr) > 0 else None
         except Exception:
             xy = None
 
@@ -159,6 +165,10 @@ class Neighborhood:
             samples= self._sample_gaussian_2d(sample_count)
         elif distribution == "cluster":
             samples = self._sample_cluster_2d(sample_count)
+        elif distribution == "explosion":###########
+            samples = self._sample_explosion_2d(sample_count)
+        elif distribution == "implosion":
+            samples = self._sample_implosion_2d(sample_count)
         else:
             raise ValueError(f"Unknown distribution: {distribution}")
 
@@ -187,6 +197,10 @@ class Neighborhood:
             samples= self._sample_gaussian_2d(sample_count,burst_mode=True)
         elif distribution == "cluster":
             samples = self._sample_cluster_2d(sample_count,burst_mode=True)
+        elif distribution == "explosion":
+            samples = self._sample_explosion_2d(sample_count,burst_mode=True)
+        elif distribution == "implosion":
+            samples = self._sample_implosion_2d(sample_count,burst_mode=True)
         else:
             raise ValueError(f"Unknown distribution: {distribution}")
         demands = []
@@ -288,6 +302,63 @@ class Neighborhood:
         
         return np.column_stack((x_selected, y_selected))
 
+    def _sample_explosion_2d(self, n_points: int, burst_mode:bool=False) -> np.ndarray:  ##############
+        """sample points in 2D with exponential decay from center"""
+
+        scale_factor= self.local_params.get("scale_factor")
+        if scale_factor is None:
+            print("No cluster distribution params!")
+            return None
+        
+        if burst_mode:
+            scale_factor=np.sqrt(n_points)/5.0
+        
+        W, H = self.width, self.height
+        
+        # distance grid
+        x_coords, y_coords = np.meshgrid(np.arange(W), np.arange(H))
+        distances = np.sqrt((x_coords - self.center_x)**2 + (y_coords - self.center_y)**2)
+
+        # Explosion: probability increases with distance
+        probabilities = 1 - np.exp(-distances / scale_factor)
+        probabilities = probabilities.flatten()
+        probabilities /= probabilities.sum()
+
+        total_cells = W * H
+        indices = np.random.choice(total_cells, size=n_points, replace=(n_points > total_cells), p=probabilities)
+        
+        x_selected = indices % W
+        y_selected = indices // W
+        return np.column_stack((x_selected, y_selected))
+
+    def _sample_implosion_2d(self, n_points: int, burst_mode:bool=False) -> np.ndarray:##############
+        """sample points in 2D with exponential decay from center"""
+
+        scale_factor= self.local_params.get("scale_factor")
+        if scale_factor is None:
+            print("No cluster distribution params!")
+            return None
+        
+        if burst_mode:
+            scale_factor=np.sqrt(n_points)/5.0
+        
+        W, H = self.width, self.height
+        
+        x_coords, y_coords = np.meshgrid(np.arange(W), np.arange(H))
+        distances = np.sqrt((x_coords - self.center_x)**2 + (y_coords - self.center_y)**2)
+
+        # Implosion: sharply decaying exponential (strongly centered)
+        probabilities = np.exp(-(distances / scale_factor)**2)
+        probabilities = probabilities.flatten()
+        probabilities /= probabilities.sum()
+
+        # distance grid
+        total_cells = W * H
+        indices = np.random.choice(total_cells, size=n_points, replace=(n_points > total_cells), p=probabilities)
+
+        x_selected = indices % W
+        y_selected = indices // W
+        return np.column_stack((x_selected, y_selected))
 
 
 class RuleBasedGenerator(BaseDemandGenerator):
@@ -332,6 +403,16 @@ class RuleBasedGenerator(BaseDemandGenerator):
                 distribution_params={
                     "distribution":"cluster",
                     "scale_factor":size/5.0,
+                }
+            elif distribution == "explosion":########
+                distribution_params = {
+                "distribution": "explosion",
+                "scale_factor": size/5.0,
+                }
+            elif distribution == "implosion":########
+                distribution_params = {
+                "distribution": "implosion",
+                "scale_factor": size/5.0,
                 }
 
             local_params={
