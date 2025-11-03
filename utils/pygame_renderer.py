@@ -100,8 +100,9 @@ class PygameRenderer:
         depot = tuple(obs.get("depot", (0, 0)))
         self._draw_square(depot, color=self.DEPOT)
 
-        # draw demands
-        for (dx, dy, dt, dc) in obs.get("demands", []):
+        # draw demands (support 4-tuple or 5-tuple with end_t)
+        for d in obs.get("demands", []):
+            dx, dy, dt, dc = d[:4]
             if dt <= obs.get("time", 0):
                 self._draw_circle((dx, dy), color=self.DEMAND, radius_ratio=0.35)
 

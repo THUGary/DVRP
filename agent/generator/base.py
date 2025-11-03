@@ -9,6 +9,7 @@ class Demand:
     y: int
     t: int  # appearance time
     c: int  # quantity/demand
+    end_t: int  # cancel time (exclusive): demand is canceled when current time > end_t
 
 class BaseDemandGenerator(ABC):
     """Interface for demand generators.
@@ -25,6 +26,16 @@ class BaseDemandGenerator(ABC):
         self.width = width
         self.height = height
         self.params = params
+        # Depot coordinate (optional). When provided, generators may avoid producing demands at depot.
+        depot = params.get("depot")
+        try:
+            self.depot = tuple(depot) if depot is not None else None
+        except Exception:
+            print("[Generator] Warning: no depot input, demand generator may produce demands at depot.")
+            self.depot = None
+        # Remaining total demand budget (for certain generators)
+        self.total_demand = int(params.get("total_demand", 1))
+        self.max_time = int(params.get("max_time", 0))
 
     def reset(self, seed: Optional[int] = None) -> None:
         """Reset internal state. Implementations may use seed for RNG."""
