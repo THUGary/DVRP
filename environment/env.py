@@ -32,7 +32,8 @@ class GridEnvironment:
 		depot: Tuple[int, int] = (0, 0),
 		generator: Optional[BaseDemandGenerator] = None,
 		max_time: int = 100,
-		expiry_penalty_scale: float = 1.0,
+		expiry_penalty_scale: float = 5.0,
+		switch_penalty_coef: float = 1.0,
 	) -> None:
 		self.width = width
 		self.height = height
@@ -41,10 +42,12 @@ class GridEnvironment:
 		self.capacity = capacity
 		self._generator = generator
 		self.expiry_penalty_scale = expiry_penalty_scale
+		self.switch_penalty_coef = switch_penalty_coef
 		self._state: Optional[EnvState] = None
 
 		# cache for resolved full capacity to avoid repeated imports
 		self._resolved_full_capacity: Optional[int] = None
+		self._prev_actions: List[Action] = []
 
 	def _full_capacity(self) -> int:
 		"""Return the vehicle full capacity.
@@ -92,6 +95,9 @@ class GridEnvironment:
 			"total_distance": 0.0,
 			"episode_reward": 0.0,
 		}
+		self._episode_stats["switch_count"] = 0
+		self._episode_stats["switch_penalty"] = 0.0
+		self._prev_actions = [(0, 0) for _ in agent_states]
 		return self._obs()
 
 	def step(self, actions: List[Action]) -> Tuple[Dict, float, bool, Dict]:
@@ -125,6 +131,16 @@ class GridEnvironment:
 		# record previous positions to compute route distance
 		prev_states = [AgentState(x=a.x, y=a.y, s=a.s) for a in self._state.agent_states]
 		prev_positions = [(a.x, a.y) for a in prev_states]
+		# stability penalty: count agents that changed their intended direction
+		switch_count = 0
+		if self._prev_actions:
+			for idx, act in enumerate(actions):
+				if idx < len(self._prev_actions):
+					prev_act = self._prev_actions[idx]
+					if prev_act != (0, 0) and act != prev_act:
+						switch_count += 1
+		else:
+			self._prev_actions = [(0, 0) for _ in actions]
 		capacity_reward = 0.0
 		candidate_states: List[AgentState] = []
 		for i, (dx, dy) in enumerate(actions):
@@ -197,7 +213,8 @@ class GridEnvironment:
 
 		# net reward = total capacity served this step - distance traveled this step
 		# include expiry penalty (negative) for demands that timed out at the start of this step
-		reward = capacity_reward - float(movement_distance) + expiry_penalty
+		switch_penalty = -self.switch_penalty_coef * switch_count
+		reward = 10 * capacity_reward + expiry_penalty + 0.01 * switch_penalty
 
 		# update episode-level stats
 		self._episode_stats["served_count"] += served_count
@@ -218,6 +235,9 @@ class GridEnvironment:
 			self._episode_stats["agent_total_distances"][idx] += d
 		self._episode_stats["total_distance"] += movement_distance
 		self._episode_stats["episode_reward"] += reward
+		self._episode_stats["switch_count"] += switch_count
+		self._episode_stats["switch_penalty"] += -switch_penalty  # store positive magnitude
+		self._prev_actions = list(actions)
 
 		# 4) time update
 		self._state.time += 1
@@ -237,6 +257,8 @@ class GridEnvironment:
 				print(f"Expired (timed-out): count={es.get('expired_count',0)}, capacity={es.get('expired_capacity',0.0)}, penalty={es.get('expired_penalty',0.0)}")
 			if es.get('collision_count', 0) > 0:
 				print(f"Agent collision resolutions: {es.get('collision_count', 0)}")
+			if es.get('switch_count', 0) > 0:
+				print(f"Target switches penalized: count={es.get('switch_count', 0)}, penalty={es.get('switch_penalty', 0.0)}")
 			remaining_count = len(self._state.demands)
 			remaining_capacity = sum(float(d.c) for d in self._state.demands)
 			print(f"Remaining unserved: count={remaining_count}, capacity={remaining_capacity}")
@@ -252,6 +274,8 @@ class GridEnvironment:
 				'agent_total_distances': list(es['agent_total_distances']),
 				'total_distance': es['total_distance'],
 				'episode_reward': es['episode_reward'],
+				'switch_penalty': es.get('switch_penalty', 0.0),
+				'switch_count': es.get('switch_count', 0),
 			}
 		return self._obs(), reward, done, info
 

@@ -40,26 +40,19 @@ class Neighborhood:
         
 
         # Generate Basic demands and Burst demands IN ADVANCE
-        self.basic_demands, self.burst_demands = \
-            self._generate_demands(self.local_params.get("distribution"),
-                                   burst_mode=self.burst_params.get("burst_mode", False))
+        self.demands= self._generate_demands(self.local_params.get("distribution"),
+                                             burst_mode=self.burst_params.get("burst_mode"))
         
     def sample(self, t: int) -> List[Demand]:
         """Sample demand points for current time step"""
 
         demand_t = []
-        for demand in self.basic_demands:
+        for demand in self.demands:
             if demand.t==t:
                 demand_t.append(demand)
         # remove sampled basic demands, which always come first in the list
-        num_basic=len(demand_t)
-        self.basic_demands=self.basic_demands[num_basic:]
-
-        for demand in self.burst_demands:
-            if demand.t==t:
-                demand_t.append(demand)
-        num_burst=len(demand_t)-num_basic
-        self.burst_demands=self.burst_demands[num_burst:]
+        num_sampled=len(demand_t)
+        self.demands=self.demands[num_sampled:]
 
         return demand_t
 
@@ -78,6 +71,12 @@ class Neighborhood:
                 xy = (int(arr[0, 0]), int(arr[0, 1])) if arr is not None and len(arr) > 0 else None
             elif dist == "cluster":
                 arr = self._sample_cluster_2d(1)
+                xy = (int(arr[0, 0]), int(arr[0, 1])) if arr is not None and len(arr) > 0 else None
+            elif dist == "explosion":##########
+                arr = self._sample_explosion_2d(1)
+                xy = (int(arr[0, 0]), int(arr[0, 1])) if arr is not None and len(arr) > 0 else None
+            elif dist == "implosion":#########
+                arr = self._sample_implosion_2d(1)
                 xy = (int(arr[0, 0]), int(arr[0, 1])) if arr is not None and len(arr) > 0 else None
         except Exception:
             xy = None
@@ -109,43 +108,74 @@ class Neighborhood:
 
         return events_count, time_series
 
-    def _generate_demands(self, distribution: str, burst_mode: bool=False) -> Tuple[List[Demand], List[Demand]]:
+    def _generate_demands(self, distribution: str, burst_mode: bool=False) -> List[Demand]:
         """Generate demands according to the specified distribution.\n
         returns basic_demands, burst_demands (empty if burst_mode is False)
         """
-
+        count, time_series=self._sample_poisson_process(
+            max_time=self.max_time, lambda_param=self.lambda_param)
+        # print(f"time_series: {time_series}")
         if burst_mode:
             burst_prob = self.burst_params.get("burst_prob")
             if burst_prob is not None:
-                _ , burst_timestamps = self._sample_poisson_process(
-                    max_time=self.max_time, lambda_param=burst_prob * self.lambda_param)
+                burst_num=np.round(burst_prob*count).astype(int)
+                burst_ids=np.random.choice(np.arange(count),size=burst_num,replace=False)
+                burst_timestamps = time_series[burst_ids]
                 burst_demands = self._burst_demand(distribution=distribution, time_series=burst_timestamps)
+                basic_timestamps = np.delete(time_series, burst_ids)
             else:
                 burst_prob=0.0
                 burst_demands=[]
+                basic_timestamps = time_series
                 print("No burst probability parameter! Set to 0.0 by default.")
         else:
             burst_prob = 0.0
             burst_demands = []
-        
-        _, basic_timestamps = self._sample_poisson_process(
-            max_time=self.max_time, lambda_param=(1 - burst_prob) * self.lambda_param)
+            basic_timestamps = time_series
         
         basic_demands=self._basic_demands(distribution=distribution, time_series=basic_timestamps)
-        return basic_demands, burst_demands
+        if burst_demands:
+            merged_demands=self.merge_list_by_ids(burst_demands, basic_demands, A_pos=burst_ids)
+            return merged_demands
+        else:
+            return basic_demands
+
+    def merge_list_by_ids(self,A:List, B:List, A_pos:List[int]) -> List:
+        if len(A) != len(A_pos):
+            raise ValueError("Length of A and A_pos must be the same.")
+        if max(A_pos) >= len(A)+len(B):
+            raise ValueError("A_pos exceeds the total length of merged list.")
+        total_len=len(A)+len(B)
+        merged_list=np.empty(total_len,dtype=object)
+        merged_list[A_pos]=A
+
+        mask=np.ones(total_len,dtype=bool)
+        mask[A_pos]=False
+        merged_list[mask]=B
+        return merged_list.tolist()
 
     def _basic_demands(self, distribution: str, time_series: list[int]) -> List[Demand]:
         """Generate basic demands"""
 
         count=len(time_series)
+        sample_count=int(count*2)
         if distribution == "uniform":
-            samples = self._sample_uniform_2d(count)
+            samples = self._sample_uniform_2d(sample_count)
         elif distribution == "gaussian":
-            samples= self._sample_gaussian_2d(count)
+            samples= self._sample_gaussian_2d(sample_count)
         elif distribution == "cluster":
-            samples = self._sample_cluster_2d(count)
+            samples = self._sample_cluster_2d(sample_count)
+        elif distribution == "explosion":###########
+            samples = self._sample_explosion_2d(sample_count)
+        elif distribution == "implosion":
+            samples = self._sample_implosion_2d(sample_count)
         else:
             raise ValueError(f"Unknown distribution: {distribution}")
+
+        # remove depot-overlapping points
+        samples=self.remove_in_depot(samples)
+        if len(samples)>count:
+            samples=samples[:count]
 
         demands = []
         for i, (px, py) in enumerate(samples):
@@ -160,22 +190,43 @@ class Neighborhood:
         """Generate burst demands"""
 
         count=len(time_series)
+        sample_count=int(count*2)
         if distribution == "uniform":
-            samples = self._sample_uniform_2d(count,burst_mode=True)
+            samples = self._sample_uniform_2d(sample_count,burst_mode=True)
         elif distribution == "gaussian":
-            samples= self._sample_gaussian_2d(count,burst_mode=True)
+            samples= self._sample_gaussian_2d(sample_count,burst_mode=True)
         elif distribution == "cluster":
-            samples = self._sample_cluster_2d(count,burst_mode=True)
+            samples = self._sample_cluster_2d(sample_count,burst_mode=True)
+        elif distribution == "explosion":
+            samples = self._sample_explosion_2d(sample_count,burst_mode=True)
+        elif distribution == "implosion":
+            samples = self._sample_implosion_2d(sample_count,burst_mode=True)
         else:
             raise ValueError(f"Unknown distribution: {distribution}")
         demands = []
+
+        # remove depot-overlapping points
+        samples=self.remove_in_depot(samples)
+        if len(samples)>count:
+            samples=samples[:count]
+
         for i, (px,py) in enumerate(samples):
             c=self.max_c
             end_t=time_series[i]+self.max_lifetime
             demand = Demand(x=px, y=py, t=time_series[i], c=c, end_t=end_t)
             demands.append(demand)
         return demands
-    
+
+    def remove_in_depot(self, pts:List[Tuple[int,int]]) -> bool:
+        depot = self.env_params.get("depot")
+        if depot is None:
+            print("No depot info!")
+            return pts
+        pts=np.array(pts)
+        depot=np.array(depot).reshape(1,2)
+        mask=(pts[:,0]==depot[:,0]) & (pts[:,1]==depot[:,1])
+        return pts[~mask]
+
     def _sample_uniform_2d(self,n_points:int, burst_mode: bool=False) -> tuple[float, float]:
         """sample uniform 2D points around the center"""
         
@@ -251,6 +302,63 @@ class Neighborhood:
         
         return np.column_stack((x_selected, y_selected))
 
+    def _sample_explosion_2d(self, n_points: int, burst_mode:bool=False) -> np.ndarray:  ##############
+        """sample points in 2D with exponential decay from center"""
+
+        scale_factor= self.local_params.get("scale_factor")
+        if scale_factor is None:
+            print("No cluster distribution params!")
+            return None
+        
+        if burst_mode:
+            scale_factor=np.sqrt(n_points)/5.0
+        
+        W, H = self.width, self.height
+        
+        # distance grid
+        x_coords, y_coords = np.meshgrid(np.arange(W), np.arange(H))
+        distances = np.sqrt((x_coords - self.center_x)**2 + (y_coords - self.center_y)**2)
+
+        # Explosion: probability increases with distance
+        probabilities = 1 - np.exp(-distances / scale_factor)
+        probabilities = probabilities.flatten()
+        probabilities /= probabilities.sum()
+
+        total_cells = W * H
+        indices = np.random.choice(total_cells, size=n_points, replace=(n_points > total_cells), p=probabilities)
+        
+        x_selected = indices % W
+        y_selected = indices // W
+        return np.column_stack((x_selected, y_selected))
+
+    def _sample_implosion_2d(self, n_points: int, burst_mode:bool=False) -> np.ndarray:##############
+        """sample points in 2D with exponential decay from center"""
+
+        scale_factor= self.local_params.get("scale_factor")
+        if scale_factor is None:
+            print("No cluster distribution params!")
+            return None
+        
+        if burst_mode:
+            scale_factor=np.sqrt(n_points)/5.0
+        
+        W, H = self.width, self.height
+        
+        x_coords, y_coords = np.meshgrid(np.arange(W), np.arange(H))
+        distances = np.sqrt((x_coords - self.center_x)**2 + (y_coords - self.center_y)**2)
+
+        # Implosion: sharply decaying exponential (strongly centered)
+        probabilities = np.exp(-(distances / scale_factor)**2)
+        probabilities = probabilities.flatten()
+        probabilities /= probabilities.sum()
+
+        # distance grid
+        total_cells = W * H
+        indices = np.random.choice(total_cells, size=n_points, replace=(n_points > total_cells), p=probabilities)
+
+        x_selected = indices % W
+        y_selected = indices // W
+        return np.column_stack((x_selected, y_selected))
 
 
 class RuleBasedGenerator(BaseDemandGenerator):
@@ -272,8 +380,7 @@ class RuleBasedGenerator(BaseDemandGenerator):
            # Sample center coordinates
             center_x = self._rng.uniform(0, self.width)
             center_y = self._rng.uniform(0, self.height)
-
-            local_max_c=random.randint(1,self.params.get("max_c"))
+            local_max_c=self.params.get("max_c")
             lambda_param=self.total_demand/num_centers/self.params.get("max_time")/(1+local_max_c/2)
             
             distribution=self.params.get("distribution")
@@ -283,19 +390,29 @@ class RuleBasedGenerator(BaseDemandGenerator):
             if distribution=="uniform":
                 distribution_params={
                     "distribution":"uniform",
-                    "size":random.uniform(0.75*size,1.25*size),
+                    "size":random.uniform(0.25*size,1.25*size),
                     }
             elif distribution=="gaussian":
                 distribution_params={
                     "distribution":"gaussian",
-                    "sigma1":random.uniform(0.5*size,1.5*size),
-                    "sigma2":random.uniform(0.5*size,1.5*size),
+                    "sigma1":random.uniform(0.5*size/3,1.5*size/3),
+                    "sigma2":random.uniform(0.5*size/3,1.5*size/3),
                     "rho":0.0,
                     }
             elif distribution=="cluster":
                 distribution_params={
                     "distribution":"cluster",
                     "scale_factor":size/5.0,
+                }
+            elif distribution == "explosion":########
+                distribution_params = {
+                "distribution": "explosion",
+                "scale_factor": size/5.0,
+                }
+            elif distribution == "implosion":########
+                distribution_params = {
+                "distribution": "implosion",
+                "scale_factor": size/5.0,
                 }
 
             local_params={
@@ -312,8 +429,8 @@ class RuleBasedGenerator(BaseDemandGenerator):
                 "max_time":self.max_time,
             }
             burst_params={
-                "burst_mode": True,
-                "burst_prob": random.uniform(0.1,0.2),
+                "burst_mode": True if self.params.get("burst_prob", 0.0) > 0.0 else False,
+                "burst_prob": self.params.get("burst_prob", 0.0),
             }
             neighborhood = Neighborhood(
                 (center_x, center_y),
@@ -371,8 +488,18 @@ class RuleBasedGenerator(BaseDemandGenerator):
         
         # After per-neighborhood resampling, merged_demands should no longer contain depot-overlapping points
 
+        # strictly control total demand quantity
         total_c = sum(d.c for d in merged_demands)
+        remove_ids=[]
+    
+        while total_c > self.total_demand:
+            id=random.randint(0,len(merged_demands)-1)
+            total_c -= merged_demands[id].c
+            remove_ids.append(id)
+
         self.total_demand -= total_c
+
+        merged_demands = [d for i, d in enumerate(merged_demands) if i not in remove_ids]
 
         return merged_demands
     

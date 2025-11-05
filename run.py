@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse
 import random
+import os
 from typing import List, Tuple
 
 from configs import get_default_config, Config
@@ -49,7 +50,7 @@ def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, BaseDema
 		# 使用 Distributed Cooperative Planner（带参数）
 		planner = DistributedCooperativePlanner(auction_rounds=5, bid_strategy='time_urgency')
 	elif planner_type == "model":
-		planner_params = dict(cfg.planner_params)
+		planner_params = dict(cfg.model_planner_params)
 		ckpt_path = planner_params.pop("ckpt", None)
 		planner = ModelPlanner(full_capacity=cfg.capacity, **planner_params)
 		if ckpt_path:
@@ -69,8 +70,13 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 	depot = (rng.randint(0, cfg.width - 1), rng.randint(0, cfg.height - 1))
 	cfg.depot = depot
 	cfg.generator_params = {**cfg.generator_params, "depot": depot}
-
+	#print model used
+	print(f"Using planner: {planner}")
 	planner_type = planner
+	if planner_type == "model":
+		ckpt_info = cfg.model_planner_params.get("ckpt")
+		if ckpt_info:
+			print(f"Loading model checkpoint: {ckpt_info}")
 	env, gen, planner_impl, controller = build_env(cfg, planner_type=planner_type)
 	obs = env.reset(seed)
 	total_reward = 0.0
@@ -107,7 +113,7 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 		agents = [type("S", (), {"x": x, "y": y, "s": s}) for (x, y, s) in agent_states]
 		plan_horizon = 1
 		if planner_type == "model":
-			plan_horizon = max(1, int(cfg.planner_params.get("time_plan", 1)))
+			plan_horizon = max(1, int(cfg.model_planner_params.get("time_plan", 1)))
 		targets = planner_impl.plan(
 			observations=obs["demands"],  # [(x, y, t_arrival, c, t_due), ...]
 			agent_states=agents,
@@ -155,25 +161,23 @@ def main() -> None:
 	parser.add_argument("--render", action="store_true", help="Use pygame to visualize")
 	parser.add_argument("--fps", type=int, default=10, help="Render FPS when --render")
 	parser.add_argument("--planner", type=str, default="greedy", choices=["greedy", "fri", "rbso", "dcp", "model"], help="Planner type: greedy, fri, rbso, dcp, model")
-	parser.add_argument("--ckpt", type=str, default="checkpoints/planner/planner_20_2_200.pt", help="Checkpoint path for --planner model")
-	parser.add_argument("--time-plan", dest="time_plan", type=int, default=3, help="Planning horizon for --planner model")
-	parser.add_argument("--planner-device", dest="planner_device", type=str, default="cpu", choices=["cpu", "cuda"], help="Device for --planner model")
-	parser.add_argument("--lateness-lambda", dest="lateness_lambda", type=float, default=0.0, help="Lateness penalty for --planner model")
-	parser.add_argument("--d-model", dest="d_model", type=int, default=128, help="Transformer hidden size for --planner model")
-	parser.add_argument("--nhead", dest="nhead", type=int, default=8, help="Number of attention heads for --planner model")
-	parser.add_argument("--nlayers", dest="nlayers", type=int, default=2, help="Number of transformer layers for --planner model")
+	parser.add_argument("--model", action="store_true", help="Shortcut for --planner model")
+	parser.add_argument("--generator", type=str, choices=["rule", "net"], help="Override generator type: rule or net")
+	parser.add_argument("--ckpt", type=str, help="Path to planner checkpoint (.pt) when using the model planner")
 	args = parser.parse_args()
 	cfg = get_default_config()
+	if args.model:
+		args.planner = "model"
+	if args.ckpt:
+		ckpt_path = os.path.abspath(os.path.expanduser(args.ckpt))
+		if not os.path.isfile(ckpt_path):
+			raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
+		cfg.model_planner_params["ckpt"] = ckpt_path
+		args.planner = "model"
+	if args.generator:
+		cfg.generator_type = args.generator
 	if args.planner == "model":
-		cfg.planner_params = {
-			"time_plan": args.time_plan,
-			"device": args.planner_device,
-			"lateness_lambda": args.lateness_lambda,
-			"d_model": args.d_model,
-			"nhead": args.nhead,
-			"nlayers": args.nlayers,
-			"ckpt": args.ckpt,
-		}
+		cfg.planner_type = "model"
 	run_episode(cfg, seed=args.seed, render=args.render, fps=args.fps, planner=args.planner)
 
 
