@@ -153,21 +153,24 @@ class GridEnvironment:
 				new_s = self._full_capacity()
 			candidate_states.append(AgentState(x=nx, y=ny, s=new_s))
 
-		# resolve collisions: agents attempting to occupy the same cell revert to their previous state
+		# resolve collisions with "first-wins" policy:
+		# If multiple agents attempt to occupy the same non-depot cell this step, the lowest-index agent keeps the move
+		# (winner), and all other agents (losers) revert to their previous state.
 		pos_to_indices: Dict[Tuple[int, int], List[int]] = {}
 		for idx, st in enumerate(candidate_states):
 			pos_to_indices.setdefault((st.x, st.y), []).append(idx)
 		collided_agents: List[int] = []
 		for pos, indices in pos_to_indices.items():
 			if len(indices) > 1 and pos != self.depot:
-				collided_agents.extend(indices)
-		if collided_agents:
-			collided_agents = sorted(set(collided_agents))
-		for idx in collided_agents:
-			prev = prev_states[idx]
-			candidate_states[idx] = AgentState(x=prev.x, y=prev.y, s=prev.s)
+				indices_sorted = sorted(indices)
+				winner = indices_sorted[0]
+				losers = indices_sorted[1:]
+				for idx in losers:
+					prev = prev_states[idx]
+					candidate_states[idx] = AgentState(x=prev.x, y=prev.y, s=prev.s)
+				collided_agents.extend(losers)
 
-		# second pass to ensure uniqueness after reverting (should hold if prev states were unique)
+	# second pass to ensure uniqueness after reverting (should hold if prev states were unique)
 		self._state.agent_states = candidate_states
 		# 3) serve demands when an agent arrives on a demand cell (simplified: remove demand entirely)
 		remaining: List[Demand] = []
