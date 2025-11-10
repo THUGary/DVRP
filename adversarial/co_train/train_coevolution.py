@@ -44,6 +44,9 @@ class CoevolutionConfig:
     device: str = "cuda"
     seed: int = 42
     save_dir: str = "checkpoints/coevolution"
+    # 在 planner phase 采样 generator 版本时，优先选择最新版本的概率
+    # (余下概率从历史版本中随机选择)。取值范围 [0,1]
+    sample_latest_prob: float = 0.7
 
 
 def coevolution_loop(
@@ -94,7 +97,19 @@ def coevolution_loop(
         print(f"=== Cycle {cycle}/{cfg.num_cycles} ===")
         # ---- Planner phase ----
         for pe in range(1, cfg.planner_epochs_per_cycle + 1):
-            gv = scheduler.pick(rng)
+            # Choose a generator version to generate training data.
+            # With probability cfg.sample_latest_prob pick the latest version,
+            # otherwise pick a random historical version (exclude latest).
+            versions = registry.list()
+            if not versions:
+                raise RuntimeError("No generator versions in registry")
+            if len(versions) == 1:
+                gv = versions[0]
+            else:
+                if rng.random() < cfg.sample_latest_prob:
+                    gv = versions[-1]
+                else:
+                    gv = rng.choice(versions[:-1])
             # Load generator weights into diffusion_model for demand sampling
             state = gv.load(device)
             try:
@@ -183,8 +198,20 @@ def coevolution_loop(
         print(f"[Save] Planner checkpoint => {planner_ckpt_path}")
 
         # ---- Generator (adversarial) phase ----
+        # Ensure we start evolution from the newest registered generator version
+        latest = registry.latest()
+        if latest is not None:
+            try:
+                state = latest.load(device)
+                diffusion_model.load_state_dict(state, strict=False)
+            except Exception:
+                if isinstance(state, dict) and "model" in state:
+                    diffusion_model.load_state_dict(state["model"], strict=False)
+            diffusion_model.eval()
+
         for ge in range(1, cfg.generator_epochs_per_cycle + 1):
             # Use current planner (could add evaluation vs older planners here)
+            # Evolve the (newest) diffusion model against the planner
             gen_trainer.train(planner, episodes=1, renderer=None, save_path=None, seed=cfg.seed + cycle * 100 + ge)
             if ge % max(1, cfg.generator_epochs_per_cycle // 2) == 0:
                 print(f"[GeneratorPhase] cycle={cycle} epoch={ge}")
