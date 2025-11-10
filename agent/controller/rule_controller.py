@@ -18,4 +18,12 @@ class RuleBasedController(BaseController):
         if dx == 0 and dy == 0:
             target_queue.popleft()
             return (0, 0)
+        # Enforce 4-directional moves only (no diagonals): if both dx and dy are non-zero,
+        # pick one axis to move along. Policy: move along the axis with larger remaining distance;
+        # tie-breaker: prefer x-axis. This yields actions in {(0,0),(1,0),(-1,0),(0,1),(0,-1)}.
+        if dx != 0 and dy != 0:
+            if abs(tx - x) >= abs(ty - y):
+                return (dx, 0)
+            else:
+                return (0, dy)
         return (dx, dy)
