@@ -156,29 +156,51 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 
 
 def main() -> None:
-	parser = argparse.ArgumentParser(description="Train skeleton (rule-based run)")
-	parser.add_argument("--seed", type=int, default=2025)
+	# --------------------------------------------------------------
+	# Minimal CLI: keep only seed, render, fps, pmodel, gmodel
+	# --------------------------------------------------------------
+	parser = argparse.ArgumentParser(description="DVRP runner")
+	parser.add_argument("--seed", type=int, default=2025, help="Random seed (default: 2025)")
 	parser.add_argument("--render", action="store_true", help="Use pygame to visualize")
-	parser.add_argument("--fps", type=int, default=10, help="Render FPS when --render")
-	parser.add_argument("--planner", type=str, default="greedy", choices=["greedy", "fri", "rbso", "dcp", "model"], help="Planner type: greedy, fri, rbso, dcp, model")
-	parser.add_argument("--model", action="store_true", help="Shortcut for --planner model")
-	parser.add_argument("--generator", type=str, choices=["rule", "net"], help="Override generator type: rule or net")
-	parser.add_argument("--ckpt", type=str, help="Path to planner checkpoint (.pt) when using the model planner")
+	parser.add_argument("--fps", type=int, default=10, help="Render FPS when --render (default: 10)")
+	# --pmodel optionally accepts a checkpoint path; if omitted, use default from cfg
+	parser.add_argument("--pmodel", nargs="?", const="__DEFAULT__", help="Use model planner; optionally pass checkpoint path (.pt/.pth). Example: --pmodel checkpoints/planner/planner_rl_best.pt")
+	parser.add_argument("--gmodel", action="store_true", help="Use neural net demand generator; otherwise rule")
 	args = parser.parse_args()
+
 	cfg = get_default_config()
-	if args.model:
-		args.planner = "model"
-	if args.ckpt:
-		ckpt_path = os.path.abspath(os.path.expanduser(args.ckpt))
-		if not os.path.isfile(ckpt_path):
-			raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
-		cfg.model_planner_params["ckpt"] = ckpt_path
-		args.planner = "model"
-	if args.generator:
-		cfg.generator_type = args.generator
-	if args.planner == "model":
-		cfg.planner_type = "model"
-	run_episode(cfg, seed=args.seed, render=args.render, fps=args.fps, planner=args.planner)
+
+	# Planner: model if --pmodel provided (with or without path); else greedy
+	use_model_planner = args.pmodel is not None
+	planner_choice = "model" if use_model_planner else "greedy"
+	if use_model_planner:
+		cfg.planner_type = "model"  # use defaults from cfg.model_planner_params
+		# If a path is provided after --pmodel, resolve it
+		if isinstance(args.pmodel, str) and args.pmodel != "__DEFAULT__":
+			raw = os.path.expanduser(args.pmodel)
+			candidates = [
+				raw,
+				os.path.join("checkpoints", raw) if not os.path.isabs(raw) else raw,
+				os.path.join("checkpoints", "planner", os.path.basename(raw)),
+			]
+			ckpt_path = None
+			for p in candidates:
+				p_abs = os.path.abspath(p)
+				if os.path.isfile(p_abs):
+					ckpt_path = p_abs
+					break
+			# If not found, still set the expanded absolute path for downstream attempt
+			if ckpt_path is None:
+				ckpt_path = os.path.abspath(raw)
+				print(f"WARNING: Planner checkpoint not found at {ckpt_path}. Will attempt to load; ensure path is correct.")
+			cfg.model_planner_params["ckpt"] = ckpt_path
+
+	# Generator: net if --gmodel else keep default (rule)
+	if args.gmodel:
+		cfg.generator_type = "net"
+
+	# Run
+	run_episode(cfg, seed=args.seed, render=args.render, fps=args.fps, planner=planner_choice)
 
 
 if __name__ == "__main__":
