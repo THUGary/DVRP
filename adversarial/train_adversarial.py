@@ -12,7 +12,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from adversarial.builders import build_env, build_planner, build_diffusion
-from adversarial.trainers import DiffusionAdversarialTrainer, AdvConfig
+from training.generator.adversarial_trainer import DiffusionAdversarialTrainer, AdvConfig
 from utils.pygame_renderer import PygameRenderer
 
 

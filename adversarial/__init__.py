@@ -12,7 +12,11 @@ Public symbols are re-exported here for convenient imports, e.g.:
 
 from .types import EpisodeResult, GeneratorPolicy, PlannerPolicy, DemandTuple
 from .builders import build_env, build_planner, build_diffusion
-from .trainers import DiffusionAdversarialTrainer, AdvConfig, rollout_episode
+from training.generator.adversarial_trainer import (
+	DiffusionAdversarialTrainer,
+	AdvConfig,
+	rollout_episode,
+)
 
 __all__ = [
 	"EpisodeResult",
