@@ -121,8 +121,19 @@ def coevolution_loop(
             diffusion_model.eval()
             # Hook for planner update (user implements training step)
             if planner_update_hook:
-                planner_update_hook(planner, {"env": env, "generator_version": gv, "rng": rng})
+                planner_update_hook(planner, {
+                    "env": env,
+                    "generator_version": gv,
+                    "rng": rng,
+                    "opt_planner": opt_planner,
+                    "diffusion_model": diffusion_model,
+                    "condition": condition,
+                    "base_cfg": base_cfg,
+                    "device": device,
+                })
+                print("rl")
             else:
+                print("supervised")
                 # Default: one mini supervised step using a greedy teacher and k=1 labels
                 teacher = RuleBasedPlanner(full_capacity=base_cfg.capacity)
                 controller = RuleBasedController(**base_cfg.controller_params)

@@ -4,6 +4,8 @@ import argparse
 import torch
 
 from .train_coevolution import coevolution_loop, CoevolutionConfig
+from adversarial.co_train.train_coevolution import coevolution_loop, CoevolutionConfig
+from adversarial.co_train.rl_hooks import reinforce_planner_hook
 
 
 def main() -> None:
@@ -36,9 +38,10 @@ def main() -> None:
 
     coevolution_loop(
         cfg,
-        planner_type=args.planner_type,
-        planner_ckpt_init=(args.planner_ckpt_init if args.planner_type == "model" else None),
-        diffusion_ckpt_init=args.diffusion_ckpt_init,
+        planner_type="model",
+        planner_ckpt_init="checkpoints/planner/planner_20_2_200.pt",
+        diffusion_ckpt_init="checkpoints/diffusion_model.pth",
+        planner_update_hook=reinforce_planner_hook,
     )
 
 
