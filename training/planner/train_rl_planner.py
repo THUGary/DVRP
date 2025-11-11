@@ -398,7 +398,7 @@ def main() -> None:
                 next_obs, reward, done, _ = env.step(actions)
                 reward_val = float(reward)
                 total_reward += reward_val
-                logprob_traj.append(torch.tensor(0.0, device=device))
+                # No decision taken this step -> no policy log-prob to accumulate
                 rewards_all.append(reward_val)
                 dones_all.append(done)
                 obs = next_obs
@@ -458,17 +458,20 @@ def main() -> None:
             adv = episode_return - baseline
             baseline = 0.9 * baseline + 0.1 * episode_return
 
+            # If no policy decisions were made (e.g., no demands), skip update safely
             if not logprob_traj:
-                logprob_traj.append(torch.tensor(0.0, device=device))
-            sum_logprob = torch.stack(logprob_traj).sum()
-            loss = -adv * sum_logprob
-
-            opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            opt.step()
-
-            print(f"[EP {ep:04d}] return={total_reward:.1f} adv={adv:.1f} loss={float(loss.item()):.3f}")
+                print(f"[EP {ep:04d}] return={total_reward:.1f} adv={adv:.1f} (skip update: no decisions)")
+            else:
+                sum_logprob = torch.stack(logprob_traj).sum()
+                if not sum_logprob.requires_grad:
+                    print(f"[EP {ep:04d}] return={total_reward:.1f} adv={adv:.1f} (skip update: no grad)")
+                else:
+                    loss = -adv * sum_logprob
+                    opt.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    opt.step()
+                    print(f"[EP {ep:04d}] return={total_reward:.1f} adv={adv:.1f} loss={float(loss.item()):.3f}")
         else:
             assert critic is not None and value_opt is not None
             if not rewards_all:

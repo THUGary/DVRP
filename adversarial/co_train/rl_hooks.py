@@ -12,6 +12,7 @@ training/planner/train_rl_planner.py for sampling decisions with log-probs.
 from typing import Any, Dict, List, Tuple
 import torch
 import torch.nn.functional as F
+from collections import deque
 
 
 def _towards_step(cur: Tuple[int, int], dst: Tuple[int, int]) -> Tuple[int, int]:
@@ -71,6 +72,9 @@ def reinforce_planner_hook(planner, ctx: Dict[str, Any]) -> None:
         })
     except Exception:
         return
+    # Guard: if no demands were sampled, skip this update to avoid encoder shape errors
+    if not demands_list:
+        return
 
     # 2) Reset env and inject demands
     obs = env.reset()
@@ -97,10 +101,17 @@ def reinforce_planner_hook(planner, ctx: Dict[str, Any]) -> None:
         # ModelPlanner requires full_capacity to compute cap_full
         return
 
+    # Use the same controller as standalone RL to map destinations to env actions
+    from agent.controller import RuleBasedController
+    controller = RuleBasedController(**base_cfg.controller_params)
+
     done = False
     while not done:
         # Build features for DVRPNet
         nodes_list = obs["demands"]
+        # If no nodes available, stop the episode early (skip update)
+        if nodes_list is None or len(nodes_list) == 0:
+            break
         t_now = obs["time"]
         depot_xy = tuple(obs["depot"])  # (x,y)
         mask = [False] * len(nodes_list)
@@ -130,11 +141,12 @@ def reinforce_planner_hook(planner, ctx: Dict[str, Any]) -> None:
         # Sum log-probs across agents for this step
         step_logp = log_probs.sum()
 
-        # Convert destination coords into one-grid actions
+        # Convert destination coords into actions via controller (handles collisions, etc.)
         actions = []
         for idx, (ax, ay, _s) in enumerate(agents):
             dst = (int(dest_xy[0, idx, 0].item()), int(dest_xy[0, idx, 1].item()))
-            actions.append(_towards_step((ax, ay), dst))
+            q = deque([dst])
+            actions.append(controller.act((ax, ay), q))
 
         # Env step
         obs, reward, done, _info = env.step(actions)

@@ -31,7 +31,7 @@ class Config:
         "neighborhood_size": 3, # 3-15, the average radius of the concentrated generation areas
         "burst_prob": 0.1, # 0.0 - 1.0, probability of bursting demands among all demands
         # add checkpoint path for the network-based generator
-        "model_path": "checkpoints/diffusion_model.pth",
+        "model_path": "checkpoints/coevolution/generator_cycle_4.pth,"#"checkpoints/diffusion_model.pth",
     })
 
     # Planner params
@@ -44,7 +44,7 @@ class Config:
         "d_model": 128,
         "nhead": 8,
         "nlayers": 2,
-        "ckpt": "checkpoints/planner/planner_20_2_200.pt",
+        "ckpt":"checkpoints/coevolution/planner_cycle_3.pt",# "checkpoints/planner/planner_20_2_200.pt",
     })
 
     # Controller params
