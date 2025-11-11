@@ -12,11 +12,7 @@ Public symbols are re-exported here for convenient imports, e.g.:
 
 from .types import EpisodeResult, GeneratorPolicy, PlannerPolicy, DemandTuple
 from .builders import build_env, build_planner, build_diffusion
-from training.generator.adversarial_trainer import (
-	DiffusionAdversarialTrainer,
-	AdvConfig,
-	rollout_episode,
-)
+from .co_train.train_coevolution import coevolution_loop, CoevolutionConfig
 
 __all__ = [
 	"EpisodeResult",
@@ -26,7 +22,6 @@ __all__ = [
 	"build_env",
 	"build_planner",
 	"build_diffusion",
-	"DiffusionAdversarialTrainer",
-	"AdvConfig",
-	"rollout_episode",
+	"coevolution_loop",
+	"CoevolutionConfig",
 ]
