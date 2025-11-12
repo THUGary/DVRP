@@ -44,7 +44,8 @@ class Config:
         "d_model": 128,
         "nhead": 8,
         "nlayers": 2,
-        "ckpt":"checkpoints/coevolution/planner_cycle_3.pt",# "checkpoints/planner/planner_20_2_200.pt",
+        "ckpt": "checkpoints/planner/planner_20_2_10.pt",
+        # "ckpt": "training/planner/planner_rl_best.pt",
     })
 
     # Controller params

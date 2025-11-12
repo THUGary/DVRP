@@ -149,7 +149,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--k", type=int, default=3, help="每个样本的监督步数，需与数据集一致")
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-6)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])

@@ -42,14 +42,18 @@ class Neighborhood:
         # Generate Basic demands and Burst demands IN ADVANCE
         self.demands= self._generate_demands(self.local_params.get("distribution"),
                                              burst_mode=self.burst_params.get("burst_mode"))
-        
+        # print(f"Generated total {len(self.demands)} demands in neighborhood centered at ({self.center_x}, {self.center_y}).")
+
     def sample(self, t: int) -> List[Demand]:
         """Sample demand points for current time step"""
 
         demand_t = []
+        # print(f"Sampling demands at time {t}...demands left: {len(self.demands)}")
         for demand in self.demands:
             if demand.t==t:
+                # print(f"Sampled demand at ({demand.x}, {demand.y}) with quantity {demand.c} and time {demand.t}")
                 demand_t.append(demand)
+                
         # remove sampled basic demands, which always come first in the list
         num_sampled=len(demand_t)
         self.demands=self.demands[num_sampled:]
@@ -114,6 +118,29 @@ class Neighborhood:
         """
         count, time_series=self._sample_poisson_process(
             max_time=self.max_time, lambda_param=self.lambda_param)
+
+        # If the Poisson process produced zero events, retry a few times to
+        # avoid completely empty neighborhoods. If after retries there are
+        # still zero events, create a single fallback timestamp so the
+        # neighborhood is not empty.
+        if count == 0:
+            max_retries = int(self.local_params.get("resample_attempts", 3))
+            for _ in range(max_retries - 1):
+                count, time_series = self._sample_poisson_process(
+                    max_time=self.max_time, lambda_param=self.lambda_param)
+                if count > 0:
+                    break
+            if count == 0:
+                # Fallback: create one event at a random time within [0, max_time-1]
+                mt = max(1, int(max(0, math.floor(self.max_time))))
+                # prefer self.rng for reproducibility when available
+                try:
+                    t0 = int(self.rng.randint(0, mt - 1))
+                except Exception:
+                    t0 = int(np.random.randint(0, mt))
+                count = 1
+                time_series = np.array([t0], dtype=int)
+
         # print(f"time_series: {time_series}")
         if burst_mode:
             burst_prob = self.burst_params.get("burst_prob")
@@ -370,6 +397,13 @@ class RuleBasedGenerator(BaseDemandGenerator):
 
         # Initialize concentrated generation areas
         self.neighborhoods = self._initialize_neighborhoods()
+        # Reset mutable counters (total_demand) from params so repeated calls to
+        # reset produce fresh episodes rather than depleting the budget across
+        # multiple episodes.
+        try:
+            self.total_demand = int(self.params.get("total_demand", 1))
+        except Exception:
+            self.total_demand = int(getattr(self, "total_demand", 1))
         
     def _initialize_neighborhoods(self) -> List[Neighborhood]:
         """Initialize concentrated generation areas"""
@@ -458,6 +492,7 @@ class RuleBasedGenerator(BaseDemandGenerator):
         depot_xy = tuple(self.depot) if getattr(self, "depot", None) is not None else None
         for neighborhood in self.neighborhoods:
             demands = neighborhood.sample(t)
+            # print(f"Sampled {len(demands)} demands from neighborhood centered at ({neighborhood.center_x}, {neighborhood.center_y}) at time {t}.")
             if depot_xy is None or len(demands) == 0:
                 all_demands.extend(demands)
                 continue
@@ -479,6 +514,7 @@ class RuleBasedGenerator(BaseDemandGenerator):
                         all_demands.append(Demand(x=int(new_xy[0]), y=int(new_xy[1]), t=d.t, c=d.c, end_t=d.end_t))
                     else:
                         # give up: drop this demand (rare)
+                        print(f"Dropped depot-overlapping demand at ({d.x}, {d.y}) after {max_tries} resample attempts.")
                         continue
                 else:
                     all_demands.append(d)
@@ -498,7 +534,6 @@ class RuleBasedGenerator(BaseDemandGenerator):
             remove_ids.append(id)
 
         self.total_demand -= total_c
-
         merged_demands = [d for i, d in enumerate(merged_demands) if i not in remove_ids]
 
         return merged_demands
