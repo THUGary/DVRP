@@ -7,7 +7,7 @@ import torch.nn as nn
 
 class Encoder(nn.Module):
     """
-    仅编码 nodes 与 depot 的 Encoder（不接收/处理 agents）。
+    仅编码 nodes 与 depot 的 Encoder，并提供 agents 的编码接口（迁移自 Decoder）。
 
     输入（张量）:
       - nodes:     [B, N, 5]   (x, y, t_arrival, c/demand, t_due) — 顺序按仓库现有用法即可
@@ -42,6 +42,24 @@ class Encoder(nn.Module):
         # 可选：对 depot 做轻量变换（保持维度）
         self.depot_norm = nn.LayerNorm(d_model)
 
+        # === Agents 编码（从 Decoder 迁移过来） ===
+        # Agent 编码块：Embedding + Self-Attn + FFN（Transformer 风格：残差 + Norm）
+        self.agent_mlp = nn.Sequential(
+            nn.Linear(4, d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_model, d_model),
+        )
+        self.agent_self_attn = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=nhead, batch_first=True
+        )
+        self.agent_attn_norm = nn.LayerNorm(d_model)
+        self.agent_ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_model * 4, d_model),
+        )
+        self.agent_ffn_norm = nn.LayerNorm(d_model)
+
     def forward(self, feats: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         nodes: torch.Tensor = feats["nodes"]            # [B, N, 5]
         node_mask: torch.Tensor = feats["node_mask"]    # [B, N] (bool)
@@ -74,3 +92,18 @@ class Encoder(nn.Module):
         H_depot = self.depot_norm(H_depot)
 
         return H_nodes, H_depot, node_mask
+
+    def encode_agents(self, agents_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        将 agents 状态编码为 [B, A, d] 表征。
+        输入: agents_tensor [B, A, 4]，四维含义为 (x, y, s, t_agent)
+        """
+        if agents_tensor is None:
+            raise ValueError("encode_agents requires agents_tensor with shape [B,A,4]")
+        h = self.agent_mlp(agents_tensor)                        # [B, A, d]
+        # Self-Attn (Post-Attn Norm)
+        attn_out, _ = self.agent_self_attn(h, h, h, need_weights=False)
+        h = self.agent_attn_norm(h + attn_out)                   # Residual 1
+        ffn_out = self.agent_ffn(h)
+        h = self.agent_ffn_norm(h + ffn_out)                     # Residual 2
+        return h

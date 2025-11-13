@@ -14,6 +14,13 @@ class Config:
     capacity: int = 200
     depot: Tuple[int, int] = (0, 0)
     max_time: int = 100 # the value has to be consistent with generator_params' max_time
+    # Reward scales
+    capacity_reward_scale: float = 0.05
+    expiry_penalty_scale: float = 0.05
+    switch_penalty_scale: float = 0.001
+    # Exploration penalty params
+    exploration_history_n: int = 3  # consider positions at t-2 .. t-n
+    exploration_penalty_scale: float = 0.001  # scale of revisit penalty
 
     # Generator params
     generator_type: str = "rule"  # "rule" | "net"
@@ -44,8 +51,8 @@ class Config:
         "d_model": 128,
         "nhead": 8,
         "nlayers": 2,
-        "ckpt": "checkpoints/planner/planner_20_2_10.pt",
-        # "ckpt": "training/planner/planner_rl_best.pt",
+        # "ckpt": "checkpoints/planner/planner_20_2_10.pt",
+        "ckpt": "training/planner/planner_rl_best.pt",
     })
 
     # Controller params

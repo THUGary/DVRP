@@ -33,7 +33,10 @@ class GridEnvironment:
 		generator: Optional[BaseDemandGenerator] = None,
 		max_time: int = 100,
 		expiry_penalty_scale: float = 5.0,
-		switch_penalty_coef: float = 1.0,
+		switch_penalty_scale: float = 0.01,
+		capacity_reward_scale: float = 10.0,
+		exploration_history_n: int = 0,
+		exploration_penalty_scale: float = 0.0,
 	) -> None:
 		self.width = width
 		self.height = height
@@ -42,7 +45,10 @@ class GridEnvironment:
 		self.capacity = capacity
 		self._generator = generator
 		self.expiry_penalty_scale = expiry_penalty_scale
-		self.switch_penalty_coef = switch_penalty_coef
+		self.switch_penalty_scale = switch_penalty_scale
+		self.capacity_reward_scale = capacity_reward_scale
+		self.exploration_history_n = max(0, int(exploration_history_n))
+		self.exploration_penalty_scale = float(exploration_penalty_scale)
 		self._state: Optional[EnvState] = None
 
 		# cache for resolved full capacity to avoid repeated imports
@@ -98,6 +104,8 @@ class GridEnvironment:
 		self._episode_stats["switch_count"] = 0
 		self._episode_stats["switch_penalty"] = 0.0
 		self._prev_actions = [(0, 0) for _ in agent_states]
+		# maintain per-agent position history for exploration penalty
+		self._pos_history: List[List[Tuple[int,int]]] = [[(a.x, a.y)] for a in agent_states]
 		return self._obs()
 
 	def step(self, actions: List[Action]) -> Tuple[Dict, float, bool, Dict]:
@@ -214,14 +222,41 @@ class GridEnvironment:
 			agent_distances.append(d)
 			movement_distance += d
 
-		# net reward = total capacity served this step - distance traveled this step
-		# include expiry penalty (negative) for demands that timed out at the start of this step
-		switch_penalty = -self.switch_penalty_coef * switch_count
-		reward = 10 * capacity_reward + expiry_penalty + 0.01 * switch_penalty
+		# --- Exploration revisit penalty ---
+		exploration_penalty = 0.0
+		if self.exploration_history_n > 1:
+			for idx, a in enumerate(self._state.agent_states):
+				# ensure history list exists
+				if idx >= len(self._pos_history):
+					self._pos_history.append([])
+				hist = self._pos_history[idx]
+				cur_pos = (a.x, a.y)
+				# look back positions at t-2 .. t-n (skip immediate previous which is at end)
+				# hist stores chronological positions; last element is previous step position
+				look_back = min(len(hist)-1, self.exploration_history_n)
+				if look_back >= 2:
+					# indices: -2 (t-1), -3 (t-2), ... but we need t-2 .. t-n relative to current t after move
+					# Because we append later, hist[-1] is previous position (t-1). We compare current position with older ones.
+					for offset, h_index in enumerate(range(2, look_back+1), start=1):
+						past_pos = hist[-h_index]
+						if past_pos == cur_pos:
+							# weight rule: if match with position from t-2 (closest older), penalty = (exploration_history_n-1);
+							# if match with t-n (farthest), penalty = 1. offset=1 corresponds to t-2.
+							weight = max(1, (self.exploration_history_n - offset))
+							exploration_penalty += float(weight)
+		# scale exploration penalty (negative contribution)
+		exploration_penalty_value = - self.exploration_penalty_scale * exploration_penalty if exploration_penalty > 0 else 0.0
+
+		# --- Reward aggregation ---
+		capacity_reward_term = float(self.capacity_reward_scale) * float(capacity_reward)
+		switch_penalty_term = - float(self.switch_penalty_scale) * float(switch_count)
+		reward = capacity_reward_term + expiry_penalty 		# + switch_penalty_term  + exploration_penalty_value
 
 		# update episode-level stats
 		self._episode_stats["served_count"] += served_count
 		self._episode_stats["served_capacity"] += served_capacity
+		self._episode_stats.setdefault('capacity_reward_term', 0)
+		self._episode_stats["capacity_reward_term"] += capacity_reward_term
 		self._episode_stats["served_details"].extend(served_details)
 		# update expired stats in episode-level tracking
 		if expired_count > 0:
@@ -239,8 +274,23 @@ class GridEnvironment:
 		self._episode_stats["total_distance"] += movement_distance
 		self._episode_stats["episode_reward"] += reward
 		self._episode_stats["switch_count"] += switch_count
-		self._episode_stats["switch_penalty"] += -switch_penalty  # store positive magnitude
+		self._episode_stats["switch_penalty"] += float(switch_penalty_term)
+		if self.exploration_history_n > 1:
+			self._episode_stats.setdefault("exploration_penalty_raw", 0.0)
+			self._episode_stats.setdefault("exploration_penalty_value", 0.0)
+			self._episode_stats["exploration_penalty_raw"] += exploration_penalty
+			self._episode_stats["exploration_penalty_value"] += exploration_penalty_value
 		self._prev_actions = list(actions)
+		# update position histories AFTER computing penalty
+		for idx, a in enumerate(self._state.agent_states):
+			if idx >= len(self._pos_history):
+				self._pos_history.append([])
+			hist = self._pos_history[idx]
+			hist.append((a.x, a.y))
+			# trim history to n+2 (keep some buffer) to bound memory
+			max_keep = max(2, self.exploration_history_n + 2)
+			if len(hist) > max_keep:
+				self._pos_history[idx] = hist[-max_keep:]
 
 		# 4) time update
 		self._state.time += 1
@@ -255,19 +305,21 @@ class GridEnvironment:
 			es = self._episode_stats
 			print("=== Episode summary ===")
 			print(f"Total demands encountered: count={es['demand_count']}, total_capacity={es['demand_capacity']}")
-			print(f"Served: count={es['served_count']}, served_capacity={es['served_capacity']}")
+			print(f"Served: count={es['served_count']}, served_capacity={es['served_capacity']}, capacity_reward={es.get('capacity_reward_term', 0.0)}")
 			if es.get('expired_count', 0) > 0:
 				print(f"Expired (timed-out): count={es.get('expired_count',0)}, capacity={es.get('expired_capacity',0.0)}, penalty={es.get('expired_penalty',0.0)}")
 			if es.get('collision_count', 0) > 0:
 				print(f"Agent collision resolutions: {es.get('collision_count', 0)}")
 			if es.get('switch_count', 0) > 0:
 				print(f"Target switches penalized: count={es.get('switch_count', 0)}, penalty={es.get('switch_penalty', 0.0)}")
+			if self.exploration_history_n > 1:
+				print(f"Exploration revisit penalty: raw={es.get('exploration_penalty_raw', 0.0)}, value={es.get('exploration_penalty_value', 0.0)}")
 			remaining_count = len(self._state.demands)
 			remaining_capacity = sum(float(d.c) for d in self._state.demands)
-			print(f"Remaining unserved: count={remaining_count}, capacity={remaining_capacity}")
-			for i, td in enumerate(es['agent_total_distances']):
-				print(f"Agent {i} total distance: {td}")
-			print(f"Total distance this episode: {es['total_distance']}")
+			# print(f"Remaining unserved: count={remaining_count}, capacity={remaining_capacity}")
+			# for i, td in enumerate(es['agent_total_distances']):
+			# 	print(f"Agent {i} total distance: {td}")
+			# print(f"Total distance this episode: {es['total_distance']}")
 			print(f"Episode cumulative reward: {es['episode_reward']}")
 			# also return stats in info for external use
 			info['episode_stats'] = {
