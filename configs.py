@@ -1,7 +1,7 @@
 # ...existing code...
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, Any, Tuple, Iterator
+from typing import Dict, Any, Tuple, Iterator, Optional
 import itertools
 
 
@@ -14,10 +14,14 @@ class Config:
     capacity: int = 200
     depot: Tuple[int, int] = (0, 0)
     max_time: int = 100 # the value has to be consistent with generator_params' max_time
+    # Hard cap on episode after last generation time; if None, will be set in __post_init__
+    max_end_time: Optional[int] = None
     # Reward scales
     capacity_reward_scale: float = 0.05
     expiry_penalty_scale: float = 0.05
     switch_penalty_scale: float = 0.001
+    # Per-step waiting penalty over active (unserved) demands
+    wait_penalty_scale: float = 0.001
     # Exploration penalty params
     exploration_history_n: int = 3  # consider positions at t-2 .. t-n
     exploration_penalty_scale: float = 0.001  # scale of revisit penalty
@@ -66,6 +70,11 @@ class Config:
         # accept either "__depot__" or "__DEPOT__" as placeholder
         if self.generator_params.get("depot") in ("__depot__", "__DEPOT__"):
             self.generator_params["depot"] = self.depot
+        # default max_end_time if not provided: allow time after last generation
+        # to return to depot and finish remaining work
+        if self.max_end_time is None:
+            # heuristic default: 2x max_time to allow wind-down
+            self.max_end_time = int(self.max_time * 2)
 
 
 def get_default_config() -> Config:

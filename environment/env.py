@@ -32,11 +32,21 @@ class GridEnvironment:
 		depot: Tuple[int, int] = (0, 0),
 		generator: Optional[BaseDemandGenerator] = None,
 		max_time: int = 100,
+		# Interpretation changed: max_time is the last demand generation time.
+		# Episode does NOT end at max_time immediately. After max_time, the
+		# episode will terminate when there are no unserved demands AND all
+		# agents are back at the depot; or when hitting max_end_time.
 		expiry_penalty_scale: float = 5.0,
 		switch_penalty_scale: float = 0.01,
 		capacity_reward_scale: float = 10.0,
 		exploration_history_n: int = 0,
 		exploration_penalty_scale: float = 0.0,
+		# per-step waiting penalty scale: at each timestep each active (unserved)
+		# demand contributes penalty = - wait_penalty_scale * demand.c
+		wait_penalty_scale: float = 0.001,
+		# Hard cap on episode length; regardless of vehicle positions, if the
+		# current time reaches max_end_time, the episode ends.
+		max_end_time: Optional[int] = None,
 	) -> None:
 		self.width = width
 		self.height = height
@@ -49,6 +59,9 @@ class GridEnvironment:
 		self.capacity_reward_scale = capacity_reward_scale
 		self.exploration_history_n = max(0, int(exploration_history_n))
 		self.exploration_penalty_scale = float(exploration_penalty_scale)
+		self.wait_penalty_scale = float(wait_penalty_scale)
+		# If not specified, default to max_time to preserve previous behavior
+		self.max_end_time = int(max_time if max_end_time is None else max_end_time)
 		self._state: Optional[EnvState] = None
 
 		# cache for resolved full capacity to avoid repeated imports
@@ -126,8 +139,18 @@ class GridEnvironment:
 		# remove expired demands
 		self._state.demands = [d for d in self._state.demands if t <= d.end_t]
 
+		# Previously the environment applied a one-shot expiry penalty when a
+		# demand actually expired. We now replace that with a per-step waiting
+		# penalty: each active (unexpired) demand contributes a small negative
+		# reward proportional to its capacity. Keep expired stats but set the
+		# one-shot expiry_penalty to 0 for backward compatibility.
+		
 		# apply expiry penalty (negative), scaled by expiry_penalty_scale
 		expiry_penalty = - float(self.expiry_penalty_scale) * expired_capacity if expired_count > 0 else 0.0
+
+		# compute per-step waiting penalty over currently active demands
+		active_total_capacity = sum(float(d.c) for d in self._state.demands)
+		wait_penalty = - float(self.wait_penalty_scale) * active_total_capacity if active_total_capacity > 0 else 0.0
 
 		# record any newly observed demands (covers both generated and externally appended demands)
 		for d in self._state.demands:
@@ -250,7 +273,8 @@ class GridEnvironment:
 		# --- Reward aggregation ---
 		capacity_reward_term = float(self.capacity_reward_scale) * float(capacity_reward)
 		switch_penalty_term = - float(self.switch_penalty_scale) * float(switch_count)
-		reward = capacity_reward_term + expiry_penalty 		# + switch_penalty_term  + exploration_penalty_value
+		# Combine capacity reward with the per-step waiting penalty (negative).
+		reward = capacity_reward_term + wait_penalty + switch_penalty_term 		#  + exploration_penalty_value
 
 		# update episode-level stats
 		self._episode_stats["served_count"] += served_count
@@ -280,6 +304,9 @@ class GridEnvironment:
 			self._episode_stats.setdefault("exploration_penalty_value", 0.0)
 			self._episode_stats["exploration_penalty_raw"] += exploration_penalty
 			self._episode_stats["exploration_penalty_value"] += exploration_penalty_value
+		# record per-step waiting penalty (negative or zero)
+		self._episode_stats.setdefault("wait_penalty_value", 0.0)
+		self._episode_stats["wait_penalty_value"] += wait_penalty
 		self._prev_actions = list(actions)
 		# update position histories AFTER computing penalty
 		for idx, a in enumerate(self._state.agent_states):
@@ -294,7 +321,19 @@ class GridEnvironment:
 
 		# 4) time update
 		self._state.time += 1
-		done = self._state.time >= self.max_time
+		# Termination logic:
+		# - If reached hard cap max_end_time -> done
+		# - Else if past last generation time (max_time) and there are no
+		#   unserved demands AND all agents are at depot -> done
+		# - Else -> continue
+		if self._state.time >= self.max_end_time:
+			done = True
+		elif self._state.time > self.max_time:
+			no_unserved = (len(self._state.demands) == 0)
+			all_at_depot = all((a.x, a.y) == self.depot for a in self._state.agent_states)
+			done = bool(no_unserved and all_at_depot)
+		else:
+			done = False
 		# on episode end, print aggregated statistics and return them in info
 		info: Dict = {}
 		if collided_agents:

@@ -375,6 +375,8 @@ def build_env_from_cfg(cfg: Config) -> GridEnvironment:
         capacity_reward_scale=float(getattr(cfg, "capacity_reward_scale", 10.0)),
         exploration_history_n=int(getattr(cfg, "exploration_history_n", 0)),
         exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
+        wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
+        max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2)),
     )
     env.num_agents = cfg.num_agents
     return env
@@ -389,7 +391,7 @@ def parse_args() -> argparse.Namespace:
     """
     p = argparse.ArgumentParser(description="RL fine-tuning for DVRPNet (policy gradient)")
     p.add_argument("--episodes", type=int, default=200, help="Number of training episodes")
-    p.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    p.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     p.add_argument("--ckpt_init", type=str, default="checkpoints/planner/planner_20_2_200.pt", help="Initial planner checkpoint to warm start")

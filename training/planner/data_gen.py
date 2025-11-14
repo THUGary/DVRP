@@ -306,6 +306,8 @@ def generate_dataset(
             capacity_reward_scale=float(getattr(cfg, "capacity_reward_scale", 10.0)),
             exploration_history_n=int(getattr(cfg, "exploration_history_n", 0)),
             exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
+            wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
+            max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2)),
         )
         env.num_agents = cfg.num_agents
         planner = _build_planner(planner_type, capacity=cfg.capacity)
