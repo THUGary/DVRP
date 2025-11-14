@@ -12,7 +12,7 @@ else:
 
 Color = Tuple[int, int, int]
 
-
+#
 class PygameRenderer:
     """Simple Pygame-based renderer for the DVRP grid environment.
 
