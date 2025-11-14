@@ -394,8 +394,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
-    p.add_argument("--ckpt_init", type=str, default="checkpoints/planner/planner_20_2_200.pt", help="Initial planner checkpoint to warm start")
-    p.add_argument("--save_best", type=str, default="checkpoints/planner/planner_rl_best.pt", help="Path to save the best-performing RL checkpoint")
+    # If the flag is omitted entirely we do NOT warm-start.
+    # If the flag is present but no path is given, use the default checkpoint path.
+    p.add_argument("--ckpt_init", nargs='?', const="checkpoints/planner_20_2_10.pt", default=None,
+                   help="Optional: initial planner checkpoint to warm start (flag present with no value uses default path)")
+    p.add_argument("--save_best", type=str, default="checkpoints/planner_rl_best.pt", help="Path to save the best-performing RL checkpoint")
     p.add_argument("--generator", type=str, choices=["rule", "net"], default="rule", help="Override generator type for RL training")
     p.add_argument("--lateness_lambda", type=float, default=0.0, help="Soft lateness penalty used during decode")
     p.add_argument("--reward_log", type=str, default="runs/rl_rewards.csv", help="CSV file to log per-episode rewards")
@@ -550,13 +553,20 @@ def main() -> None:
     ).to(device)
     model.train()
 
-    if args.ckpt_init and os.path.exists(args.ckpt_init):
-        blob = torch.load(args.ckpt_init, map_location=device)
-        state = blob.get("model", blob)
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        print(f"[RL] Warm start from {args.ckpt_init} (missing={len(missing)}, unexpected={len(unexpected)})")
+    # Only warm-start if the flag was provided on the command line. If the
+    # flag was omitted (args.ckpt_init is None) we explicitly do NOT warm-start.
+    if args.ckpt_init is None:
+        print("[RL] No warm-start requested; training from random init.")
     else:
-        print("[RL] No warm-start checkpoint found; training from random init.")
+        # Flag present: attempt to load the specified checkpoint (or default
+        # path if the flag was given without a value).
+        if os.path.exists(args.ckpt_init):
+            blob = torch.load(args.ckpt_init, map_location=device)
+            state = blob.get("model", blob)
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            print(f"[RL] Warm start from {args.ckpt_init} (missing={len(missing)}, unexpected={len(unexpected)})")
+        else:
+            print(f"[RL] Warm-start requested but checkpoint not found at {args.ckpt_init}; training from random init.")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
