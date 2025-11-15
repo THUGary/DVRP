@@ -16,7 +16,7 @@ class Config:
     max_time: int = 100 # the value has to be consistent with generator_params' max_time
 
     # Generator params
-    generator_type: str = "rule"  # "rule" | "net"
+    generator_type: str = "net"  # "rule" | "net"
     generator_params: Dict[str, Any] = field(default_factory=lambda: {
         "max_per_step": 2, # not used in rule-based generator
         "depot": "__depot__",  # placeholder to be replaced with Config.depot (accepts "__depot__" or "__DEPOT__")
@@ -31,7 +31,7 @@ class Config:
         "neighborhood_size": 3, # 3-15, the average radius of the concentrated generation areas
         "burst_prob": 0.1, # 0.0 - 1.0, probability of bursting demands among all demands
         # add checkpoint path for the network-based generator
-    "model_path": "checkpoints/coevolution/generator_cycle_4.pth",#"checkpoints/diffusion_model.pth",
+    "model_path": "checkpoints/rl_generator/ggreedy_20251115-180359/ckpt_ep_400.pth",#"checkpoints/diffusion_model.pth",
     })
 
     # Planner params
