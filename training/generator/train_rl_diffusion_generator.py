@@ -72,7 +72,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--init_diffusion_ckpt", type=str, default="checkpoints/diffusion_model.pth", help="Initialize diffusion model from this checkpoint if exists")
     p.add_argument("--log_tb", action="store_true", help="Log training metrics to TensorBoard")
     p.add_argument("--save_every", type=int, default=100)
-    p.add_argument("--max_steps", type=int, default=1500, help="Diffusion model internal steps (num_steps) if reinit")
+    p.add_argument("--max_steps", type=int, default=1000, help="Diffusion model internal steps (num_steps) if reinit")
     p.add_argument("--normalize_reward", action="store_true", help="Normalize generator rewards across batch for stable updates")
     p.add_argument("--baseline_beta", type=float, default=0.9, help="EMA baseline beta for variance reduction")
     p.add_argument("--sl_weight", type=float, default=0.01, help="Weight for supervised loss component in hybrid loss")

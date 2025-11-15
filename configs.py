@@ -31,7 +31,7 @@ class Config:
         "neighborhood_size": 3, # 3-15, the average radius of the concentrated generation areas
         "burst_prob": 0.1, # 0.0 - 1.0, probability of bursting demands among all demands
         # add checkpoint path for the network-based generator
-    "model_path": "checkpoints/rl_generator/ggreedy_20251115-180359/ckpt_ep_400.pth",#"checkpoints/diffusion_model.pth",
+    "model_path": "checkpoints/rl_generator/greedy_20251115-171640/ckpt_ep_1000.pth",#"checkpoints/diffusion_model.pth",
     })
 
     # Planner params
