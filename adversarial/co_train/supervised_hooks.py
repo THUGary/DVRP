@@ -68,7 +68,8 @@ def supervised_planner_hook(planner: Any, ctx: Dict[str, Any]) -> None:
     _torch = torch
     agents_tensor = _torch.tensor([[ (a[0], a[1], a[2], obs["time"]) for a in agent_states ]], dtype=_torch.float32, device=device)
     enc_nodes, enc_depot, node_mask = planner._model.encoder(feats)  # type: ignore[attr-defined]
-    logits = planner._model.decode(enc_nodes=enc_nodes, enc_depot=enc_depot, node_mask=node_mask, agents_tensor=agents_tensor, nodes=feats.get("nodes"), lateness_lambda=getattr(planner, "lateness_lambda", 0.0))  # type: ignore[attr-defined]
+    enc_agents = planner._model.encoder.encode_agents(agents_tensor)  # type: ignore[attr-defined]
+    logits = planner._model.decode(enc_nodes=enc_nodes, enc_depot=enc_depot, node_mask=node_mask, enc_agents=enc_agents, agents_tensor=agents_tensor, nodes=feats.get("nodes"), lateness_lambda=getattr(planner, "lateness_lambda", 0.0), history_indices=None)  # type: ignore[attr-defined]
 
     # labels from teacher targets: map coord to index (0=depot, 1..N nodes)
     nodes = feats["nodes"]

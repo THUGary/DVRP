@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 import matplotlib.pyplot as plt
 from collections import deque
+from torch.utils.tensorboard import SummaryWriter
 
 plt.switch_backend("Agg")
 
@@ -171,10 +172,14 @@ def evaluate_sample(model: DVRPNet,
     feats_cpu = sample["feats"]  # type: ignore[index]
     agents_cpu = sample["agents"]  # type: ignore[index]
     actions_cpu = sample["actions"]  # type: ignore[index]
+    hist_pos_cpu = sample.get("history_positions", None)  # type: ignore[index]
+    hist_idx_cpu = sample.get("history_indices", None)    # type: ignore[index]
 
     feats = {k: v.to(device) for k, v in feats_cpu.items()}
     agents = agents_cpu.to(device)
     actions = actions_cpu.to(device)
+    history_positions = hist_pos_cpu.to(device) if hist_pos_cpu is not None else None
+    history_indices = hist_idx_cpu.to(device) if hist_idx_cpu is not None else None
 
     if feats["nodes"].size(1) == 0:
         B = actions.size(0)
@@ -184,13 +189,17 @@ def evaluate_sample(model: DVRPNet,
         return log_prob.squeeze(-1), entropy.squeeze(-1), value.squeeze(-1)
 
     enc_nodes, enc_depot, node_mask = model.encoder(feats)
+    enc_agents = model.encoder.encode_agents(agents)
     logits = model.decode(
         enc_nodes=enc_nodes,
         enc_depot=enc_depot,
         node_mask=node_mask,
+        enc_agents=enc_agents,
         agents_tensor=agents,
         nodes=feats.get("nodes"),
         lateness_lambda=lateness_lambda,
+        history_indices=history_indices,
+        history_positions=history_positions,
     )
     probs = torch.softmax(logits, dim=-1)
     logp = torch.log_softmax(logits, dim=-1)
@@ -361,6 +370,11 @@ def build_env_from_cfg(cfg: Config) -> GridEnvironment:
         depot=cfg.depot,
         generator=gen,
         max_time=cfg.max_time,
+        expiry_penalty_scale=float(getattr(cfg, "expiry_penalty_scale", 5.0)),
+        switch_penalty_scale=float(getattr(cfg, "switch_penalty_scale", 0.01)),
+        capacity_reward_scale=float(getattr(cfg, "capacity_reward_scale", 10.0)),
+        exploration_history_n=int(getattr(cfg, "exploration_history_n", 0)),
+        exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
     )
     env.num_agents = cfg.num_agents
     return env
@@ -395,6 +409,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--normalize_adv", action="store_true", help="Normalize advantages before PPO update")
     p.add_argument("--debug", action="store_true", help="Enable per-step debug printing of observed demands and new demands")
     p.add_argument("--deterministic", action="store_true", help="Enable deterministic torch/CuDNN behavior (may reduce performance)")
+    p.add_argument("--tb_logdir", type=str, default="runs/tb", help="TensorBoard log directory (empty string to disable)")
     return p.parse_args()
 
 
@@ -403,7 +418,9 @@ def select_targets_with_sampling(model: DVRPNet,
                                  agents_tensor: torch.Tensor,
                                  lateness_lambda: float,
                                  cap_full: torch.Tensor,
-                                 critic: ValueCritic | None = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+                                 critic: ValueCritic | None = None,
+                                 history_positions: torch.Tensor | None = None,
+                                 history_indices: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     Sample one-step target indices for each agent according to the current
     policy probabilities produced by `model.decode`.
@@ -442,13 +459,17 @@ def select_targets_with_sampling(model: DVRPNet,
         return sel, dest_xy, log_probs, value
 
     enc_nodes, enc_depot, node_mask = model.encoder(feats)
+    enc_agents = model.encoder.encode_agents(agents_tensor)
     logits = model.decode(
         enc_nodes=enc_nodes,
         enc_depot=enc_depot,
         node_mask=node_mask,
+        enc_agents=enc_agents,
         agents_tensor=agents_tensor,
         nodes=feats["nodes"],
         lateness_lambda=lateness_lambda,
+        history_indices=history_indices,
+        history_positions=history_positions,
     )  # [B,A,N+1]
 
     probs = torch.softmax(logits, dim=-1)
@@ -464,6 +485,7 @@ def select_targets_with_sampling(model: DVRPNet,
 
     for b in range(B):
         for a in range(A):
+            # print(f"Debug: B={b}, A={a}, Probs={probs[b,a].cpu().detach().numpy()}") if os.getenv("DVRP_DEBUG_LOGP") else None
             # sample using the categorical distribution built from probs
             cat = Categorical(probs[b, a])
             idx = cat.sample()  # 0..N
@@ -544,8 +566,8 @@ def main() -> None:
         os.makedirs(reward_log_dir, exist_ok=True)
         if not os.path.exists(args.reward_log):
             with open(args.reward_log, "w", newline="") as fh:
-                writer = csv.writer(fh)
-                writer.writerow(["episode", "return"])
+                csv_writer = csv.writer(fh)
+                csv_writer.writerow(["episode", "return"])
 
     if args.reward_plot:
         reward_plot_dir = os.path.dirname(args.reward_plot) or "."
@@ -558,6 +580,11 @@ def main() -> None:
     critic = None
     value_opt = None
     baseline = None
+    writer: SummaryWriter | None = None
+    if getattr(args, "tb_logdir", None):
+        if len(args.tb_logdir.strip()) > 0:
+            os.makedirs(args.tb_logdir, exist_ok=True)
+            writer = SummaryWriter(log_dir=args.tb_logdir)
     if args.algo == "ppo":
         critic = ValueCritic(model.d_model).to(device)
         critic.train()
@@ -589,7 +616,15 @@ def main() -> None:
         # keep track of previous demands to compute "new" arrivals for debug
         prev_demands: List[Tuple[int, int, int, int, int]] = []
 
+        # 初始化历史：记录初始位置
         done = False
+        hist_pos: List[List[Tuple[int, int]]] = []  # 每个 agent 的 (x,y) 列表
+        hist_idx: List[List[int]] = []              # 每个 agent 的 选择索引序列 (0=depot,1..N=node)
+        for (x, y, s) in obs["agent_states"]:
+            hist_pos.append([(int(x), int(y))])
+            hist_idx.append([0])  # 初始位置视作 depot
+        depot_select_count = 0
+        total_select_count = 0
         while not done:
             nodes_list = obs["demands"]
             step_idx = len(rewards_all)
@@ -624,6 +659,20 @@ def main() -> None:
             agents = [(x, y, s, obs["time"]) for (x, y, s) in obs["agent_states"]]
             agents_t = prepare_agents([agents], device=device)
 
+            # 组织历史位置序列 [B=1, A, T, 2]，无 padding（T 为各 agent 相同）
+            T = max(len(h) for h in hist_pos)
+            A = len(hist_pos)
+            hp = torch.full((1, A, T, 2), -1, dtype=torch.float32, device=device)
+            hi = torch.full((1, A, T), -1, dtype=torch.long, device=device)
+            for a_idx, (seq_pos, seq_idx) in enumerate(zip(hist_pos, hist_idx)):
+                for t_idx, (px, py) in enumerate(seq_pos):
+                    hp[0, a_idx, t_idx, 0] = float(px)
+                    hp[0, a_idx, t_idx, 1] = float(py)
+                # 索引序列长度与位置序列一致（决策后追加），截断或填充
+                for t_idx, idx_val in enumerate(seq_idx):
+                    if t_idx < T:
+                        hi[0, a_idx, t_idx] = int(idx_val)
+
             sel, dest_xy, log_probs, state_value = select_targets_with_sampling(
                 model,
                 feats,
@@ -631,7 +680,16 @@ def main() -> None:
                 lateness_lambda=args.lateness_lambda,
                 cap_full=torch.full((1, cfg.num_agents), float(cfg.capacity), device=device),
                 critic=critic,
+                history_positions=hp,
+                history_indices=hi,
             )
+
+            if args.debug:
+                # 统计本步各 agent 选择 depot 的比例
+                B, A = sel.shape
+                depot_sel = int((sel == 0).sum().item())
+                total = B * A
+                print(f"[EP {ep:04d} STEP {step_idx}] depot_ratio={depot_sel}/{total} = {depot_sel/float(max(1,total)):.2f}")
 
             actions: List[Tuple[int, int]] = []
             for i, (x, y, s) in enumerate(obs["agent_states"]):
@@ -648,6 +706,9 @@ def main() -> None:
             logprob_traj.append(log_prob_sum)
             rewards_all.append(reward_val)
             dones_all.append(done)
+            # depot ratio 统计
+            depot_select_count += int((sel == 0).sum().item())
+            total_select_count += sel.numel()
 
             if critic is not None and state_value is not None:
                 decision_steps.append({
@@ -657,17 +718,23 @@ def main() -> None:
                     "actions": sel.detach().cpu().clone(),
                     "old_log_prob": float(log_prob_sum.detach().cpu().item()),
                     "value": float(state_value.detach().cpu().item()),
+                    "history_positions": hp.detach().cpu().clone(),
+                    "history_indices": hi.detach().cpu().clone(),
                 })
 
             obs = next_obs
             # remember demands seen at this step for the next iteration's diff
             prev_demands = list(nodes_list)
+            # 更新历史：追加新位置（下一状态）
+            # 更新历史：追加下一状态位置与本步选择的索引（sel 已对应目标点，长度与 agent 数一致）
+            hist_pos = [seq + [(int(x), int(y))] for seq, (x, y, s) in zip(hist_pos, obs["agent_states"]) ]
+            hist_idx = [seq + [int(sel[0, a].item())] for a, seq in enumerate(hist_idx)]
 
         reward_history.append(total_reward)
         if args.reward_log:
             with open(args.reward_log, "a", newline="") as fh:
-                writer = csv.writer(fh)
-                writer.writerow([ep, total_reward])
+                csv_writer = csv.writer(fh)
+                csv_writer.writerow([ep, total_reward])
 
         if args.algo == "reinforce":
             episode_return = total_reward
@@ -678,18 +745,18 @@ def main() -> None:
 
             # If no policy decisions were made (e.g., no demands), skip update safely
             if not logprob_traj:
-                print(f"[EP {ep:04d}] return={total_reward:.1f} adv={adv:.1f} (skip update: no decisions)")
+                print(f"[EP {ep:04d}] return={total_reward:.5f} adv={adv:.1f} (skip update: no decisions)")
             else:
                 sum_logprob = torch.stack(logprob_traj).sum()
                 if not sum_logprob.requires_grad:
-                    print(f"[EP {ep:04d}] return={total_reward:.1f} adv={adv:.1f} (skip update: no grad)")
+                    print(f"[EP {ep:04d}] return={total_reward:.5f} adv={adv:.1f} (skip update: no grad)")
                 else:
                     loss = -adv * sum_logprob
                     opt.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     opt.step()
-                    print(f"[EP {ep:04d}] return={total_reward:.1f} adv={adv:.1f} loss={float(loss.item()):.3f}")
+                    print(f"[EP {ep:04d}] return={total_reward:.5f} adv={adv:.1f} loss={float(loss.item()):.3f}")
         else:
             assert critic is not None and value_opt is not None
             if not rewards_all:
@@ -708,7 +775,7 @@ def main() -> None:
                 args.lateness_lambda,
             )
             print(
-                f"[EP {ep:04d}] return={total_reward:.1f} policy_loss={stats['policy_loss']:.3f} "
+                f"[EP {ep:04d}] return={total_reward:.5f} policy_loss={stats['policy_loss']:.3f} "
                 f"value_loss={stats['value_loss']:.3f} entropy={stats['entropy']:.3f}"
             )
 
@@ -716,7 +783,41 @@ def main() -> None:
             best_return = total_reward
             if args.save_best:
                 torch.save({"model": model.state_dict(), "episode": ep, "return": total_reward}, args.save_best)
-                print(f"[RL] new best checkpoint saved => {args.save_best} (return={total_reward:.1f})")
+                print(f"[RL] new best checkpoint saved => {args.save_best} (return={total_reward:.5f})")
+
+        # TensorBoard logging
+        if writer is not None:
+            env_stats = getattr(env, "_episode_stats", {})
+            demand_count = env_stats.get("demand_count", 0)
+            demand_capacity = env_stats.get("demand_capacity", 0.0)
+            served_count = env_stats.get("served_count", 0)
+            served_capacity = env_stats.get("served_capacity", 0.0)
+            expired_capacity = env_stats.get("expired_capacity", 0.0)
+            capacity_reward_term = env_stats.get("capacity_reward_term", 0.0)
+            expired_penalty_mag = env_stats.get("expired_penalty", 0.0)
+            switch_penalty_term = env_stats.get("switch_penalty", 0.0)
+            exploration_penalty_value = env_stats.get("exploration_penalty_value", 0.0)
+            served_ratio = (served_capacity / demand_capacity) if demand_capacity > 1e-9 else 0.0
+            depot_ratio = (depot_select_count / total_select_count) if total_select_count > 0 else 0.0
+            # expiry penalty sign restore (original per-step negative)
+            expiry_penalty_total = -expired_penalty_mag
+            writer.add_scalar("episode/return", total_reward, ep)
+            writer.add_scalar("demand/count", demand_count, ep)
+            writer.add_scalar("demand/capacity_total", demand_capacity, ep)
+            writer.add_scalar("served/count", served_count, ep)
+            writer.add_scalar("served/capacity_served", served_capacity, ep)
+            writer.add_scalar("expired/capacity", expired_capacity, ep)
+            writer.add_scalar("ratio/served_capacity_ratio", served_ratio, ep)
+            writer.add_scalar("ratio/depot_ratio", depot_ratio, ep)
+            if capacity_reward_term is not None:
+                writer.add_scalar("reward_parts/capacity_reward_term", capacity_reward_term, ep)
+            if expired_penalty_mag is not None:
+                writer.add_scalar("reward_parts/expiry_penalty", expiry_penalty_total, ep)
+            if switch_penalty_term is not None:
+                writer.add_scalar("reward_parts/switch_penalty_term", switch_penalty_term, ep)
+            if exploration_penalty_value is not None:
+                writer.add_scalar("reward_parts/exploration_penalty_value", exploration_penalty_value, ep)
+            writer.flush()
 
     if reward_history and args.reward_plot:
         plt.figure(figsize=(8, 4))
@@ -734,6 +835,9 @@ def main() -> None:
         print("[RL] Warning: no episodes completed; no checkpoint saved.")
     else:
         print(f"[RL] best return={best_return:.1f} checkpoint => {args.save_best}")
+
+    if writer is not None:
+        writer.close()
 
 
 if __name__ == "__main__":

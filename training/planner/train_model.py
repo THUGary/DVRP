@@ -196,13 +196,16 @@ def evaluate(model: DVRPNet, loader: DataLoader, device: torch.device, lateness_
 
         for step in range(K):
             with torch.cuda.amp.autocast(enabled=amp):
+                enc_agents = model.encoder.encode_agents(ag)
                 logits = model.decode(
                     enc_nodes=enc["H_nodes"],
                     enc_depot=enc["H_depot"],
                     node_mask=cur_mask,
+                    enc_agents=enc_agents,
                     agents_tensor=ag,
                     nodes=nodes,
                     lateness_lambda=lateness_lambda,
+                    history_indices=None,
                 )  # [B,A,N+1]
 
                 # debug
@@ -358,13 +361,16 @@ def main():
                     # print(f"[TRAIN-DEBUG] mask (B x N): {cur_mask.detach().cpu().tolist()}")
                 for step in range(K):
                     with torch.cuda.amp.autocast(enabled=args.amp):
+                        enc_agents = model.encoder.encode_agents(ag)
                         logits = model.decode(
                             enc_nodes=enc["H_nodes"],
                             enc_depot=enc["H_depot"],
                             node_mask=cur_mask,
+                            enc_agents=enc_agents,
                             agents_tensor=ag,
                             nodes=nodes,
                             lateness_lambda=args.lateness_lambda,
+                            history_indices=None,
                         )  # [B,A,N+1]
                         labels_step = labels_ak[:, :, step]                  # [B,A]
                         logits_flat = logits.reshape(-1, logits.size(-1))    # [B*A,N+1]
