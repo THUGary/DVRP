@@ -22,22 +22,22 @@ Constraints:
   We enforce by clipping / rounding after un-normalization similarly to NetDemandGenerator.
 
 CLI Example:
-python scripts/train_rl_diffusion_generator.py --episodes 50 --planner greedy --device cuda
-python scripts/train_rl_diffusion_generator.py --episodes 50 --planner model --planner_ckpt checkpoints/planner/planner_20_2_200.pt --device cuda
+python training/generator/train_rl_diffusion_generator.py --episodes 50 --planner greedy --device cuda
+python training/generator/train_rl_diffusion_generator.py --episodes 50 --planner model --planner_ckpt checkpoints/planner/planner_20_2_200.pt --device cuda
 
 Outputs:
-- Updated diffusion model checkpoint at --out_ckpt.
-- CSV log with episode, env_reward, gen_reward.
+- Checkpoints saved to a unique timestamped directory inside `checkpoints/rl_generator/`.
+- TensorBoard logs and a CSV log saved to a unique timestamped directory inside `runs/rl_generator/`.
 """
 from __future__ import annotations
 import argparse
 import os
-import csv
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 
 import sys
 import pathlib
@@ -57,7 +57,8 @@ from agent.planner.base import AgentState  # type: ignore
 from utils.pygame_renderer import PygameRenderer  # type: ignore
 from configs import get_default_config  # type: ignore
 import random
-
+import csv
+from datetime import datetime
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Adversarial RL training for diffusion demand generator against a planner")
@@ -66,15 +67,16 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--planner", type=str, default="greedy", choices=["greedy", "model"], help="Planner to adversarially attack")
     p.add_argument("--planner_ckpt", type=str, default="checkpoints/planner/planner_20_2_200.pt", help="Checkpoint for model planner if --planner model")
     p.add_argument("--total_demand", type=int, default=50, help="Number of demands to generate per episode")
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--out_ckpt", type=str, default="checkpoints/diffusion_model_adv.pth")
     p.add_argument("--init_diffusion_ckpt", type=str, default="checkpoints/diffusion_model.pth", help="Initialize diffusion model from this checkpoint if exists")
-    p.add_argument("--log_csv", type=str, default="runs/diffusion_adv_rewards.csv")
-    p.add_argument("--save_every", type=int, default=10)
+    p.add_argument("--log_tb", action="store_true", help="Log training metrics to TensorBoard")
+    p.add_argument("--save_every", type=int, default=100)
     p.add_argument("--max_steps", type=int, default=1000, help="Diffusion model internal steps (num_steps) if reinit")
     p.add_argument("--normalize_reward", action="store_true", help="Normalize generator rewards across batch for stable updates")
     p.add_argument("--baseline_beta", type=float, default=0.9, help="EMA baseline beta for variance reduction")
+    p.add_argument("--sl_weight", type=float, default=0.01, help="Weight for supervised loss component in hybrid loss")
+    p.add_argument("--diff_loss_clip", type=float, default=10.0, help="Clip diffusion loss to this max value to prevent instability")
     p.add_argument("--render", action="store_true", help="Render environment with Pygame during rollout")
     p.add_argument("--fps", type=int, default=10, help="Render FPS; used only with --render")
     p.add_argument("--save_frames_dir", type=str, default="", help="If set, save rendered frames as PNGs to this directory (headless)")
@@ -126,14 +128,16 @@ def _init_planner(planner_type: str, cfg, device: torch.device, ckpt_path: str |
         raise ValueError(f"Unsupported planner type: {planner_type}")
 
 
-def _plan_episode(planner, env: GridEnvironment, demands: List[Tuple[int,int,int,int,int]], *, renderer: PygameRenderer | None = None, fps: int = 10, save_frames_dir: str = "", debug: bool = False) -> float:
+def _plan_episode(planner, env: GridEnvironment, demands: List[Tuple[int,int,int,int,int]], *, renderer: PygameRenderer | None = None, fps: int = 10, save_frames_dir: str = "", debug: bool = False) -> Tuple[float, float, float]:
     """Inject demands then roll out a simple control loop with no sophisticated planner replanning every step.
     For adversarial training we only need the resulting reward.
     We simulate naive control: agents move greedily towards first planned target each step.
+    Returns (serviced_reward, total_initial_demand_capacity, unserviced_capacity)
     """
     obs = env.reset()
     # Pre-insert demands into generator-less environment state
     # We'll directly extend env._state.demands if accessible (adversarial setting)
+    total_initial_demand_capacity = sum(d[3] for d in demands)
     if hasattr(env, "_state") and env._state is not None:
         # convert to Demand objects via a minimal import
         from agent.generator.base import Demand
@@ -233,7 +237,14 @@ def _plan_episode(planner, env: GridEnvironment, demands: List[Tuple[int,int,int
         obs, reward, done, _info = env.step(actions)
         total_reward += reward
         step_count += 1
-    return total_reward
+    
+    # After episode, calculate unserviced capacity
+    unserviced_capacity = 0
+    if hasattr(env, "_state") and env._state is not None:
+        # Based on env.py, any demand remaining in the state list is unserviced.
+        unserviced_capacity = sum(d.c for d in env._state.demands)
+
+    return total_reward, total_initial_demand_capacity, unserviced_capacity
 
 
 def _generate_demands(model: DemandDiffusionModel, condition: torch.Tensor, params: Dict[str, Any], device: torch.device) -> List[Tuple[int,int,int,int,int]]:
@@ -275,6 +286,28 @@ def main():
     # override total demand if provided
     cfg.generator_params["total_demand"] = args.total_demand
 
+    # --- Create unique run identifiers and directories ---
+    run_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_name = f"{args.planner}_{run_timestamp}"
+    
+    checkpoint_dir = f"checkpoints/rl_generator/{run_name}"
+    log_dir = f"runs/rl_generator/{run_name}"
+    
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # --- Initialize logging ---
+    writer = None
+    if args.log_tb:
+        os.makedirs(log_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=log_dir)
+    
+    # CSV logging will also go into the unique run directory
+    csv_log_path = os.path.join(log_dir, "training_log.csv")
+    with open(csv_log_path, 'w', newline='') as fh:
+        csv_writer = csv.writer(fh)
+        csv_writer.writerow(["episode", "serviced_reward", "gen_reward"])
+
+
     env = _make_environment(cfg)
     planner = _init_planner(args.planner, cfg, device, args.planner_ckpt if args.planner == "model" else None)
 
@@ -302,13 +335,6 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     baseline = None
-    os.makedirs(os.path.dirname(args.out_ckpt) or '.', exist_ok=True)
-    if args.log_csv:
-        os.makedirs(os.path.dirname(args.log_csv) or '.', exist_ok=True)
-        if not os.path.exists(args.log_csv):
-            with open(args.log_csv, 'w', newline='') as fh:
-                writer = csv.writer(fh)
-                writer.writerow(['episode','env_reward','gen_reward'])
 
     renderer = None
     # Try to enable headless rendering if rendering/saving frames without a display
@@ -347,8 +373,17 @@ def main():
         }, device)
 
         # Evaluate planner reward under these demands
-        env_reward = _plan_episode(planner, env, demands, renderer=renderer, fps=args.fps, save_frames_dir=args.save_frames_dir, debug=args.debug_planner)
-        gen_reward = -env_reward  # adversarial objective
+        serviced_reward, total_demand_cap, unserviced_cap = _plan_episode(planner, env, demands, renderer=renderer, fps=args.fps, save_frames_dir=args.save_frames_dir, debug=args.debug_planner)
+        
+        # Aadversarial objective: reward creating unserviced demands, penalize creating serviced demands.
+        # This prevents the model from collapsing to generating zero demands.
+        gen_reward = unserviced_cap - serviced_reward
+
+        # --- Add a penalty for generating too little demand ---
+        # This is a crucial fix to prevent the model from collapsing to generating nothing.
+        MIN_TOTAL_CAPACITY = 10 # Set a reasonable minimum threshold
+        if total_demand_cap < MIN_TOTAL_CAPACITY:
+            gen_reward -= 1000 # Apply a large penalty
 
         if baseline is None:
             baseline = gen_reward
@@ -385,29 +420,49 @@ def main():
 
         noise, predicted_noise = model(x_start, condition)
         diff_loss = F.mse_loss(predicted_noise, noise)
-        loss = diff_loss * adv_scaled
+        
+        # Clip diff_loss to prevent explosive gradients from unstable outputs
+        diff_loss_clipped = torch.clamp(diff_loss, max=args.diff_loss_clip)
+        
+        # --- MODIFIED: Use a hybrid loss with tunable weight and clipped diff_loss ---
+        rl_loss = diff_loss_clipped * adv_scaled
+        loss = rl_loss + args.sl_weight * diff_loss_clipped
 
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
 
-        if args.log_csv:
-            with open(args.log_csv, 'a', newline='') as fh:
-                writer = csv.writer(fh)
-                writer.writerow([ep, env_reward, gen_reward])
+        if writer is not None:
+            writer.add_scalar("reward/serviced", serviced_reward, ep)
+            writer.add_scalar("reward/generator", gen_reward, ep)
+            writer.add_scalar("train/advantage", adv, ep)
+            writer.add_scalar("train/loss", loss.item(), ep)
+            writer.add_scalar("train/diff_loss", diff_loss.item(), ep) # Log original diff_loss for monitoring
+            writer.add_scalar("train/diff_loss_clipped", diff_loss_clipped.item(), ep)
 
-        print(f"[EP {ep:03d}] env_reward={env_reward:.2f} gen_reward={gen_reward:.2f} adv={adv:.2f} loss={loss.item():.4f} diff={diff_loss.item():.4f}")
+        with open(csv_log_path, 'a', newline='') as fh:
+            writer_csv = csv.writer(fh)
+            writer_csv.writerow([ep, serviced_reward, gen_reward])
+
+        print(f"[EP {ep:03d}] serviced_reward={serviced_reward:.2f} gen_reward={gen_reward:.2f} adv={adv:.2f} loss={loss.item():.4f} diff={diff_loss.item():.4f}")
 
         if ep % args.save_every == 0 or ep == args.episodes:
-            torch.save(model.state_dict(), args.out_ckpt)
-            print(f"[CKPT] saved diffusion adversarial weights -> {args.out_ckpt}")
+            # Save episode-specific checkpoint
+            checkpoint_path = os.path.join(checkpoint_dir, f"ckpt_ep_{ep}.pth")
+            torch.save(model.state_dict(), checkpoint_path)
+            # Overwrite a 'latest' checkpoint for easy access
+            latest_checkpoint_path = os.path.join(checkpoint_dir, "latest.pth")
+            torch.save(model.state_dict(), latest_checkpoint_path)
+            print(f"Saved checkpoint to {checkpoint_path}")
 
     if renderer is not None:
         try:
             renderer.close()
         except Exception:
             pass
+    if writer is not None:
+        writer.close()
     print("Training complete.")
 
 
