@@ -16,6 +16,7 @@ class Config:
     max_time: int = 100 # the value has to be consistent with generator_params' max_time
     # Hard cap on episode after last generation time; if None, will be set in __post_init__
     max_end_time: Optional[int] = None
+    include_service_time: bool = False
     # Reward scales
     capacity_reward_scale: float = 0.05
     expiry_penalty_scale: float = 0.05
@@ -36,6 +37,9 @@ class Config:
         "max_c": 5, # from 1 to 10
         "min_lifetime": 40,
         "max_lifetime": 50,
+        "min_service_time": 1,
+        "max_service_time": 3,
+        "service_time_per_unit": 0.0,
 
         "num_centers": 6,
         "distribution": "uniform",  # "uniform" | "gaussian" | "cluster"
@@ -70,6 +74,13 @@ class Config:
         # accept either "__depot__" or "__DEPOT__" as placeholder
         if self.generator_params.get("depot") in ("__depot__", "__DEPOT__"):
             self.generator_params["depot"] = self.depot
+        # ensure service-time range is well-ordered
+        min_service = int(self.generator_params.get("min_service_time", 0))
+        max_service = int(self.generator_params.get("max_service_time", min_service))
+        if max_service < min_service:
+            max_service = min_service
+        self.generator_params["min_service_time"] = min_service
+        self.generator_params["max_service_time"] = max_service
         # default max_end_time if not provided: allow time after last generation
         # to return to depot and finish remaining work
         if self.max_end_time is None:

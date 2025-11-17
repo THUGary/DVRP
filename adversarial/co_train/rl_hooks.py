@@ -81,7 +81,10 @@ def reinforce_planner_hook(planner, ctx: Dict[str, Any]) -> None:
     if hasattr(env, "_state") and getattr(env, "_state") is not None:
         try:
             from agent.generator.base import Demand as _Demand
-            env._state.demands.extend([_Demand(x=d[0], y=d[1], t=d[2], c=d[3], end_t=d[4]) for d in demands_list])
+            def _to_demand(raw: Tuple[int, ...]) -> _Demand:
+                service_time = int(raw[5]) if len(raw) > 5 else 0
+                return _Demand(x=raw[0], y=raw[1], t=raw[2], c=raw[3], end_t=raw[4], service_time=service_time)
+            env._state.demands.extend([_to_demand(d) for d in demands_list])
         except Exception:
             pass
     if hasattr(env, "_obs"):

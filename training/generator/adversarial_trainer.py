@@ -44,10 +44,20 @@ def _generate_demands(model, condition, params: Dict[str, Any]):
     return demands
 
 
-def rollout_episode(planner, env: GridEnvironment, demands: List[Tuple[int,int,int,int,int]], *, renderer: PygameRenderer|None=None, fps: int=10) -> float:
+def rollout_episode(planner, env: GridEnvironment, demands: List[Tuple[int, ...]], *, renderer: PygameRenderer|None=None, fps: int=10) -> float:
     obs = env.reset()
     if hasattr(env, "_state") and env._state is not None:
-        env._state.demands.extend([Demand(x=d[0], y=d[1], t=d[2], c=d[3], end_t=d[4]) for d in demands])
+        env._state.demands.extend([
+            Demand(
+                x=d[0],
+                y=d[1],
+                t=d[2],
+                c=d[3],
+                end_t=d[4],
+                service_time=int(d[5]) if len(d) > 5 else 0,
+            )
+            for d in demands
+        ])
     total_reward = 0.0
     done = False
     clock = None

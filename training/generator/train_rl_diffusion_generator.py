@@ -100,6 +100,7 @@ def _make_environment(cfg) -> GridEnvironment:
         exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
         wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
         max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2)),
+        include_service_time=bool(getattr(cfg, "include_service_time", False)),
     )
     env.num_agents = cfg.num_agents
     return env
@@ -141,7 +142,10 @@ def _plan_episode(planner, env: GridEnvironment, demands: List[Tuple[int,int,int
     if hasattr(env, "_state") and env._state is not None:
         # convert to Demand objects via a minimal import
         from agent.generator.base import Demand
-        env._state.demands.extend([Demand(x=d[0], y=d[1], t=d[2], c=d[3], end_t=d[4]) for d in demands])
+        def _as_demand(raw: Tuple[int, ...]) -> Demand:
+            service_time = int(raw[5]) if len(raw) > 5 else 0
+            return Demand(x=raw[0], y=raw[1], t=raw[2], c=raw[3], end_t=raw[4], service_time=service_time)
+        env._state.demands.extend([_as_demand(d) for d in demands])
     total_reward = 0.0
     done = False
     frame_idx = 0

@@ -42,6 +42,7 @@ def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, BaseDema
 		exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
 		wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
 		max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2)),
+		include_service_time=bool(getattr(cfg, "include_service_time", False)),
 	)
 	env.num_agents = cfg.num_agents
 	if planner_type == "greedy":
@@ -173,9 +174,11 @@ def main() -> None:
 	# --pmodel optionally accepts a checkpoint path; if omitted, use default from cfg
 	parser.add_argument("--pmodel", nargs="?", const="__DEFAULT__", help="Use model planner; optionally pass checkpoint path (.pt/.pth). Example: --pmodel checkpoints/planner/planner_rl_best.pt")
 	parser.add_argument("--gmodel", action="store_true", help="Use neural net demand generator; otherwise rule")
+	parser.add_argument("--service-time", action="store_true", help="Enable service times for demands (vehicles must remain on-site before completion)")
 	args = parser.parse_args()
 
 	cfg = get_default_config()
+	cfg.include_service_time = bool(args.service_time)
 
 	# Planner: model if --pmodel provided (with or without path); else greedy
 	use_model_planner = args.pmodel is not None

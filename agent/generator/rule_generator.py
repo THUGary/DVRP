@@ -393,6 +393,7 @@ class RuleBasedGenerator(BaseDemandGenerator):
 
     def reset(self, seed: Optional[int] = None) -> None:
         seed = seed if seed is not None else self.params.get("rng_seed")
+        super().reset(seed)
         self._rng = random.Random(seed)
 
         # Initialize concentrated generation areas
@@ -536,7 +537,19 @@ class RuleBasedGenerator(BaseDemandGenerator):
         self.total_demand -= total_c
         merged_demands = [d for i, d in enumerate(merged_demands) if i not in remove_ids]
 
-        return merged_demands
+        enriched_demands = [
+            Demand(
+                x=d.x,
+                y=d.y,
+                t=d.t,
+                c=d.c,
+                end_t=d.end_t,
+                service_time=self.sample_service_time(capacity=d.c),
+            )
+            for d in merged_demands
+        ]
+
+        return enriched_demands
     
     def _merge_demands_by_grid(self, demands: List[Demand]) -> List[Demand]:
         """Merge demands fallen into the same grid cell."""

@@ -25,6 +25,7 @@ class NetDemandGenerator(BaseDemandGenerator):
         Loads the model and generates all demands for the entire episode.
         """
         # Use the provided seed for reproducibility
+        super().reset(seed)
         if seed is not None:
             torch.manual_seed(seed)
 
@@ -111,7 +112,8 @@ class NetDemandGenerator(BaseDemandGenerator):
                     continue
                 x, y = relocated
 
-            demand = Demand(x=x, y=y, t=t, c=c, end_t=end_t)
+            service_time = self.sample_service_time(capacity=c)
+            demand = Demand(x=x, y=y, t=t, c=c, end_t=end_t, service_time=service_time)
 
             # Store the demand in a dictionary keyed by its appearance time
             if t not in self.pre_generated_demands:

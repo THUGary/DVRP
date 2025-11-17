@@ -47,6 +47,7 @@ class GridEnvironment:
 		# Hard cap on episode length; regardless of vehicle positions, if the
 		# current time reaches max_end_time, the episode ends.
 		max_end_time: Optional[int] = None,
+		include_service_time: bool = False,
 	) -> None:
 		self.width = width
 		self.height = height
@@ -60,6 +61,7 @@ class GridEnvironment:
 		self.exploration_history_n = max(0, int(exploration_history_n))
 		self.exploration_penalty_scale = float(exploration_penalty_scale)
 		self.wait_penalty_scale = float(wait_penalty_scale)
+		self.include_service_time = bool(include_service_time)
 		# If not specified, default to max_time to preserve previous behavior
 		self.max_end_time = int(max_time if max_end_time is None else max_end_time)
 		self._state: Optional[EnvState] = None
@@ -67,6 +69,7 @@ class GridEnvironment:
 		# cache for resolved full capacity to avoid repeated imports
 		self._resolved_full_capacity: Optional[int] = None
 		self._prev_actions: List[Action] = []
+		self._active_services: Dict[int, Tuple[Demand, int]] = {}
 
 	def _full_capacity(self) -> int:
 		"""Return the vehicle full capacity.
@@ -117,6 +120,7 @@ class GridEnvironment:
 		self._episode_stats["switch_count"] = 0
 		self._episode_stats["switch_penalty"] = 0.0
 		self._prev_actions = [(0, 0) for _ in agent_states]
+		self._active_services = {}
 		# maintain per-agent position history for exploration penalty
 		self._pos_history: List[List[Tuple[int,int]]] = [[(a.x, a.y)] for a in agent_states]
 		return self._obs()
@@ -160,29 +164,66 @@ class GridEnvironment:
 				self._episode_stats["demand_capacity"] += float(d.c)
 		# 2) apply actions to agents
 		# record previous positions to compute route distance
-		prev_states = [AgentState(x=a.x, y=a.y, s=a.s) for a in self._state.agent_states]
+		prev_states = [
+			AgentState(
+				x=a.x,
+				y=a.y,
+				s=a.s,
+				service_time_remaining=a.service_time_remaining,
+				servicing_demand_id=a.servicing_demand_id,
+			)
+			for a in self._state.agent_states
+		]
 		prev_positions = [(a.x, a.y) for a in prev_states]
+		num_agents = len(prev_states)
+		# determine executed actions (agents in service are forced to wait)
+		effective_actions: List[Action] = []
+		for idx in range(num_agents):
+			raw_act = actions[idx] if idx < len(actions) else (0, 0)
+			if self.include_service_time and prev_states[idx].service_time_remaining > 0:
+				effective_actions.append((0, 0))
+			else:
+				dx = max(-1, min(1, raw_act[0]))
+				dy = max(-1, min(1, raw_act[1]))
+				effective_actions.append((dx, dy))
 		# stability penalty: count agents that changed their intended direction
+		if not self._prev_actions or len(self._prev_actions) != len(effective_actions):
+			self._prev_actions = [(0, 0) for _ in range(len(effective_actions))]
 		switch_count = 0
-		if self._prev_actions:
-			for idx, act in enumerate(actions):
-				if idx < len(self._prev_actions):
-					prev_act = self._prev_actions[idx]
-					if prev_act != (0, 0) and act != prev_act:
-						switch_count += 1
-		else:
-			self._prev_actions = [(0, 0) for _ in actions]
+		for idx, act in enumerate(effective_actions):
+			prev_act = self._prev_actions[idx]
+			if prev_act != (0, 0) and act != prev_act:
+				switch_count += 1
 		capacity_reward = 0.0
 		candidate_states: List[AgentState] = []
-		for i, (dx, dy) in enumerate(actions):
+		for i, (dx, dy) in enumerate(effective_actions):
 			a_prev = prev_states[i]
-			nx = max(0, min(self.width - 1, a_prev.x + max(-1, min(1, dx))))
-			ny = max(0, min(self.height - 1, a_prev.y + max(-1, min(1, dy))))
+			if self.include_service_time and a_prev.service_time_remaining > 0:
+				candidate_states.append(
+					AgentState(
+						x=a_prev.x,
+						y=a_prev.y,
+						s=a_prev.s,
+						service_time_remaining=a_prev.service_time_remaining,
+						servicing_demand_id=a_prev.servicing_demand_id,
+					)
+				)
+				continue
+			nx = max(0, min(self.width - 1, a_prev.x + dx))
+			ny = max(0, min(self.height - 1, a_prev.y + dy))
 			# if agent arrives at depot, refill to full capacity
 			new_s = a_prev.s
 			if (nx, ny) == self.depot:
 				new_s = self._full_capacity()
-			candidate_states.append(AgentState(x=nx, y=ny, s=new_s))
+			candidate_states.append(
+				AgentState(
+					x=nx,
+					y=ny,
+					s=new_s,
+					service_time_remaining=0,
+					servicing_demand_id=None,
+				)
+			)
 
 		# resolve collisions with "first-wins" policy:
 		# If multiple agents attempt to occupy the same non-depot cell this step, the lowest-index agent keeps the move
@@ -198,44 +239,122 @@ class GridEnvironment:
 				losers = indices_sorted[1:]
 				for idx in losers:
 					prev = prev_states[idx]
-					candidate_states[idx] = AgentState(x=prev.x, y=prev.y, s=prev.s)
+					candidate_states[idx] = AgentState(
+						x=prev.x,
+						y=prev.y,
+						s=prev.s,
+						service_time_remaining=prev.service_time_remaining,
+						servicing_demand_id=prev.servicing_demand_id,
+					)
 				collided_agents.extend(losers)
 
-	# second pass to ensure uniqueness after reverting (should hold if prev states were unique)
+		# second pass to ensure uniqueness after reverting (should hold if prev states were unique)
 		self._state.agent_states = candidate_states
-		# 3) serve demands when an agent arrives on a demand cell (simplified: remove demand entirely)
-		remaining: List[Demand] = []
-		pos_to_agent_idx = {(a.x, a.y): idx for idx, a in enumerate(self._state.agent_states)}
-
-		# stats before serving
-		total_demands_before = len(self._state.demands)
-		total_capacity_before = sum(float(d.c) for d in self._state.demands)
-
+		# 3) serve demands, honoring service-time if enabled
 		served_count = 0
 		served_capacity = 0.0
 		served_details: List[Tuple[int, int, float]] = []
-		for d in self._state.demands:
-			agent_idx = pos_to_agent_idx.get((d.x, d.y))
-			if agent_idx is not None:
-				# agent on the demand cell
-				a = self._state.agent_states[agent_idx]
-				# Assumption: must have enough capacity to serve; otherwise skip
-				if a.s >= d.c:
-					# serve
-					new_s = a.s - d.c
-					self._state.agent_states[agent_idx] = AgentState(x=a.x, y=a.y, s=new_s)
-					# accumulate capacity served this step
-					capacity_reward += float(d.c)
-					# record served stats
-					served_count += 1
-					served_capacity += float(d.c)
-					served_details.append((d.x, d.y, float(d.c)))
-					# drop demand (served)
+		if self.include_service_time:
+			updated_agents = list(self._state.agent_states)
+			new_active_services: Dict[int, Tuple[Demand, int]] = {}
+			if getattr(self, "_active_services", None):
+				for agent_idx, (demand, remaining) in self._active_services.items():
+					new_active_services[agent_idx] = (demand, int(remaining))
+			# progress ongoing services
+			for agent_idx, agent in enumerate(updated_agents):
+				session = new_active_services.get(agent_idx)
+				if not session:
 					continue
-			# keep demand (not served)
-			remaining.append(d)
-
-		self._state.demands = remaining
+				demand, remaining = session
+				remaining = max(0, int(remaining) - 1)
+				if remaining <= 0:
+					new_s = max(0, agent.s - demand.c)
+					updated_agents[agent_idx] = AgentState(
+						x=agent.x,
+						y=agent.y,
+						s=new_s,
+						service_time_remaining=0,
+						servicing_demand_id=None,
+					)
+					capacity_reward += float(demand.c)
+					served_count += 1
+					served_capacity += float(demand.c)
+					served_details.append((demand.x, demand.y, float(demand.c)))
+					new_active_services.pop(agent_idx, None)
+				else:
+					updated_agents[agent_idx] = AgentState(
+						x=agent.x,
+						y=agent.y,
+						s=agent.s,
+						service_time_remaining=remaining,
+						servicing_demand_id=id(demand),
+					)
+					new_active_services[agent_idx] = (demand, remaining)
+			# attempt to start new services on co-located demands
+			pos_to_agent_idx = {(a.x, a.y): idx for idx, a in enumerate(updated_agents)}
+			remaining_demands: List[Demand] = []
+			for demand in self._state.demands:
+				agent_idx = pos_to_agent_idx.get((demand.x, demand.y))
+				if agent_idx is not None and agent_idx not in new_active_services:
+					agent = updated_agents[agent_idx]
+					if agent.s >= demand.c:
+						service_time = int(getattr(demand, "service_time", 0))
+						if service_time > 0:
+							updated_agents[agent_idx] = AgentState(
+								x=agent.x,
+								y=agent.y,
+								s=agent.s,
+								service_time_remaining=service_time,
+								servicing_demand_id=id(demand),
+							)
+							new_active_services[agent_idx] = (demand, service_time)
+							continue
+						else:
+							new_s = agent.s - demand.c
+							updated_agents[agent_idx] = AgentState(
+								x=agent.x,
+								y=agent.y,
+								s=new_s,
+								service_time_remaining=0,
+								servicing_demand_id=None,
+							)
+							capacity_reward += float(demand.c)
+							served_count += 1
+							served_capacity += float(demand.c)
+							served_details.append((demand.x, demand.y, float(demand.c)))
+							continue
+				remaining_demands.append(demand)
+			self._state.demands = remaining_demands
+			self._state.agent_states = updated_agents
+			self._active_services = new_active_services
+		else:
+			remaining: List[Demand] = []
+			pos_to_agent_idx = {(a.x, a.y): idx for idx, a in enumerate(self._state.agent_states)}
+			for d in self._state.demands:
+				agent_idx = pos_to_agent_idx.get((d.x, d.y))
+				if agent_idx is not None:
+					# agent on the demand cell
+					a = self._state.agent_states[agent_idx]
+					# Assumption: must have enough capacity to serve; otherwise skip
+					if a.s >= d.c:
+						# serve immediately
+						new_s = a.s - d.c
+						self._state.agent_states[agent_idx] = AgentState(
+							x=a.x,
+							y=a.y,
+							s=new_s,
+							service_time_remaining=0,
+							servicing_demand_id=None,
+						)
+						capacity_reward += float(d.c)
+						served_count += 1
+						served_capacity += float(d.c)
+						served_details.append((d.x, d.y, float(d.c)))
+						continue
+				# keep demand (not served)
+				remaining.append(d)
+			self._state.demands = remaining
+			self._active_services = {}
 		# compute route distance (Euclidean) this step
 		movement_distance = 0.0
 		agent_distances: List[float] = []
@@ -307,7 +426,7 @@ class GridEnvironment:
 		# record per-step waiting penalty (negative or zero)
 		self._episode_stats.setdefault("wait_penalty_value", 0.0)
 		self._episode_stats["wait_penalty_value"] += wait_penalty
-		self._prev_actions = list(actions)
+		self._prev_actions = list(effective_actions)
 		# update position histories AFTER computing penalty
 		for idx, a in enumerate(self._state.agent_states):
 			if idx >= len(self._pos_history):
@@ -376,13 +495,22 @@ class GridEnvironment:
 	# --- Helpers ---
 	def _obs(self) -> Dict:
 		assert self._state is not None
+		active_demands = [d for d in self._state.demands if d.t <= self._state.time]
 		return {
 			"time": self._state.time,
 			"depot": self._state.depot,
 			"agent_states": [(a.x, a.y, a.s) for a in self._state.agent_states],
-			"demands": [(d.x, d.y, d.t, d.c, d.end_t) for d in self._state.demands if d.t <= self._state.time],
+			"demands": [(d.x, d.y, d.t, d.c, d.end_t) for d in active_demands],
 			"width": self.width,
 			"height": self.height,
+			**(
+				{
+					"demands_with_service": [(d.x, d.y, d.t, d.c, d.end_t, d.service_time) for d in active_demands],
+					"demand_service_times": [d.service_time for d in active_demands],
+					"agent_service_time_remaining": [a.service_time_remaining for a in self._state.agent_states],
+				}
+				if self.include_service_time else {}
+			),
 		}
 
 	# Property to set/get number of agents post-init

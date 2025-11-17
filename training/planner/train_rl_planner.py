@@ -377,6 +377,7 @@ def build_env_from_cfg(cfg: Config) -> GridEnvironment:
         exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
         wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
         max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2)),
+        include_service_time=bool(getattr(cfg, "include_service_time", False)),
     )
     env.num_agents = cfg.num_agents
     return env

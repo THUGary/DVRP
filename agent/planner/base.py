@@ -9,6 +9,8 @@ class AgentState:
     x: int
     y: int
     s: int  # remaining capacity/space
+    service_time_remaining: int = 0
+    servicing_demand_id: Optional[int] = None
 
 # Target is a coordinate (x, y). In a fuller impl, could be demand IDs.
 Target = Tuple[int, int]
