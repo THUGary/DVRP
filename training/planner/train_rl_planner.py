@@ -17,9 +17,6 @@ if str(_ROOT) not in sys.path:
 import random
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Categorical
 import matplotlib.pyplot as plt
 from collections import deque
 from torch.utils.tensorboard import SummaryWriter
@@ -31,313 +28,38 @@ from environment.env import GridEnvironment
 from agent.controller import RuleBasedController
 
 from models.planner_model.model import DVRPNet, prepare_features, prepare_agents
+from training.planner.rl_algorithms import (
+    ReinforceAlgorithm,
+    PPOAlgorithm,
+    RLAlgorithm,
+    DecisionRecord,
+)
+from training.planner.rl_algorithms.sampling import select_targets_with_sampling, detach_feats
 
 
-class ValueCritic(nn.Module):
-    """
-    A small value-function critic used by PPO.
-
-    The critic expects an input embedding produced by `aggregate_state_embedding`,
-    which concatenates the depot embedding and the mean node embedding. The
-    critic outputs a single scalar value per batch element.
-
-    Args:
-        d_model: the embedding dimensionality (per-component) produced by the
-            planner model. The critic's input dimension is `d_model * 2` because
-            the state embedding concatenates depot and mean node embeddings.
-    """
-    def __init__(self, d_model: int) -> None:
-        super().__init__()
-        hidden = max(128, d_model)
-        self.input_dim = d_model * 2
-        self.net = nn.Sequential(
-            nn.Linear(self.input_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)
+ALGORITHM_REGISTRY = {
+    "reinforce": ReinforceAlgorithm,
+    "ppo": PPOAlgorithm,
+}
 
 
-def aggregate_state_embedding(enc_nodes: torch.Tensor, enc_depot: torch.Tensor, node_mask: torch.Tensor) -> torch.Tensor:
-    """
-    Produce a compact state embedding used by the value critic.
-
-    The function concatenates the depot embedding with the mean embedding of
-    the (unmasked) nodes to produce a single vector per batch element.
-
-    Args:
-        enc_nodes: [B, N, D] tensor of node embeddings from the encoder.
-        enc_depot: [B, 1, D] tensor of depot embeddings from the encoder.
-        node_mask: [B, N] boolean mask where True indicates masked/invalid nodes.
-
-    Returns:
-        Tensor of shape [B, 2*D] containing the concatenation of depot_embed
-        and node_mean. If N == 0, node_mean is a zero tensor of shape [B, D].
-    """
-    depot_embed = enc_depot.squeeze(1)
-    if enc_nodes.size(1) == 0:
-        node_mean = torch.zeros_like(depot_embed)
-    else:
-        valid = (~node_mask).unsqueeze(-1).float()
-        denom = valid.sum(dim=1).clamp(min=1.0)
-        node_mean = (enc_nodes * valid).sum(dim=1) / denom
-    return torch.cat([depot_embed, node_mean], dim=-1)
+def build_algorithm(name: str, model: DVRPNet, optimizer: torch.optim.Optimizer, device: torch.device, args: argparse.Namespace) -> RLAlgorithm:
+    algo_cls = ALGORITHM_REGISTRY.get(name)
+    if algo_cls is None:
+        raise ValueError(f"Unsupported RL algorithm '{name}'. Available: {sorted(ALGORITHM_REGISTRY.keys())}")
+    return algo_cls(model=model, optimizer=optimizer, device=device, args=args)
 
 
-def detach_feats(feats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """
-    Detach feature tensors from the current computation graph and move them to
-    CPU. A clone is returned to ensure the saved features are independent of
-    the original tensors.
-
-    This is used when storing rollout data for later re-evaluation during PPO
-    updates to avoid holding GPU memory / computation graph references.
-
-    Args:
-        feats: a dict of feature tensors (typically produced by
-            `prepare_features`).
-
-    Returns:
-        A dict with the same keys where each tensor is detached, moved to CPU,
-        and cloned.
-    """
-    return {k: v.detach().cpu().clone() for k, v in feats.items()}
-
-
-def compute_returns(rewards: List[float], dones: List[bool], gamma: float, device: torch.device) -> torch.Tensor:
-    """
-    Compute discounted returns for a sequence of rewards.
-
-    The implementation iterates the rewards/dones sequence in reverse and
-    applies the standard discounted-return recursion:
-
-        R_t = r_t + gamma * R_{t+1}
-
-    When `done` is True at a step, the return accumulator R is reset to 0
-    before processing that step (so episodes are handled correctly).
-
-    Args:
-        rewards: list of scalar rewards (floats) collected during the episode.
-        dones: list of booleans indicating terminal steps aligned with rewards.
-        gamma: discount factor in [0,1].
-        device: torch device where the returned tensor should be placed.
-
-    Returns:
-        A 1-D tensor of discounted returns of shape [T] on the requested device.
-    """
-    R = 0.0
-    returns: List[float] = []
-    for reward, done in zip(reversed(rewards), reversed(dones)):
-        if done:
-            R = 0.0
-        R = reward + gamma * R
-        returns.append(R)
-    returns.reverse()
-    return torch.tensor(returns, dtype=torch.float32, device=device)
-
-
-def evaluate_sample(model: DVRPNet,
-                    critic: ValueCritic,
-                    sample: Dict[str, object],
-                    lateness_lambda: float,
-                    device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Re-evaluate a single saved decision-step sample under the current policy.
-
-    This function is used by PPO during updates: decision-step samples are
-    stored on CPU during the rollout (detached via `detach_feats`). During the
-    PPO mini-batch evaluation we move these tensors back to the training
-    device, run the encoder+decoder to obtain the current policy logits, and
-    compute the log-probability and entropy of the originally sampled action
-    under the current policy. The critic is also evaluated on the current
-    policy's state embedding.
-
-    Args:
-        model: DVRPNet policy model (in train/eval mode as appropriate).
-        critic: ValueCritic used to compute state values.
-        sample: a dict produced by `decision_steps` containing keys
-            'feats', 'agents', 'actions', etc. Note: these tensors are on CPU
-            and detached from the graph.
-        lateness_lambda: a float passed to model.decode (soft lateness penalty).
-        device: the device to move tensors to for evaluation.
-
-    Returns:
-        A tuple (log_probs, entropies, values) where:
-          - log_probs: [B] tensor of summed log-probabilities (sum over agents)
-          - entropies: [B] tensor of summed entropies (sum over agents)
-          - values: [B] tensor of critic values for the state
-    """
-    feats_cpu = sample["feats"]  # type: ignore[index]
-    agents_cpu = sample["agents"]  # type: ignore[index]
-    actions_cpu = sample["actions"]  # type: ignore[index]
-    hist_pos_cpu = sample.get("history_positions", None)  # type: ignore[index]
-    hist_idx_cpu = sample.get("history_indices", None)    # type: ignore[index]
-
-    feats = {k: v.to(device) for k, v in feats_cpu.items()}
-    agents = agents_cpu.to(device)
-    actions = actions_cpu.to(device)
-    history_positions = hist_pos_cpu.to(device) if hist_pos_cpu is not None else None
-    history_indices = hist_idx_cpu.to(device) if hist_idx_cpu is not None else None
-
-    if feats["nodes"].size(1) == 0:
-        B = actions.size(0)
-        log_prob = torch.zeros(B, device=device)
-        entropy = torch.zeros(B, device=device)
-        value = critic(torch.zeros(B, critic.input_dim, device=device))
-        return log_prob.squeeze(-1), entropy.squeeze(-1), value.squeeze(-1)
-
-    enc_nodes, enc_depot, node_mask = model.encoder(feats)
-    enc_agents = model.encoder.encode_agents(agents)
-    logits = model.decode(
-        enc_nodes=enc_nodes,
-        enc_depot=enc_depot,
-        node_mask=node_mask,
-        enc_agents=enc_agents,
-        agents_tensor=agents,
-        nodes=feats.get("nodes"),
-        lateness_lambda=lateness_lambda,
-        history_indices=history_indices,
-        history_positions=history_positions,
-    )
-    probs = torch.softmax(logits, dim=-1)
-    logp = torch.log_softmax(logits, dim=-1)
-    B, A, _ = probs.shape
-
-    # compute per-agent log-prob and entropy using logp/probs so autograd
-    # remains connected to the model logits
-    log_terms = []
-    ent_terms = []
-    for b in range(B):
-        lp = []
-        ent = []
-        for a in range(A):
-            act = actions[b, a]
-            # gather log-prob for the taken action (preserves grad)
-            lp.append(logp[b, a, act])
-            # entropy for this agent: -sum(p * log p)
-            ent.append((-(probs[b, a] * logp[b, a]).sum()))
-        log_terms.append(torch.stack(lp).sum())
-        ent_terms.append(torch.stack(ent).sum())
-
-    state_embed = aggregate_state_embedding(enc_nodes, enc_depot, node_mask)
-    value = critic(state_embed)
-    return torch.stack(log_terms), torch.stack(ent_terms), value.squeeze(-1)
-
-
-def ppo_update(model: DVRPNet,
-               critic: ValueCritic,
-               opt_policy: torch.optim.Optimizer,
-               opt_value: torch.optim.Optimizer,
-               decision_steps: List[Dict[str, object]],
-               returns_all: torch.Tensor,
-               args: argparse.Namespace,
-               device: torch.device,
-               lateness_lambda: float) -> Dict[str, float]:
-    """
-    Perform PPO-style updates using stored decision-step samples.
-
-    The function expects `decision_steps` collected during a single episode
-    rollout. Each entry in `decision_steps` must include the original
-    'old_log_prob' and 'value' computed at sampling time, as well as detached
-    copies of 'feats', 'agents' and 'actions' to re-evaluate under the current
-    policy. The function will run for `args.ppo_epochs` epochs and use
-    mini-batches of size `args.ppo_batch_size` to compute the clipped surrogate
-    objective, value loss and entropy bonus. Both policy and value optimizers
-    are stepped inside.
-
-    Args:
-        model: policy network (DVRPNet).
-        critic: value network.
-        opt_policy: optimizer for the policy parameters.
-        opt_value: optimizer for the critic parameters.
-        decision_steps: list of saved decision-step dictionaries from rollout.
-        returns_all: 1-D tensor of discounted returns aligned with time steps.
-        args: parsed command-line arguments containing PPO hyperparameters.
-        device: device to place temporary tensors on.
-        lateness_lambda: forwarded to model.decode during evaluation.
-
-    Returns:
-        A dict with averaged metrics: policy_loss, value_loss, entropy.
-    """
-    if not decision_steps:
-        return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
-
-    indices = torch.tensor([step["step_index"] for step in decision_steps], dtype=torch.long, device=device)
-    targets = returns_all[indices]
-    old_log_probs = torch.tensor([step["old_log_prob"] for step in decision_steps], dtype=torch.float32, device=device)
-    old_values = torch.tensor([step["value"] for step in decision_steps], dtype=torch.float32, device=device)
-    advantages = targets - old_values
-    if args.normalize_adv and advantages.numel() > 1:
-        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
-
-    total_batches = 0
-    accum_policy = 0.0
-    accum_value = 0.0
-    accum_entropy = 0.0
-
-    batch_size = max(1, min(args.ppo_batch_size, len(decision_steps)))
-
-    for _ in range(args.ppo_epochs):
-        perm = torch.randperm(len(decision_steps), device=device)
-        for start in range(0, len(decision_steps), batch_size):
-            idx = perm[start:start + batch_size]
-            batch_samples = [decision_steps[int(i.item())] for i in idx]
-
-            new_log_list = []
-            entropy_list = []
-            value_list = []
-            for sample in batch_samples:
-                log_prob, entropy, value = evaluate_sample(
-                    model,
-                    critic,
-                    sample,
-                    lateness_lambda,
-                    device,
-                )
-                new_log_list.append(log_prob.squeeze())
-                entropy_list.append(entropy.squeeze())
-                value_list.append(value.squeeze())
-
-            new_log_probs = torch.stack(new_log_list)
-            entropies = torch.stack(entropy_list)
-            values = torch.stack(value_list)
-
-            old_batch = old_log_probs[idx]
-            adv_batch = advantages[idx]
-            target_batch = targets[idx]
-
-            ratio = torch.exp(new_log_probs - old_batch)
-            surr1 = ratio * adv_batch
-            surr2 = torch.clamp(ratio, 1.0 - args.ppo_clip, 1.0 + args.ppo_clip) * adv_batch
-            policy_loss = -torch.min(surr1, surr2).mean()
-            value_loss = F.mse_loss(values, target_batch)
-            entropy_bonus = entropies.mean()
-
-            total_loss = policy_loss + args.value_coef * value_loss - args.entropy_coef * entropy_bonus
-
-            opt_policy.zero_grad()
-            opt_value.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=1.0)
-            opt_policy.step()
-            opt_value.step()
-
-            accum_policy += policy_loss.item()
-            accum_value += value_loss.item()
-            accum_entropy += entropy_bonus.item()
-            total_batches += 1
-
-    if total_batches == 0:
-        return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
-
-    return {
-        "policy_loss": accum_policy / total_batches,
-        "value_loss": accum_value / total_batches,
-        "entropy": accum_entropy / total_batches,
-    }
+def format_metrics(stats: Dict[str, float]) -> str:
+    if not stats:
+        return ""
+    parts = []
+    for key, value in stats.items():
+        try:
+            parts.append(f"{key}={value:.3f}")
+        except (TypeError, ValueError):
+            parts.append(f"{key}={value}")
+    return " " + " ".join(parts)
 
 
 def build_env_from_cfg(cfg: Config) -> GridEnvironment:
@@ -419,98 +141,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def select_targets_with_sampling(model: DVRPNet,
-                                 feats: dict,
-                                 agents_tensor: torch.Tensor,
-                                 lateness_lambda: float,
-                                 cap_full: torch.Tensor,
-                                 critic: ValueCritic | None = None,
-                                 history_positions: torch.Tensor | None = None,
-                                 history_indices: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """
-    Sample one-step target indices for each agent according to the current
-    policy probabilities produced by `model.decode`.
-
-    The function returns sampled selection indices (`sel`), the corresponding
-    destination coordinates (`dest_xy`), the log-probabilities of the sampled
-    indices (`log_probs`) and, if a critic is provided, the critic value for
-    the current state embedding.
-
-    Args:
-        model: DVRPNet policy model.
-        feats: feature dictionary (as produced by `prepare_features`).
-        agents_tensor: [B,A,...] tensor describing agent states on the chosen device.
-        lateness_lambda: float penalty forwarded to the decoder.
-        cap_full: tensor indicating capacities (not used directly here but kept for API compatibility).
-        critic: optional ValueCritic; if provided, returns value estimates.
-
-    Returns:
-        sel: [B,A] long tensor of sampled indices (0 means depot, 1..N map to nodes).
-        dest_xy: [B,A,2] long tensor of destination coordinates for each agent.
-        log_probs: [B,A] float tensor of log-probabilities of sampled indices.
-        value: optional [B] tensor of critic values (or None if critic is None).
-    """
-    dev = agents_tensor.device
-    if feats["nodes"].size(1) == 0:
-        B = agents_tensor.size(0)
-        A = agents_tensor.size(1)
-        depot_xy = feats["depot"][..., :2].long().squeeze(1)  # [B,2]
-        sel = torch.zeros(B, A, dtype=torch.long, device=dev)
-        dest_xy = depot_xy.unsqueeze(1).repeat(1, A, 1)
-        log_probs = torch.zeros(B, A, dtype=torch.float32, device=dev)
-        value = None
-        if critic is not None:
-            embed = torch.zeros(B, critic.input_dim, device=dev)
-            value = critic(embed)
-        return sel, dest_xy, log_probs, value
-
-    enc_nodes, enc_depot, node_mask = model.encoder(feats)
-    enc_agents = model.encoder.encode_agents(agents_tensor)
-    logits = model.decode(
-        enc_nodes=enc_nodes,
-        enc_depot=enc_depot,
-        node_mask=node_mask,
-        enc_agents=enc_agents,
-        agents_tensor=agents_tensor,
-        nodes=feats["nodes"],
-        lateness_lambda=lateness_lambda,
-        history_indices=history_indices,
-        history_positions=history_positions,
-    )  # [B,A,N+1]
-
-    probs = torch.softmax(logits, dim=-1)
-    logp = torch.log_softmax(logits, dim=-1)
-    B, A, N1 = probs.shape
-    N = N1 - 1
-    node_xy = feats["nodes"][..., :2].long()        # [B,N,2]
-    depot_xy = feats["depot"][..., :2].long().squeeze(1)  # [B,2]
-
-    sel = torch.zeros(B, A, dtype=torch.long, device=dev)
-    dest_xy = torch.zeros(B, A, 2, dtype=torch.long, device=dev)
-    log_probs = torch.zeros(B, A, dtype=torch.float32, device=dev)
-
-    for b in range(B):
-        for a in range(A):
-            # print(f"Debug: B={b}, A={a}, Probs={probs[b,a].cpu().detach().numpy()}") if os.getenv("DVRP_DEBUG_LOGP") else None
-            # sample using the categorical distribution built from probs
-            cat = Categorical(probs[b, a])
-            idx = cat.sample()  # 0..N
-            sel[b, a] = idx
-            # use log_softmax gather to keep autograd connected to logits
-            log_probs[b, a] = logp[b, a, idx]
-            if 1 <= idx <= N:
-                dest_xy[b, a] = node_xy[b, idx - 1]
-            else:
-                dest_xy[b, a] = depot_xy[b]
-
-    value = None
-    if critic is not None:
-        state_embed = aggregate_state_embedding(enc_nodes, enc_depot, node_mask)
-        value = critic(state_embed)
-
-    return sel, dest_xy, log_probs, value
-
-
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
@@ -590,22 +220,15 @@ def main() -> None:
         save_best_dir = os.path.dirname(args.save_best) or "."
         os.makedirs(save_best_dir, exist_ok=True)
 
-    critic = None
-    value_opt = None
-    baseline = None
     writer: SummaryWriter | None = None
     if getattr(args, "tb_logdir", None):
         if len(args.tb_logdir.strip()) > 0:
             os.makedirs(args.tb_logdir, exist_ok=True)
             writer = SummaryWriter(log_dir=args.tb_logdir)
-    if args.algo == "ppo":
-        critic = ValueCritic(model.d_model).to(device)
-        critic.train()
-        value_opt = torch.optim.AdamW(critic.parameters(), lr=args.value_lr)
-
-    gamma = args.gamma
+    rl_algo = build_algorithm(args.algo, model, opt, device, args)
 
     for ep in range(1, args.episodes + 1):
+        rl_algo.begin_episode(ep)
         # Reseed per-episode so that all sources of randomness (torch,
         # numpy, python random) are aligned to the episode seed. We still
         # pass the same seed to the environment generator for completeness.
@@ -621,8 +244,6 @@ def main() -> None:
 
         obs = env.reset(seed=seed_ep)
         total_reward = 0.0
-        logprob_traj: List[torch.Tensor] = []
-        decision_steps: List[Dict[str, object]] = []
         rewards_all: List[float] = []
         dones_all: List[bool] = []
 
@@ -686,13 +307,13 @@ def main() -> None:
                     if t_idx < T:
                         hi[0, a_idx, t_idx] = int(idx_val)
 
+            critic_module = getattr(rl_algo, "critic", None)
             sel, dest_xy, log_probs, state_value = select_targets_with_sampling(
-                model,
-                feats,
-                agents_t,
+                model=model,
+                feats=feats,
+                agents_tensor=agents_t,
                 lateness_lambda=args.lateness_lambda,
-                cap_full=torch.full((1, cfg.num_agents), float(cfg.capacity), device=device),
-                critic=critic,
+                critic=critic_module,
                 history_positions=hp,
                 history_indices=hi,
             )
@@ -716,24 +337,24 @@ def main() -> None:
             total_reward += reward_val
 
             log_prob_sum = log_probs.sum()
-            logprob_traj.append(log_prob_sum)
             rewards_all.append(reward_val)
             dones_all.append(done)
             # depot ratio 统计
             depot_select_count += int((sel == 0).sum().item())
             total_select_count += sel.numel()
 
-            if critic is not None and state_value is not None:
-                decision_steps.append({
-                    "step_index": len(rewards_all) - 1,
-                    "feats": detach_feats(feats),
-                    "agents": agents_t.detach().cpu().clone(),
-                    "actions": sel.detach().cpu().clone(),
-                    "old_log_prob": float(log_prob_sum.detach().cpu().item()),
-                    "value": float(state_value.detach().cpu().item()),
-                    "history_positions": hp.detach().cpu().clone(),
-                    "history_indices": hi.detach().cpu().clone(),
-                })
+            record = DecisionRecord(
+                step_index=len(rewards_all) - 1,
+                log_prob_sum=log_prob_sum,
+            )
+            if rl_algo.requires_full_state:
+                record.feats = detach_feats(feats)
+                record.agents = agents_t.detach().cpu().clone()
+                record.actions = sel.detach().cpu().clone()
+                record.state_value = state_value.detach().cpu().clone() if state_value is not None else None
+                record.history_positions = hp.detach().cpu().clone()
+                record.history_indices = hi.detach().cpu().clone()
+            rl_algo.record_decision(record)
 
             obs = next_obs
             # remember demands seen at this step for the next iteration's diff
@@ -749,48 +370,10 @@ def main() -> None:
                 csv_writer = csv.writer(fh)
                 csv_writer.writerow([ep, total_reward])
 
-        if args.algo == "reinforce":
-            episode_return = total_reward
-            if baseline is None:
-                baseline = episode_return
-            adv = episode_return - baseline
-            baseline = 0.9 * baseline + 0.1 * episode_return
-
-            # If no policy decisions were made (e.g., no demands), skip update safely
-            if not logprob_traj:
-                print(f"[EP {ep:04d}] return={total_reward:.5f} adv={adv:.1f} (skip update: no decisions)")
-            else:
-                sum_logprob = torch.stack(logprob_traj).sum()
-                if not sum_logprob.requires_grad:
-                    print(f"[EP {ep:04d}] return={total_reward:.5f} adv={adv:.1f} (skip update: no grad)")
-                else:
-                    loss = -adv * sum_logprob
-                    opt.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    opt.step()
-                    print(f"[EP {ep:04d}] return={total_reward:.5f} adv={adv:.1f} loss={float(loss.item()):.3f}")
-        else:
-            assert critic is not None and value_opt is not None
-            if not rewards_all:
-                rewards_all.append(0.0)
-                dones_all.append(True)
-            returns_all = compute_returns(rewards_all, dones_all, gamma, device)
-            stats = ppo_update(
-                model,
-                critic,
-                opt,
-                value_opt,
-                decision_steps,
-                returns_all,
-                args,
-                device,
-                args.lateness_lambda,
-            )
-            print(
-                f"[EP {ep:04d}] return={total_reward:.5f} policy_loss={stats['policy_loss']:.3f} "
-                f"value_loss={stats['value_loss']:.3f} entropy={stats['entropy']:.3f}"
-            )
+        env_stats = getattr(env, "_episode_stats", {})
+        stats = rl_algo.end_episode(total_reward, rewards_all, dones_all, env_stats)
+        msg = format_metrics(stats)
+        print(f"[EP {ep:04d}] return={total_reward:.5f}{msg}")
 
         if total_reward > best_return:
             best_return = total_reward
@@ -800,7 +383,6 @@ def main() -> None:
 
         # TensorBoard logging
         if writer is not None:
-            env_stats = getattr(env, "_episode_stats", {})
             demand_count = env_stats.get("demand_count", 0)
             demand_capacity = env_stats.get("demand_capacity", 0.0)
             served_count = env_stats.get("served_count", 0)
