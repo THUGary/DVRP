@@ -3,6 +3,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from .layers import TransformerBlock
 
 
 class Encoder(nn.Module):
@@ -49,16 +50,8 @@ class Encoder(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(d_model, d_model),
         )
-        self.agent_self_attn = nn.MultiheadAttention(
-            embed_dim=d_model, num_heads=nhead, batch_first=True
-        )
-        self.agent_attn_norm = nn.LayerNorm(d_model)
-        self.agent_ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model * 4, d_model),
-        )
-        self.agent_ffn_norm = nn.LayerNorm(d_model)
+        # Agent block: use reusable TransformerBlock (pre-LN, attn+FFN)
+        self.agent_block = TransformerBlock(d_model, nhead, dim_ff=d_model * 4)
 
     def forward(self, feats: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         nodes: torch.Tensor = feats["nodes"]            # [B, N, 5]
@@ -101,9 +94,7 @@ class Encoder(nn.Module):
         if agents_tensor is None:
             raise ValueError("encode_agents requires agents_tensor with shape [B,A,4]")
         h = self.agent_mlp(agents_tensor)                        # [B, A, d]
-        # Self-Attn (Post-Attn Norm)
-        attn_out, _ = self.agent_self_attn(h, h, h, need_weights=False)
-        h = self.agent_attn_norm(h + attn_out)                   # Residual 1
-        ffn_out = self.agent_ffn(h)
-        h = self.agent_ffn_norm(h + ffn_out)                     # Residual 2
+        # Apply LayerNorm -> Attention -> LayerNorm -> FFN (pre-norm before each sublayer)
+        # Use the TransformerBlock wrapper which performs pre-LN -> Attn -> pre-LN -> FFN with residuals
+        h = self.agent_block(h)
         return h

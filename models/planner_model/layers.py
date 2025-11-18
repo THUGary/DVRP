@@ -30,12 +30,15 @@ class TransformerBlock(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x, key_padding_mask=None, attn_mask=None):
-        # Self-attention
-        h, _ = self.attn(x, x, x, key_padding_mask=key_padding_mask, attn_mask=attn_mask, need_weights=False)
-        x = self.norm1(x + self.drop(h))
-        # FFN
-        h2 = self.ff(x)
-        x = self.norm2(x + self.drop(h2))
+        # Pre-LN -> Attention -> Pre-LN -> FFN  (i.e. LN, attn, LN, ffn)
+        # 1) LayerNorm before attention
+        x_ln = self.norm1(x)
+        h, _ = self.attn(x_ln, x_ln, x_ln, key_padding_mask=key_padding_mask, attn_mask=attn_mask, need_weights=False)
+        x = x + self.drop(h)
+        # 2) LayerNorm before FFN
+        x_ln2 = self.norm2(x)
+        h2 = self.ff(x_ln2)
+        x = x + self.drop(h2)
         return x
 
 
@@ -53,8 +56,11 @@ class CrossAttentionBlock(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, q, k, v, key_padding_mask=None, attn_mask=None):
-        h, _ = self.attn(q, k, v, key_padding_mask=key_padding_mask, attn_mask=attn_mask, need_weights=False)
-        x = self.norm1(q + self.drop(h))
-        h2 = self.ff(x)
-        x = self.norm2(x + self.drop(h2))
+        # Pre-LN -> Attention -> Pre-LN -> FFN
+        q_ln = self.norm1(q)
+        h, _ = self.attn(q_ln, k, v, key_padding_mask=key_padding_mask, attn_mask=attn_mask, need_weights=False)
+        x = q + self.drop(h)
+        x_ln = self.norm2(x)
+        h2 = self.ff(x_ln)
+        x = x + self.drop(h2)
         return x

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Tuple, List
+import math
 
 try:
     import pygame
@@ -40,6 +41,9 @@ class PygameRenderer:
         self.DEPOT: Color = (80, 160, 255)
         self.DEMAND: Color = (235, 90, 90)
         self.AGENT: Color = (90, 220, 120)
+
+        # color for agent that is currently serving (blue-ish)
+        self.SERVING: Color = (80, 140, 220)
         self.TEXT: Color = (230, 230, 230)
 
     def init(self) -> None:
@@ -107,8 +111,51 @@ class PygameRenderer:
                 self._draw_circle((dx, dy), color=self.DEMAND, radius_ratio=0.35)
 
         # draw agents
-        for idx, (ax, ay, s) in enumerate(obs.get("agent_states", [])):
-            self._draw_circle((ax, ay), color=self.AGENT, radius_ratio=0.45)
+        # agent_states may be either (x,y,s) or (x,y,s,is_serving)
+        agent_states = obs.get("agent_states", [])
+        # optional per-agent serving progress provided by environment (float 0..1)
+        progress_list = obs.get("agent_serving_progress", None)
+        for idx, agent_tuple in enumerate(agent_states):
+            # flexible unpacking
+            if len(agent_tuple) >= 4:
+                ax, ay, s, is_serving = agent_tuple[:4]
+            elif len(agent_tuple) >= 3:
+                ax, ay, s = agent_tuple[:3]
+                is_serving = False
+            else:
+                # unexpected format
+                continue
+
+            # if agent_states did not include is_serving, environment may provide
+            # per-agent remaining service time under 'agent_service_time_remaining'
+            if not is_serving:
+                rem_list = obs.get("agent_service_time_remaining")
+                if rem_list is not None and idx < len(rem_list):
+                    try:
+                        is_serving = int(rem_list[idx]) > 0
+                    except Exception:
+                        is_serving = is_serving
+
+            # choose color; serving agents get special color
+            color = self.SERVING if is_serving else self.AGENT
+            self._draw_circle((ax, ay), color=color, radius_ratio=0.45)
+
+            # if progress information exists, draw an arc showing progress
+            if is_serving and progress_list is not None and idx < len(progress_list):
+                try:
+                    progress = float(progress_list[idx])
+                    progress = max(0.0, min(1.0, progress))
+                except Exception:
+                    progress = 0.0
+                if progress > 0:
+                    cx, cy = self._cell_center((ax, ay))
+                    radius = int(self.cell_size * 0.45)
+                    rect = pygame.Rect(cx - radius, cy - radius, radius * 2, radius * 2)
+                    # draw arc from top (−pi/2) clockwise
+                    start_ang = -math.pi / 2
+                    end_ang = start_ang + progress * 2 * math.pi
+                    pygame.draw.arc(self._screen, self.TEXT, rect, start_ang, end_ang, width=3)
+
             # id label
             label = self._font.render(str(idx), True, self.TEXT)
             cx, cy = self._cell_center((ax, ay))

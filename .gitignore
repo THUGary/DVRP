@@ -128,3 +128,5 @@ checkpoints/planner/*.pt
 data/plans_*.pt
 data/
 *.zip
+runs/tb/*
+training/planner/runs/tb/*

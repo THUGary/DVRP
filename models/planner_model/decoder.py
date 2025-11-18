@@ -4,6 +4,7 @@ from typing import Tuple, Dict, Optional
 import math
 import torch
 import torch.nn as nn
+from .layers import TransformerBlock, CrossAttentionBlock
 
 
 class Decoder(nn.Module):
@@ -25,17 +26,8 @@ class Decoder(nn.Module):
         self.d_model = d_model
 
         # 历史序列自注意力（可融合坐标与节点嵌入）
-        self.hist_self_attn = nn.MultiheadAttention(
-            embed_dim=d_model, num_heads=nhead, batch_first=True
-        )
-        self.hist_norm = nn.LayerNorm(d_model)
-        # 融合后再加 FFN（可选强化表达）
-        self.hist_ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model * 4, d_model),
-        )
-        self.hist_ffn_norm = nn.LayerNorm(d_model)
+        # 历史自注意力与 FFN：使用封装好的 TransformerBlock（pre-LN）
+        self.hist_block = TransformerBlock(d_model, nhead, dim_ff=d_model * 4)
 
         # 跨 agent 的历史交互（让每个 agent 感知他人近期意图）
         # 先将 enc_agents 与 hist_summary 融合到 d 维，再在 agent 维度做自注意力
@@ -45,16 +37,8 @@ class Decoder(nn.Module):
             nn.Linear(d_model, d_model),
         )
         self.agent_ctx_norm = nn.LayerNorm(d_model)
-        self.agent_interact_attn = nn.MultiheadAttention(
-            embed_dim=d_model, num_heads=nhead, batch_first=True
-        )
-        self.agent_interact_norm = nn.LayerNorm(d_model)
-        self.agent_interact_ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model * 4, d_model),
-        )
-        self.agent_interact_ffn_norm = nn.LayerNorm(d_model)
+        # 跨-agent 交互：在 agent 维度上使用 TransformerBlock
+        self.agent_block = TransformerBlock(d_model, nhead, dim_ff=d_model * 4)
 
         # 历史位置投影 (x,y) -> d
         self.hist_pos_proj = nn.Sequential(
@@ -78,16 +62,8 @@ class Decoder(nn.Module):
         self.ctx_norm = nn.LayerNorm(d_model)
 
         # Cross-Attn (Q=context, K/V=kv) + FFN (Transformer 风格)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=d_model, num_heads=nhead, batch_first=True
-        )
-        self.cross_attn_norm = nn.LayerNorm(d_model)
-        self.cross_ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model * 4, d_model),
-        )
-        self.cross_ffn_norm = nn.LayerNorm(d_model)
+        # Cross-Attn (Q=context, K/V=kv) + FFN，用 CrossAttentionBlock
+        self.cross_block = CrossAttentionBlock(d_model, nhead, dim_ff=d_model * 4)
 
         # 4) 单独的打分头（缩放点积）
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
@@ -130,14 +106,12 @@ class Decoder(nn.Module):
             fuse = self.hist_fuse_proj(fuse)                      # [BA,T,d]
             pe = self._build_sinusoidal_pe(T, d, fuse.device)
             fuse = fuse + pe.unsqueeze(0)
-            hist_out, _ = self.hist_self_attn(fuse, fuse, fuse, key_padding_mask=pad.view(BA, T), need_weights=False)
+            # Use wrapped TransformerBlock (pre-LN attn + FFN)
+            fuse = self.hist_block(fuse, key_padding_mask=pad.view(BA, T))
             lengths = (~pad.view(BA, T)).sum(dim=1)
             last_idx = torch.clamp(lengths - 1, min=0)
             arange_ba = torch.arange(BA, device=fuse.device)
-            hist_summary = hist_out[arange_ba, last_idx, :].view(B, A, d)
-            # FFN refine
-            hist_summary = self.hist_norm(hist_summary)
-            hist_summary = self.hist_ffn_norm(hist_summary + self.hist_ffn(hist_summary))
+            hist_summary = fuse[arange_ba, last_idx, :].view(B, A, d)
         elif history_positions is not None and history_positions.numel() > 0:
             hp = history_positions
             pad2d = (hp[..., 0] < 0) | (hp[..., 1] < 0)
@@ -146,12 +120,11 @@ class Decoder(nn.Module):
             emb = self.hist_pos_proj(hp2d)
             pe = self._build_sinusoidal_pe(T, d, emb.device)
             emb = emb + pe.unsqueeze(0)
-            hist_out, _ = self.hist_self_attn(emb, emb, emb, key_padding_mask=pad2d.view(BA, T), need_weights=False)
+            emb = self.hist_block(emb, key_padding_mask=pad2d.view(BA, T))
             lengths = (~pad2d.view(BA, T)).sum(dim=1)
             last_idx = torch.clamp(lengths - 1, min=0)
             arange_ba = torch.arange(BA, device=emb.device)
-            hist_summary = hist_out[arange_ba, last_idx, :].view(B, A, d)
-            hist_summary = self.hist_norm(hist_summary)
+            hist_summary = emb[arange_ba, last_idx, :].view(B, A, d)
         elif history_indices is not None and history_indices.numel() > 0:
             hist_pad = history_indices < 0
             idx = history_indices.clamp(min=0, max=N-1)
@@ -163,12 +136,12 @@ class Decoder(nn.Module):
             pad2d = hist_pad.view(BA, T)
             pe = self._build_sinusoidal_pe(T, d, hist2d.device)
             hist2d = hist2d + pe.unsqueeze(0)
-            hist_out, _ = self.hist_self_attn(hist2d, hist2d, hist2d, key_padding_mask=pad2d, need_weights=False)
+            hist2d = self.hist_block(hist2d, key_padding_mask=pad2d)
             lengths = (~pad2d).sum(dim=1)
             last_idx = torch.clamp(lengths - 1, min=0)
             arange_ba = torch.arange(BA, device=enc_nodes.device)
-            hist_summary = hist_out[arange_ba, last_idx, :].view(B, A, d)
-            hist_summary = self.hist_norm(hist_summary)
+            hist_summary = hist2d[arange_ba, last_idx, :].view(B, A, d)
+            # no extra ffn here (kept similar to original branch)
         else:
             hist_summary = torch.zeros(B, A, d, device=enc_nodes.device, dtype=enc_nodes.dtype)
 
@@ -177,11 +150,8 @@ class Decoder(nn.Module):
         #    在 agent 维度上做一次自注意力与 FFN 残差堆叠，得到跨-agent 强化后的“历史摘要”。
         agent_ctx = torch.cat([enc_agents, hist_summary], dim=-1)   # [B,A,2d]
         agent_ctx = self.agent_ctx_proj(agent_ctx)                   # [B,A,d]
-        agent_ctx = self.agent_ctx_norm(agent_ctx)
-        a_out, _ = self.agent_interact_attn(agent_ctx, agent_ctx, agent_ctx, need_weights=False)
-        agent_ctx = self.agent_interact_norm(agent_ctx + a_out)
-        a_ffn = self.agent_interact_ffn(agent_ctx)
-        agent_ctx = self.agent_interact_ffn_norm(agent_ctx + a_ffn)  # [B,A,d]
+        # Use TransformerBlock for agent-agent interaction along agent dimension
+        agent_ctx = self.agent_block(agent_ctx)
         # 用跨-agent 交互后的摘要替换原先的 hist_summary
         hist_summary = agent_ctx
 
@@ -189,6 +159,7 @@ class Decoder(nn.Module):
         depot_expand = enc_depot.expand(-1, A, -1)               # [B, A, d]
         context = torch.cat([enc_agents, depot_expand, hist_summary], dim=-1)    # [B, A, 3d]
         context = self.ctx_proj(context)                         # [B, A, d]
+        # Pre-LN before cross-attention
         context = self.ctx_norm(context)
 
         if torch.isnan(enc_nodes).any() or torch.isinf(enc_nodes).any():
@@ -200,10 +171,8 @@ class Decoder(nn.Module):
             torch.zeros(B, 1, dtype=torch.bool, device=node_mask.device),  # depot 不屏蔽
             node_mask
         ], dim=1)                                                # [B,1+N]
-        attn_out, _ = self.cross_attn(context, kv, kv, key_padding_mask=kv_mask, need_weights=False)
-        context = self.cross_attn_norm(context + attn_out)       # Residual 1
-        ffn_out = self.cross_ffn(context)
-        context = self.cross_ffn_norm(context + ffn_out)         # Residual 2
+        # Cross-attention + FFN via CrossAttentionBlock
+        context = self.cross_block(context, kv, kv, key_padding_mask=kv_mask)
         if torch.isnan(context).any() or torch.isinf(context).any():
             print(f"[ERROR][cross-block] context contains NaN/Inf")
 
