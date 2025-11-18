@@ -98,11 +98,13 @@ def build_env_from_cfg(cfg: Config) -> GridEnvironment:
         exploration_history_n=int(getattr(cfg, "exploration_history_n", 0)),
         exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
         wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
+        distance_penalty_base=float(getattr(cfg, "distance_penalty_base", 0.0)),
+        distance_penalty_min_dist=float(getattr(cfg, "distance_penalty_min_dist", 1.0)),
         max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2)),
         include_service_time=bool(getattr(cfg, "include_service_time", False)),
     )
     env.num_agents = cfg.num_agents
-    return env
+    return env 
 
 
 def parse_args() -> argparse.Namespace:
@@ -392,6 +394,7 @@ def main() -> None:
             expired_penalty_mag = env_stats.get("expired_penalty", 0.0)
             switch_penalty_term = env_stats.get("switch_penalty", 0.0)
             exploration_penalty_value = env_stats.get("exploration_penalty_value", 0.0)
+            pairwise_penalty_value = env_stats.get("pairwise_penalty_value", 0.0)
             served_ratio = (served_capacity / demand_capacity) if demand_capacity > 1e-9 else 0.0
             depot_ratio = (depot_select_count / total_select_count) if total_select_count > 0 else 0.0
             # expiry penalty sign restore (original per-step negative)
@@ -412,6 +415,8 @@ def main() -> None:
                 writer.add_scalar("reward_parts/switch_penalty_term", switch_penalty_term, ep)
             if exploration_penalty_value is not None:
                 writer.add_scalar("reward_parts/exploration_penalty_value", exploration_penalty_value, ep)
+            if pairwise_penalty_value is not None:
+                writer.add_scalar("reward_parts/pairwise_penalty_value", pairwise_penalty_value, ep)
             writer.flush()
 
     if reward_history and args.reward_plot:

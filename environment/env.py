@@ -44,6 +44,9 @@ class GridEnvironment:
 		# per-step waiting penalty scale: at each timestep each active (unserved)
 		# demand contributes penalty = - wait_penalty_scale * demand.c
 		wait_penalty_scale: float = 0.001,
+		# density-based pairwise distance penalty between agents
+		distance_penalty_base: float = 0.0,
+		distance_penalty_min_dist: float = 1.0,
 		# Hard cap on episode length; regardless of vehicle positions, if the
 		# current time reaches max_end_time, the episode ends.
 		max_end_time: Optional[int] = None,
@@ -61,6 +64,8 @@ class GridEnvironment:
 		self.exploration_history_n = max(0, int(exploration_history_n))
 		self.exploration_penalty_scale = float(exploration_penalty_scale)
 		self.wait_penalty_scale = float(wait_penalty_scale)
+		self.distance_penalty_base = float(distance_penalty_base)
+		self.distance_penalty_min_dist = float(distance_penalty_min_dist)
 		self.include_service_time = bool(include_service_time)
 		# If not specified, default to max_time to preserve previous behavior
 		self.max_end_time = int(max_time if max_end_time is None else max_end_time)
@@ -116,6 +121,7 @@ class GridEnvironment:
 			"agent_total_distances": [0.0 for _ in agent_states],
 			"total_distance": 0.0,
 			"episode_reward": 0.0,
+			"pairwise_penalty_value": 0.0,
 		}
 		self._episode_stats["switch_count"] = 0
 		self._episode_stats["switch_penalty"] = 0.0
@@ -364,6 +370,28 @@ class GridEnvironment:
 			agent_distances.append(d)
 			movement_distance += d
 
+		# --- Density-scaled pairwise proximity penalty between agents ---
+		pairwise_penalty = 0.0
+		if self.distance_penalty_base > 0.0:
+			agents_now = self._state.agent_states
+			num_agents = len(agents_now)
+			if num_agents > 1:
+				grid_area = float(max(1, self.width * self.height))
+				active_total_capacity = sum(float(d.c) for d in self._state.demands)
+				# demand density: more active capacity per area -> stronger penalty
+				demand_density = active_total_capacity / grid_area
+				if demand_density > 0.0:
+					for i in range(num_agents):
+						ai = agents_now[i]
+						for j in range(i + 1, num_agents):
+							aj = agents_now[j]
+							dij = math.hypot(ai.x - aj.x, ai.y - aj.y)
+							if dij < self.distance_penalty_min_dist:
+								gap = self.distance_penalty_min_dist - dij
+								if gap > 0.0:
+									pairwise_penalty += gap * demand_density
+		pairwise_penalty_value = - self.distance_penalty_base * pairwise_penalty if pairwise_penalty > 0.0 else 0.0
+
 		# --- Exploration revisit penalty ---
 		exploration_penalty = 0.0
 		if self.exploration_history_n > 1:
@@ -392,12 +420,14 @@ class GridEnvironment:
 		# --- Reward aggregation ---
 		capacity_reward_term = float(self.capacity_reward_scale) * float(capacity_reward)
 		switch_penalty_term = - float(self.switch_penalty_scale) * float(switch_count)
-		# Combine capacity reward with the per-step waiting penalty (negative).
-		reward = capacity_reward_term + wait_penalty + switch_penalty_term 		#  + exploration_penalty_value
+		# Combine capacity reward with the per-step waiting penalty (negative)
+		# and the density-scaled pairwise proximity penalty.
+		reward = capacity_reward_term + wait_penalty + switch_penalty_term + pairwise_penalty_value		#  + exploration_penalty_value
 
 		# update episode-level stats
 		self._episode_stats["served_count"] += served_count
 		self._episode_stats["served_capacity"] += served_capacity
+		self._episode_stats["pairwise_penalty_value"] += pairwise_penalty_value
 		self._episode_stats.setdefault('capacity_reward_term', 0)
 		self._episode_stats["capacity_reward_term"] += capacity_reward_term
 		self._episode_stats["served_details"].extend(served_details)

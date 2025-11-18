@@ -10,23 +10,7 @@ from models.planner_model.model import DVRPNet
 
 from .base import RLAlgorithm, DecisionRecord
 from .sampling import aggregate_state_embedding
-
-
-class ValueCritic(nn.Module):
-	"""Small MLP critic operating on depot + mean-node embeddings."""
-
-	def __init__(self, d_model: int) -> None:
-		super().__init__()
-		hidden = max(128, d_model)
-		self.input_dim = d_model * 2
-		self.net = nn.Sequential(
-			nn.Linear(self.input_dim, hidden),
-			nn.ReLU(),
-			nn.Linear(hidden, 1),
-		)
-
-	def forward(self, x: torch.Tensor) -> torch.Tensor:
-		return self.net(x).squeeze(-1)
+from .critics import PairwiseGraphCritic
 
 
 def compute_returns(rewards: List[float], dones: List[bool], gamma: float, device: torch.device) -> torch.Tensor:
@@ -43,7 +27,7 @@ def compute_returns(rewards: List[float], dones: List[bool], gamma: float, devic
 
 def evaluate_sample(
 	model: DVRPNet,
-	critic: ValueCritic,
+	critic: nn.Module,
 	sample: Dict[str, Any],
 	lateness_lambda: float,
 	device: torch.device,
@@ -62,7 +46,11 @@ def evaluate_sample(
 		B = actions.size(0)
 		log_prob = torch.zeros(B, device=device)
 		entropy = torch.zeros(B, device=device)
-		value = critic(torch.zeros(B, critic.input_dim, device=device))
+		# fall back to zeros if critic cannot handle empty state
+		try:
+			value = critic(torch.zeros(B, 1, 4, device=device))  # [B,A,F] degenerate
+		except Exception:
+			value = torch.zeros(B, device=device)
 		return log_prob, entropy, value
 
 	enc_nodes, enc_depot, node_mask = model.encoder(feats)
@@ -94,14 +82,14 @@ def evaluate_sample(
 		log_terms.append(torch.stack(lp).sum())
 		ent_terms.append(torch.stack(ent).sum())
 
-	state_embed = aggregate_state_embedding(enc_nodes, enc_depot, node_mask)
-	value = critic(state_embed)
+	# critic operates on agent graph; pass agents tensor
+	value = critic(agents)
 	return torch.stack(log_terms), torch.stack(ent_terms), value.squeeze(-1)
 
 
 def ppo_update(
 	model: DVRPNet,
-	critic: ValueCritic,
+	critic: nn.Module,
 	opt_policy: torch.optim.Optimizer,
 	opt_value: torch.optim.Optimizer,
 	decision_steps: List[Dict[str, Any]],
@@ -193,7 +181,8 @@ class PPOAlgorithm(RLAlgorithm):
 
 	def __init__(self, model: DVRPNet, optimizer: torch.optim.Optimizer, device: torch.device, args: Any) -> None:
 		super().__init__(model, optimizer, device, args)
-		self.critic = ValueCritic(model.d_model).to(device)
+		# Shared-encoder pairwise graph critic over agent states (x,y,s,t)
+		self.critic = PairwiseGraphCritic(agent_dim=4, hidden_dim=max(128, model.d_model)).to(device)
 		self.critic.train()
 		self.value_opt = torch.optim.AdamW(self.critic.parameters(), lr=args.value_lr)
 		self.gamma = args.gamma

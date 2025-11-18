@@ -87,7 +87,13 @@ def select_targets_with_sampling(
 
 	value = None
 	if critic is not None:
-		state_embed = aggregate_state_embedding(enc_nodes, enc_depot, node_mask)
-		value = critic(state_embed)
+		# Critic may operate on aggregated embeddings or directly on agents graph.
+		# Here we pass agents_tensor so graph-based critics can use pairwise relations.
+		try:
+			value = critic(agents_tensor)
+		except TypeError:
+			# Fallback for old critics expecting aggregated state embedding
+			state_embed = aggregate_state_embedding(enc_nodes, enc_depot, node_mask)
+			value = critic(state_embed)
 
 	return sel, dest_xy, log_probs, value

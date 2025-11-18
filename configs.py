@@ -19,13 +19,16 @@ class Config:
     include_service_time: bool = False
     # Reward scales
     capacity_reward_scale: float = 0.05
-    expiry_penalty_scale: float = 0.05
-    switch_penalty_scale: float = 0.001
+    expiry_penalty_scale: float = 0.02      # 从 0.05 降一点
+    switch_penalty_scale: float = 0.0005    # 降低开关惩罚
+    # Density-scaled pairwise distance penalty between agents
+    distance_penalty_base: float = 0.0002
+    distance_penalty_min_dist: float = 1.5
     # Per-step waiting penalty over active (unserved) demands
     wait_penalty_scale: float = 0.001
     # Exploration penalty params
-    exploration_history_n: int = 3  # consider positions at t-2 .. t-n
-    exploration_penalty_scale: float = 0.001  # scale of revisit penalty
+    exploration_history_n: int = 3
+    exploration_penalty_scale: float = 0.0  # 先关掉探索惩罚
 
     # Generator params
     generator_type: str = "net"  # "rule" | "net"
