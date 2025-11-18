@@ -100,6 +100,9 @@ def build_env_from_cfg(cfg: Config) -> GridEnvironment:
         wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
         distance_penalty_base=float(getattr(cfg, "distance_penalty_base", 0.0)),
         distance_penalty_min_dist=float(getattr(cfg, "distance_penalty_min_dist", 1.0)),
+        move_penalty_scale=float(getattr(cfg, "move_penalty_scale", 0.0)),
+        approach_bonus_scale=float(getattr(cfg, "approach_bonus_scale", 0.0)),
+        approach_bonus_max_dist=float(getattr(cfg, "approach_bonus_max_dist", 0.0)),
         max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2)),
         include_service_time=bool(getattr(cfg, "include_service_time", False)),
     )
@@ -128,6 +131,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lateness_lambda", type=float, default=0.0, help="Soft lateness penalty used during decode")
     p.add_argument("--reward_log", type=str, default="runs/rl_rewards.csv", help="CSV file to log per-episode rewards")
     p.add_argument("--reward_plot", type=str, default="runs/rl_rewards.png", help="Path to save reward curve plot")
+    p.add_argument("--ppo_diag_plot", type=str, default="runs/ppo_diagnostics.png", help="Path to save PPO diagnostic plot (ratio mean/std + value loss)")
     p.add_argument("--algo", type=str, default="reinforce", choices=["reinforce", "ppo"], help="Policy gradient algorithm to use")
     p.add_argument("--gamma", type=float, default=0.99, help="Discount factor for returns")
     p.add_argument("--ppo_epochs", type=int, default=4, help="Number of PPO epochs per episode")
@@ -137,6 +141,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--value_coef", type=float, default=0.5, help="Weight for value loss in PPO")
     p.add_argument("--entropy_coef", type=float, default=0.01, help="Entropy bonus coefficient for PPO")
     p.add_argument("--normalize_adv", action="store_true", help="Normalize advantages before PPO update")
+    p.add_argument("--target_queue_len", type=int, default=1, help="Length of autoregressive target queue to propose per agent")
     p.add_argument("--debug", action="store_true", help="Enable per-step debug printing of observed demands and new demands")
     p.add_argument("--deterministic", action="store_true", help="Enable deterministic torch/CuDNN behavior (may reduce performance)")
     p.add_argument("--tb_logdir", type=str, default="runs/tb", help="TensorBoard log directory (empty string to disable)")
@@ -222,12 +227,20 @@ def main() -> None:
         save_best_dir = os.path.dirname(args.save_best) or "."
         os.makedirs(save_best_dir, exist_ok=True)
 
+    if getattr(args, "ppo_diag_plot", None):
+        ppo_diag_dir = os.path.dirname(args.ppo_diag_plot) or "."
+        os.makedirs(ppo_diag_dir, exist_ok=True)
+
     writer: SummaryWriter | None = None
     if getattr(args, "tb_logdir", None):
         if len(args.tb_logdir.strip()) > 0:
             os.makedirs(args.tb_logdir, exist_ok=True)
             writer = SummaryWriter(log_dir=args.tb_logdir)
     rl_algo = build_algorithm(args.algo, model, opt, device, args)
+
+    ratio_mean_history: List[float] = []
+    ratio_std_history: List[float] = []
+    value_loss_history: List[float] = []
 
     for ep in range(1, args.episodes + 1):
         rl_algo.begin_episode(ep)
@@ -276,7 +289,7 @@ def main() -> None:
                     print(f"[EP {ep:04d} STEP {step_idx}] no demands seen")
             N = len(nodes_list)
             node_mask = [False] * N
-            depot = [(*obs["depot"], obs["time"])]
+            depot = [obs["depot"]]
 
             if N == 0:
                 actions = [(0, 0) for _ in obs["agent_states"]]
@@ -310,7 +323,7 @@ def main() -> None:
                         hi[0, a_idx, t_idx] = int(idx_val)
 
             critic_module = getattr(rl_algo, "critic", None)
-            sel, dest_xy, log_probs, state_value = select_targets_with_sampling(
+            sel, dest_xy, log_probs, state_value, queue_indices, queue_coords = select_targets_with_sampling(
                 model=model,
                 feats=feats,
                 agents_tensor=agents_t,
@@ -318,6 +331,7 @@ def main() -> None:
                 critic=critic_module,
                 history_positions=hp,
                 history_indices=hi,
+                target_queue_len=args.target_queue_len,
             )
 
             if args.debug:
@@ -348,6 +362,8 @@ def main() -> None:
             record = DecisionRecord(
                 step_index=len(rewards_all) - 1,
                 log_prob_sum=log_prob_sum,
+                reward=reward_val,
+                done=done,
             )
             if rl_algo.requires_full_state:
                 record.feats = detach_feats(feats)
@@ -356,6 +372,8 @@ def main() -> None:
                 record.state_value = state_value.detach().cpu().clone() if state_value is not None else None
                 record.history_positions = hp.detach().cpu().clone()
                 record.history_indices = hi.detach().cpu().clone()
+                record.queue_indices = queue_indices.detach().cpu().clone()
+                record.queue_coords = queue_coords.detach().cpu().clone()
             rl_algo.record_decision(record)
 
             obs = next_obs
@@ -376,6 +394,14 @@ def main() -> None:
         stats = rl_algo.end_episode(total_reward, rewards_all, dones_all, env_stats)
         msg = format_metrics(stats)
         print(f"[EP {ep:04d}] return={total_reward:.5f}{msg}")
+
+        if args.algo == "ppo" and stats:
+            if "ratio_mean" in stats:
+                ratio_mean_history.append(float(stats["ratio_mean"]))
+            if "ratio_std" in stats:
+                ratio_std_history.append(float(stats["ratio_std"]))
+            if "value_loss" in stats:
+                value_loss_history.append(float(stats["value_loss"]))
 
         if total_reward > best_return:
             best_return = total_reward
@@ -430,6 +456,36 @@ def main() -> None:
         plt.savefig(args.reward_plot)
         plt.close()
         print(f"[RL] reward curve saved => {args.reward_plot}")
+
+    if args.algo == "ppo" and ratio_mean_history and args.ppo_diag_plot:
+        episodes_logged = range(1, len(ratio_mean_history) + 1)
+        plt.figure(figsize=(8, 4))
+        ax1 = plt.gca()
+        ax1.plot(episodes_logged, ratio_mean_history, label="ratio_mean", color="tab:blue")
+        if ratio_std_history:
+            ax1.plot(episodes_logged[:len(ratio_std_history)], ratio_std_history, label="ratio_std", color="tab:orange")
+        ax1.set_xlabel("Episode")
+        ax1.set_ylabel("Ratio stats")
+        ax1.grid(True, linestyle="--", linewidth=0.5)
+
+        ax2 = ax1.twinx()
+        if value_loss_history:
+            ax2.plot(episodes_logged[:len(value_loss_history)], value_loss_history, label="value_loss", color="tab:green")
+            ax2.set_ylabel("Value loss")
+
+        lines_labels = ax1.get_legend_handles_labels()
+        if value_loss_history:
+            hl2 = ax2.get_legend_handles_labels()
+            lines = lines_labels[0] + hl2[0]
+            labels = lines_labels[1] + hl2[1]
+        else:
+            lines, labels = lines_labels
+        ax1.legend(lines, labels, loc="upper right")
+        plt.title("PPO Diagnostics")
+        plt.tight_layout()
+        plt.savefig(args.ppo_diag_plot)
+        plt.close()
+        print(f"[RL] PPO diagnostics saved => {args.ppo_diag_plot}")
 
     if best_return == float("-inf"):
         print("[RL] Warning: no episodes completed; no checkpoint saved.")

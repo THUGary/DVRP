@@ -11,18 +11,7 @@ from models.planner_model.model import DVRPNet
 from .base import RLAlgorithm, DecisionRecord
 from .sampling import aggregate_state_embedding
 from .critics import PairwiseGraphCritic
-
-
-def compute_returns(rewards: List[float], dones: List[bool], gamma: float, device: torch.device) -> torch.Tensor:
-	R = 0.0
-	returns: List[float] = []
-	for reward, done in zip(reversed(rewards), reversed(dones)):
-		if done:
-			R = 0.0
-		R = reward + gamma * R
-		returns.append(R)
-	returns.reverse()
-	return torch.tensor(returns, dtype=torch.float32, device=device)
+from .rollout_buffer import RolloutBuffer
 
 
 def evaluate_sample(
@@ -69,6 +58,8 @@ def evaluate_sample(
 	probs = torch.softmax(logits, dim=-1)
 	logp = torch.log_softmax(logits, dim=-1)
 	B, A, _ = probs.shape
+	# global context summarizing demand/depot graph for critic
+	global_ctx = aggregate_state_embedding(enc_nodes, enc_depot, node_mask)
 
 	log_terms = []
 	ent_terms = []
@@ -83,7 +74,7 @@ def evaluate_sample(
 		ent_terms.append(torch.stack(ent).sum())
 
 	# critic operates on agent graph; pass agents tensor
-	value = critic(agents)
+	value = critic(agents, global_ctx)  # type: ignore[arg-type]
 	return torch.stack(log_terms), torch.stack(ent_terms), value.squeeze(-1)
 
 
@@ -92,20 +83,33 @@ def ppo_update(
 	critic: nn.Module,
 	opt_policy: torch.optim.Optimizer,
 	opt_value: torch.optim.Optimizer,
-	decision_steps: List[Dict[str, Any]],
-	returns_all: torch.Tensor,
+	buffer: RolloutBuffer,
 	args: Any,
 	device: torch.device,
 	lateness_lambda: float,
+	gamma: float,
+	gae_lambda: float = 0.95,
+	use_gae: bool = True,
 ) -> Dict[str, float]:
-	if not decision_steps:
+	"""Run a PPO update using transitions from the rollout buffer.
+
+	For now we assume a single contiguous rollout (one episode). Later it can
+	be extended to multi-episode rollouts simply by feeding more steps.
+	"""
+	if buffer.empty:
 		return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
 
-	indices = torch.tensor([step["step_index"] for step in decision_steps], dtype=torch.long, device=device)
-	targets = returns_all[indices]
-	old_log_probs = torch.tensor([step["old_log_prob"] for step in decision_steps], dtype=torch.float32, device=device)
-	old_values = torch.tensor([step["value"] for step in decision_steps], dtype=torch.float32, device=device)
-	advantages = targets - old_values
+	stacked = buffer.to_tensors(device)
+	old_log_probs = stacked["log_probs"].view(-1)
+	values = stacked["values"].view(-1)
+	returns, advantages = buffer.compute_returns_and_advantages(
+		gamma=gamma,
+		gae_lambda=gae_lambda,
+		use_gae=use_gae,
+		device=device,
+	)
+	advantages = advantages.view(-1)
+	returns = returns.view(-1)
 	if args.normalize_adv and advantages.numel() > 1:
 		advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
@@ -113,22 +117,28 @@ def ppo_update(
 	accum_policy = 0.0
 	accum_value = 0.0
 	accum_entropy = 0.0
-	batch_size = max(1, min(args.ppo_batch_size, len(decision_steps)))
+	ratio_mean_accum = 0.0
+	ratio_std_accum = 0.0
+	T = len(buffer.steps)
+	batch_size = max(1, min(args.ppo_batch_size, T))
 
 	for _ in range(args.ppo_epochs):
-		perm = torch.randperm(len(decision_steps), device=device)
-		for start in range(0, len(decision_steps), batch_size):
+		perm = torch.randperm(T, device=device)
+		for start in range(0, T, batch_size):
 			idx = perm[start:start + batch_size]
-			batch_samples = [decision_steps[int(i.item())] for i in idx]
-
 			new_log_list = []
 			entropy_list = []
 			value_list = []
-			for sample in batch_samples:
+			for i in idx.tolist():
+				step = buffer.steps[i]
 				log_prob, entropy, value = evaluate_sample(
 					model,
 					critic,
-					sample,
+					{
+						"feats": step.feats,
+						"agents": step.agents,
+						"actions": step.actions,
+					},
 					lateness_lambda,
 					device,
 				)
@@ -138,17 +148,19 @@ def ppo_update(
 
 			new_log_probs = torch.stack(new_log_list)
 			entropies = torch.stack(entropy_list)
-			values = torch.stack(value_list)
+			values_pred = torch.stack(value_list)
 
 			old_batch = old_log_probs[idx]
 			adv_batch = advantages[idx]
-			target_batch = targets[idx]
+			target_batch = returns[idx]
 
 			ratio = torch.exp(new_log_probs - old_batch)
+			ratio_mean_accum += ratio.mean().item()
+			ratio_std_accum += ratio.std(unbiased=False).item()
 			surr1 = ratio * adv_batch
 			surr2 = torch.clamp(ratio, 1.0 - args.ppo_clip, 1.0 + args.ppo_clip) * adv_batch
 			policy_loss = -torch.min(surr1, surr2).mean()
-			value_loss = F.mse_loss(values, target_batch)
+			value_loss = F.mse_loss(values_pred, target_batch)
 			entropy_bonus = entropies.mean()
 
 			total_loss = policy_loss + args.value_coef * value_loss - args.entropy_coef * entropy_bonus
@@ -167,12 +179,14 @@ def ppo_update(
 			total_batches += 1
 
 	if total_batches == 0:
-		return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
+		return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "ratio_mean": 1.0, "ratio_std": 0.0}
 
 	return {
 		"policy_loss": accum_policy / total_batches,
 		"value_loss": accum_value / total_batches,
 		"entropy": accum_entropy / total_batches,
+		"ratio_mean": ratio_mean_accum / total_batches,
+		"ratio_std": ratio_std_accum / total_batches,
 	}
 
 
@@ -181,29 +195,33 @@ class PPOAlgorithm(RLAlgorithm):
 
 	def __init__(self, model: DVRPNet, optimizer: torch.optim.Optimizer, device: torch.device, args: Any) -> None:
 		super().__init__(model, optimizer, device, args)
-		# Shared-encoder pairwise graph critic over agent states (x,y,s,t)
-		self.critic = PairwiseGraphCritic(agent_dim=4, hidden_dim=max(128, model.d_model)).to(device)
+		# Shared-encoder pairwise graph critic over agent states (x,y,s,t) plus demand context
+		self.critic = PairwiseGraphCritic(agent_dim=4, hidden_dim=max(128, model.d_model), global_dim=2 * model.d_model).to(device)
 		self.critic.train()
 		self.value_opt = torch.optim.AdamW(self.critic.parameters(), lr=args.value_lr)
 		self.gamma = args.gamma
-		self.decision_steps: List[Dict[str, Any]] = []
+		self.gae_lambda = getattr(args, "gae_lambda", 0.95)
+		self.use_gae = getattr(args, "use_gae", True)
+		self.buffer = RolloutBuffer()
 
 	def begin_episode(self, episode_idx: int) -> None:
-		self.decision_steps = []
+		self.buffer.clear()
 
 	def record_decision(self, record: DecisionRecord) -> None:
 		if record.feats is None or record.agents is None or record.actions is None:
 			raise ValueError("PPOAlgorithm requires full state tensors; set requires_full_state=True when capturing data.")
-		self.decision_steps.append({
-			"step_index": record.step_index,
-			"feats": record.feats,
-			"agents": record.agents,
-			"actions": record.actions,
-			"old_log_prob": float(record.log_prob_sum.detach().cpu().item()),
-			"value": float(record.state_value.detach().cpu().item()) if record.state_value is not None else 0.0,
-			"history_positions": record.history_positions,
-			"history_indices": record.history_indices,
-		})
+		if record.state_value is None:
+			raise ValueError("PPOAlgorithm expects state_value to be filled when using GAE.")
+		self.buffer.add(
+			step_index=record.step_index,
+			feats=record.feats,
+			agents=record.agents,
+			actions=record.actions,
+			log_prob_sum=record.log_prob_sum,
+			value=record.state_value,
+			reward=float(record.reward),
+			done=bool(record.done),
+		)
 
 	def end_episode(
 		self,
@@ -213,18 +231,20 @@ class PPOAlgorithm(RLAlgorithm):
 		env_stats: Dict[str, Any],
 	) -> Dict[str, float]:
 		if not rewards:
-			rewards = [0.0]
-			dones = [True]
-		returns_all = compute_returns(rewards, dones, self.gamma, self.device)
+			# still run update based on whatever is in buffer (if any)
+			if self.buffer.empty:
+				return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
 		stats = ppo_update(
 			self.model,
 			self.critic,
 			self.optimizer,
 			self.value_opt,
-			self.decision_steps,
-			returns_all,
+			self.buffer,
 			self.args,
 			self.device,
 			self.args.lateness_lambda,
+			self.gamma,
+			gae_lambda=self.gae_lambda,
+			use_gae=self.use_gae,
 		)
 		return stats

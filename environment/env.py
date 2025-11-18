@@ -47,6 +47,11 @@ class GridEnvironment:
 		# density-based pairwise distance penalty between agents
 		distance_penalty_base: float = 0.0,
 		distance_penalty_min_dist: float = 1.0,
+		# per-step movement penalty encourages shorter, smoother paths
+		move_penalty_scale: float = 0.0,
+		# reward shaping for moving closer to nearby demands
+		approach_bonus_scale: float = 0.0,
+		approach_bonus_max_dist: float = 10.0,
 		# Hard cap on episode length; regardless of vehicle positions, if the
 		# current time reaches max_end_time, the episode ends.
 		max_end_time: Optional[int] = None,
@@ -66,6 +71,9 @@ class GridEnvironment:
 		self.wait_penalty_scale = float(wait_penalty_scale)
 		self.distance_penalty_base = float(distance_penalty_base)
 		self.distance_penalty_min_dist = float(distance_penalty_min_dist)
+		self.move_penalty_scale = float(move_penalty_scale)
+		self.approach_bonus_scale = float(approach_bonus_scale)
+		self.approach_bonus_max_dist = float(max(0.0, approach_bonus_max_dist))
 		self.include_service_time = bool(include_service_time)
 		# If not specified, default to max_time to preserve previous behavior
 		self.max_end_time = int(max_time if max_end_time is None else max_end_time)
@@ -148,6 +156,8 @@ class GridEnvironment:
 		expired_capacity = sum(float(d.c) for d in expired)
 		# remove expired demands
 		self._state.demands = [d for d in self._state.demands if t <= d.end_t]
+		# snapshot demand positions prior to servicing for shaping rewards
+		demand_positions_snapshot = [(d.x, d.y) for d in self._state.demands]
 
 		# Previously the environment applied a one-shot expiry penalty when a
 		# demand actually expired. We now replace that with a per-step waiting
@@ -256,6 +266,24 @@ class GridEnvironment:
 
 		# second pass to ensure uniqueness after reverting (should hold if prev states were unique)
 		self._state.agent_states = candidate_states
+
+		# --- Demand approach bonus (potential shaping) ---
+		approach_bonus_value = 0.0
+		if self.approach_bonus_scale > 0.0 and demand_positions_snapshot:
+			max_cap = self.approach_bonus_max_dist if self.approach_bonus_max_dist > 0 else None
+			approach_delta = 0.0
+			for idx, (prev_pos, agent_state) in enumerate(zip(prev_positions, self._state.agent_states)):
+				px, py = prev_pos
+				after_pos = (agent_state.x, agent_state.y)
+				before_dist = min(math.hypot(px - dx, py - dy) for dx, dy in demand_positions_snapshot)
+				after_dist = min(math.hypot(after_pos[0] - dx, after_pos[1] - dy) for dx, dy in demand_positions_snapshot)
+				if max_cap is not None and max_cap > 0:
+					before_dist = min(before_dist, max_cap)
+					after_dist = min(after_dist, max_cap)
+				delta = before_dist - after_dist
+				if delta > 0:
+					approach_delta += delta
+			approach_bonus_value = self.approach_bonus_scale * approach_delta
 		# 3) serve demands, honoring service-time if enabled
 		served_count = 0
 		served_capacity = 0.0
@@ -392,6 +420,9 @@ class GridEnvironment:
 									pairwise_penalty += gap * demand_density
 		pairwise_penalty_value = - self.distance_penalty_base * pairwise_penalty if pairwise_penalty > 0.0 else 0.0
 
+		# movement penalty discouraging zig-zag motion
+		move_penalty_value = - self.move_penalty_scale * movement_distance if self.move_penalty_scale > 0.0 else 0.0
+
 		# --- Exploration revisit penalty ---
 		exploration_penalty = 0.0
 		if self.exploration_history_n > 1:
@@ -422,7 +453,14 @@ class GridEnvironment:
 		switch_penalty_term = - float(self.switch_penalty_scale) * float(switch_count)
 		# Combine capacity reward with the per-step waiting penalty (negative)
 		# and the density-scaled pairwise proximity penalty.
-		reward = capacity_reward_term + wait_penalty + switch_penalty_term + pairwise_penalty_value		#  + exploration_penalty_value
+		reward = (
+			capacity_reward_term
+			+ wait_penalty
+			+ switch_penalty_term
+			+ pairwise_penalty_value
+			+ move_penalty_value
+			+ approach_bonus_value
+		)		#  + exploration_penalty_value
 
 		# update episode-level stats
 		self._episode_stats["served_count"] += served_count
@@ -430,6 +468,10 @@ class GridEnvironment:
 		self._episode_stats["pairwise_penalty_value"] += pairwise_penalty_value
 		self._episode_stats.setdefault('capacity_reward_term', 0)
 		self._episode_stats["capacity_reward_term"] += capacity_reward_term
+		self._episode_stats.setdefault("move_penalty_value", 0.0)
+		self._episode_stats["move_penalty_value"] += move_penalty_value
+		self._episode_stats.setdefault("approach_bonus_value", 0.0)
+		self._episode_stats["approach_bonus_value"] += approach_bonus_value
 		self._episode_stats["served_details"].extend(served_details)
 		# update expired stats in episode-level tracking
 		if expired_count > 0:

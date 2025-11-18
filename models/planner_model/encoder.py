@@ -13,7 +13,7 @@ class Encoder(nn.Module):
     输入（张量）:
       - nodes:     [B, N, 5]   (x, y, t_arrival, c/demand, t_due) — 顺序按仓库现有用法即可
       - node_mask: [B, N]      True 表示屏蔽该节点（无效/不可选）
-      - depot:     [B, 1, 3]   (x, y, t_ref)
+    - depot:     [B, 1, 2]   (x, y)
 
     输出:
       - H_nodes: [B, N, d]
@@ -30,7 +30,7 @@ class Encoder(nn.Module):
             nn.Linear(d_model, d_model),
         )
         self.depot_proj = nn.Sequential(
-            nn.Linear(3, d_model),
+            nn.Linear(2, d_model),
             nn.ReLU(inplace=True),
             nn.Linear(d_model, d_model),
         )
@@ -56,7 +56,7 @@ class Encoder(nn.Module):
     def forward(self, feats: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         nodes: torch.Tensor = feats["nodes"]            # [B, N, 5]
         node_mask: torch.Tensor = feats["node_mask"]    # [B, N] (bool)
-        depot: torch.Tensor = feats["depot"]            # [B, 1, 3]
+        depot: torch.Tensor = feats["depot"]            # [B, 1, 2]
 
         H_nodes_in = self.node_proj(nodes)                 # [B, N, d]
         # 将 node_mask 作为 key_padding_mask 传入，True=pad/屏蔽

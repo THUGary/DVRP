@@ -18,12 +18,16 @@ class Config:
     max_end_time: Optional[int] = None
     include_service_time: bool = False
     # Reward scales
-    capacity_reward_scale: float = 0.05
+    capacity_reward_scale: float = 0.08
     expiry_penalty_scale: float = 0.02      # 从 0.05 降一点
     switch_penalty_scale: float = 0.0005    # 降低开关惩罚
     # Density-scaled pairwise distance penalty between agents
     distance_penalty_base: float = 0.0002
+    
     distance_penalty_min_dist: float = 1.5
+    move_penalty_scale: float = 0.0005
+    approach_bonus_scale: float = 0.005
+    approach_bonus_max_dist: float = 6.0
     # Per-step waiting penalty over active (unserved) demands
     wait_penalty_scale: float = 0.001
     # Exploration penalty params

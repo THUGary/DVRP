@@ -19,12 +19,12 @@ def prepare_features(
     """
     将 Encoder 需要的量（nodes/node_mask/depot）转换为张量。
 
-    返回:
-      {
-        "nodes":     [B, N, 5] float32,
-        "node_mask": [B, N]    bool,
-        "depot":     [B, 1, 3] float32
-      }
+        返回:
+            {
+                "nodes":     [B, N, 5] float32,
+                "node_mask": [B, N]    bool,
+                "depot":     [B, 1, 2] float32  # 仅保留 (x, y)，当前时间信息放在 agents 特征中
+            }
     """
     dev = torch.device(device)
 
@@ -56,7 +56,7 @@ def prepare_features(
     else:
         depot_t = torch.tensor(depot, dtype=torch.float32, device=dev)
         if depot_t.dim() == 2:
-            depot_t = depot_t.unsqueeze(0)  # [1, 1, 3]
+            depot_t = depot_t.unsqueeze(0)  # [1, 1, 2]
 
     out = {"nodes": nodes_t, "node_mask": mask_t, "depot": depot_t}
 
@@ -208,7 +208,7 @@ class DVRPNet(nn.Module):
         assert k >= 1, "k must be >= 1"
         nodes = feats["nodes"]              # [B,N,5]
         node_mask0 = feats["node_mask"]     # [B,N]
-        depot = feats["depot"]              # [B,1,3]
+        depot = feats["depot"]              # [B,1,2]
 
         # 编码静态
         enc = self.encode(feats)
@@ -228,7 +228,7 @@ class DVRPNet(nn.Module):
 
         # 预取坐标
         node_xy = nodes[..., :2].long()      # [B,N,2]
-        depot_xy = depot[..., :2].long().squeeze(1)  # [B,2]
+        depot_xy = depot.squeeze(1).long()  # [B,2]
 
         for step in range(k):
             # 单次 decode，随后基于置信度贪心分配，避免同一步冲突

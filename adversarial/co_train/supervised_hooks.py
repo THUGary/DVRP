@@ -67,7 +67,13 @@ def supervised_planner_hook(planner: Any, ctx: Dict[str, Any]) -> None:
     )
 
     # Prepare features and labels
-    feats = prepare_features(nodes=[obs["demands"]], node_mask=[[False]*len(obs["demands"])], depot=[(obs["depot"][0], obs["depot"][1], obs["time"])], d_model=getattr(planner._model, "d_model", 128), device=device)  # type: ignore[attr-defined]
+    feats = prepare_features(
+        nodes=[obs["demands"]],
+        node_mask=[[False] * len(obs["demands"])],
+        depot=[(obs["depot"][0], obs["depot"][1])],
+        d_model=getattr(planner._model, "d_model", 128),
+        device=device,
+    )  # type: ignore[attr-defined]
     _torch = torch
     agents_tensor = _torch.tensor([[ (a[0], a[1], a[2], obs["time"]) for a in agent_states ]], dtype=_torch.float32, device=device)
     enc_nodes, enc_depot, node_mask = planner._model.encoder(feats)  # type: ignore[attr-defined]

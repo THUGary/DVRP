@@ -33,13 +33,15 @@ def select_targets_with_sampling(
 	critic: Optional[torch.nn.Module] = None,
 	history_positions: Optional[torch.Tensor] = None,
 	history_indices: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+	target_queue_len: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
 	"""Sample target indices per agent using the current policy logits."""
 	dev = agents_tensor.device
+	queue_len = max(1, int(target_queue_len))
 	if feats["nodes"].size(1) == 0:
 		B = agents_tensor.size(0)
 		A = agents_tensor.size(1)
-		depot_xy = feats["depot"][..., :2].long().squeeze(1)
+		depot_xy = feats["depot"].long().squeeze(1)
 		sel = torch.zeros(B, A, dtype=torch.long, device=dev)
 		dest_xy = depot_xy.unsqueeze(1).repeat(1, A, 1)
 		log_probs = torch.zeros(B, A, dtype=torch.float32, device=dev)
@@ -47,7 +49,11 @@ def select_targets_with_sampling(
 		if critic is not None:
 			embed = torch.zeros(B, critic.input_dim, device=dev)
 			value = critic(embed)
-		return sel, dest_xy, log_probs, value
+		queue_indices = torch.zeros(B, A, queue_len, dtype=torch.long, device=dev)
+		queue_coords = torch.zeros(B, A, queue_len, 2, dtype=torch.long, device=dev)
+		queue_indices[..., 0] = sel
+		queue_coords[..., 0, :] = dest_xy
+		return sel, dest_xy, log_probs, value, queue_indices, queue_coords
 
 	enc_nodes, enc_depot, node_mask = model.encoder(feats)
 	enc_agents = model.encoder.encode_agents(agents_tensor)
@@ -67,8 +73,10 @@ def select_targets_with_sampling(
 	logp = torch.log_softmax(logits, dim=-1)
 	B, A, _ = probs.shape
 	N = feats["nodes"].size(1)
-	depot_xy = feats["depot"][..., :2].long().squeeze(1)
+	depot_xy = feats["depot"].long().squeeze(1)
 	node_xy = feats["nodes"][..., :2].long()
+	queue_indices = torch.zeros(B, A, queue_len, dtype=torch.long, device=dev)
+	queue_coords = torch.zeros(B, A, queue_len, 2, dtype=torch.long, device=dev)
 
 	sel = torch.zeros(B, A, dtype=torch.long, device=dev)
 	dest_xy = torch.zeros(B, A, 2, dtype=torch.long, device=dev)
@@ -85,15 +93,79 @@ def select_targets_with_sampling(
 			else:
 				dest_xy[b, a] = depot_xy[b]
 
+	queue_indices[..., 0] = sel
+	queue_coords[..., 0, :] = dest_xy
+
 	value = None
 	if critic is not None:
-		# Critic may operate on aggregated embeddings or directly on agents graph.
-		# Here we pass agents_tensor so graph-based critics can use pairwise relations.
+		# Build global context from demand/depot encoder outputs
+		global_ctx = aggregate_state_embedding(enc_nodes, enc_depot, node_mask)
 		try:
-			value = critic(agents_tensor)
+			# Preferred path: critic(agents, global_ctx)
+			value = critic(agents_tensor, global_ctx)  # type: ignore[arg-type]
 		except TypeError:
-			# Fallback for old critics expecting aggregated state embedding
-			state_embed = aggregate_state_embedding(enc_nodes, enc_depot, node_mask)
-			value = critic(state_embed)
+			# Backward-compatible fallback: critic may only accept agents or state embedding
+			try:
+				value = critic(agents_tensor)
+			except TypeError:
+				value = critic(global_ctx)
 
-	return sel, dest_xy, log_probs, value
+	# --- Autoregressive queue generation (greedy for steps > 1) ---
+	if queue_len > 1 and feats["nodes"].size(1) > 0:
+		mask_roll = node_mask.clone()
+		agents_roll = agents_tensor.clone()
+		nodes = feats["nodes"]
+
+		def mark_selected(mask: torch.Tensor, indices: torch.Tensor) -> None:
+			for b in range(indices.size(0)):
+				for a in range(indices.size(1)):
+					idx = int(indices[b, a].item())
+					if 1 <= idx <= nodes.size(1):
+						mask[b, idx - 1] = True
+
+		def advance_agents(state: torch.Tensor, coords: torch.Tensor, indices: torch.Tensor) -> None:
+			if nodes.size(1) == 0:
+				return
+			for b in range(indices.size(0)):
+				for a in range(indices.size(1)):
+					idx = int(indices[b, a].item())
+					dst = coords[b, a].to(state.dtype)
+					cur = state[b, a, :2]
+					dist = (cur[0] - dst[0]).abs() + (cur[1] - dst[1]).abs()
+					state[b, a, 0:2] = dst
+					state[b, a, 3] = state[b, a, 3] + dist
+					if 1 <= idx <= nodes.size(1):
+						demand = nodes[b, idx - 1, 3].to(state.dtype)
+						state[b, a, 2] = torch.clamp(state[b, a, 2] - demand, min=0.0)
+
+		mark_selected(mask_roll, sel)
+		advance_agents(agents_roll, dest_xy, sel)
+
+		for step in range(1, queue_len):
+			if (~mask_roll).sum().item() == 0:
+				break
+			enc_agents_step = model.encoder.encode_agents(agents_roll)
+			logits_step = model.decode(
+				enc_nodes=enc_nodes,
+				enc_depot=enc_depot,
+				node_mask=mask_roll,
+				enc_agents=enc_agents_step,
+				agents_tensor=agents_roll,
+				nodes=feats["nodes"],
+				lateness_lambda=lateness_lambda,
+				history_indices=history_indices,
+				history_positions=history_positions,
+			)
+			next_idx = torch.argmax(logits_step, dim=-1)
+			queue_indices[..., step] = next_idx
+			for b in range(B):
+				for a in range(A):
+					idx = int(next_idx[b, a].item())
+					if 1 <= idx <= N:
+						queue_coords[b, a, step] = node_xy[b, idx - 1]
+					else:
+						queue_coords[b, a, step] = depot_xy[b]
+			mark_selected(mask_roll, next_idx)
+			advance_agents(agents_roll, queue_coords[..., step, :], next_idx)
+
+	return sel, dest_xy, log_probs, value, queue_indices, queue_coords

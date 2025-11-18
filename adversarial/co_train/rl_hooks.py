@@ -121,7 +121,7 @@ def reinforce_planner_hook(planner, ctx: Dict[str, Any]) -> None:
         feats = prepare_features(
             nodes=[nodes_list],  # [1,N,5]
             node_mask=[mask],
-            depot=[(depot_xy[0], depot_xy[1], t_now)],  # [1,1,3]
+            depot=[(depot_xy[0], depot_xy[1])],  # [1,1,2]
             d_model=getattr(planner._model, "d_model", 128),
             device=device,
         )
@@ -134,12 +134,15 @@ def reinforce_planner_hook(planner, ctx: Dict[str, Any]) -> None:
         cap_full = _torch.full((1, agents_tensor.size(1)), float(full_capacity), dtype=_torch.float32, device=device)
 
         # Sample one target per agent with log-probs
-        sel, dest_xy, log_probs, _value = select_targets_with_sampling(
+        sel, dest_xy, log_probs, _value, _queue_idx, _queue_coords = select_targets_with_sampling(
             planner._model,  # DVRPNet
             feats,
             agents_tensor,
             lateness_lambda,
-            cap_full,
+            critic=None,
+            history_positions=None,
+            history_indices=None,
+            target_queue_len=1,
         )
         # Sum log-probs across agents for this step
         step_logp = log_probs.sum()

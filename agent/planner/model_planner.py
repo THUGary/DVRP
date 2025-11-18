@@ -90,7 +90,7 @@ class ModelPlanner(BasePlanner):
             feats = prepare_features(
                 nodes=[nodes],                 # [1,N,5]
                 node_mask=[mask],              # [1,N]
-                depot=[(depot[0], depot[1], t)],  # [1,1,3]
+                depot=[(depot[0], depot[1])],  # [1,1,2]
                 d_model=self.d_model,
                 device=self.device,
             )
