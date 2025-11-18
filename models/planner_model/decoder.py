@@ -24,6 +24,7 @@ class Decoder(nn.Module):
     def __init__(self, d_model: int = 128, nhead: int = 8) -> None:
         super().__init__()
         self.d_model = d_model
+        dropout_p = 0.1
 
         # 历史序列自注意力（可融合坐标与节点嵌入）
         # 历史自注意力与 FFN：使用封装好的 TransformerBlock（pre-LN）
@@ -34,6 +35,7 @@ class Decoder(nn.Module):
         self.agent_ctx_proj = nn.Sequential(
             nn.Linear(2 * d_model, d_model),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout_p),
             nn.Linear(d_model, d_model),
         )
         self.agent_ctx_norm = nn.LayerNorm(d_model)
@@ -44,12 +46,14 @@ class Decoder(nn.Module):
         self.hist_pos_proj = nn.Sequential(
             nn.Linear(2, d_model),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout_p),
             nn.Linear(d_model, d_model),
         )
         # 位置 + 节点嵌入 融合线性（拼接 2d -> d）
         self.hist_fuse_proj = nn.Sequential(
             nn.Linear(2 * d_model, d_model),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout_p),
             nn.Linear(d_model, d_model),
         )
 
@@ -57,6 +61,7 @@ class Decoder(nn.Module):
         self.ctx_proj = nn.Sequential(
             nn.Linear(3 * d_model, d_model),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout_p),
             nn.Linear(d_model, d_model),
         )
         self.ctx_norm = nn.LayerNorm(d_model)
@@ -150,6 +155,7 @@ class Decoder(nn.Module):
         #    在 agent 维度上做一次自注意力与 FFN 残差堆叠，得到跨-agent 强化后的“历史摘要”。
         agent_ctx = torch.cat([enc_agents, hist_summary], dim=-1)   # [B,A,2d]
         agent_ctx = self.agent_ctx_proj(agent_ctx)                   # [B,A,d]
+        agent_ctx = self.agent_ctx_norm(agent_ctx)
         # Use TransformerBlock for agent-agent interaction along agent dimension
         agent_ctx = self.agent_block(agent_ctx)
         # 用跨-agent 交互后的摘要替换原先的 hist_summary

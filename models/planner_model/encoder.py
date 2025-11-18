@@ -24,15 +24,20 @@ class Encoder(nn.Module):
     def __init__(self, d_model: int = 128, nhead: int = 8, nlayers: int = 2) -> None:
         super().__init__()
         self.d_model = d_model
+        dropout_p = 0.1
         self.node_proj = nn.Sequential(
             nn.Linear(5, d_model),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout_p),
             nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
         )
         self.depot_proj = nn.Sequential(
             nn.Linear(2, d_model),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout_p),
             nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
         )
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -46,9 +51,11 @@ class Encoder(nn.Module):
         # === Agents 编码（从 Decoder 迁移过来） ===
         # Agent 编码块：Embedding + Self-Attn + FFN（Transformer 风格：残差 + Norm）
         self.agent_mlp = nn.Sequential(
-            nn.Linear(4, d_model),
+            nn.Linear(3, d_model),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout_p),
             nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
         )
         # Agent block: use reusable TransformerBlock (pre-LN, attn+FFN)
         self.agent_block = TransformerBlock(d_model, nhead, dim_ff=d_model * 4)
@@ -89,7 +96,7 @@ class Encoder(nn.Module):
     def encode_agents(self, agents_tensor: torch.Tensor) -> torch.Tensor:
         """
         将 agents 状态编码为 [B, A, d] 表征。
-        输入: agents_tensor [B, A, 4]，四维含义为 (x, y, s, t_agent)
+        输入: agents_tensor [B, A, 3]，三维含义为 (x, y, s)
         """
         if agents_tensor is None:
             raise ValueError("encode_agents requires agents_tensor with shape [B,A,4]")

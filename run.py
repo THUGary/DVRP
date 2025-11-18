@@ -174,7 +174,13 @@ def main() -> None:
 	# --pmodel optionally accepts a checkpoint path; if omitted, use default from cfg
 	parser.add_argument("--pmodel", nargs="?", const="__DEFAULT__", help="Use model planner; optionally pass checkpoint path (.pt/.pth). Example: --pmodel checkpoints/planner/planner_rl_best.pt")
 	parser.add_argument("--gmodel", action="store_true", help="Use neural net demand generator; otherwise rule")
-	parser.add_argument("--service-time", action="store_true", help="Enable service times for demands (vehicles must remain on-site before completion)")
+	parser.add_argument(
+		"--service-time",
+		"--service_time",
+		dest="service_time",
+		action="store_true",
+		help="Enable service times for demands (vehicles must remain on-site before completion)",
+	)
 	parser.add_argument("--num-agents", type=int, default=2, help="Override number of agents for the episode (overrides config)")
 	args = parser.parse_args()
 

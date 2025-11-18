@@ -14,6 +14,8 @@ import torch
 import torch.nn.functional as F
 from collections import deque
 
+from training.planner.rl_algorithms.sampling import select_targets_with_sampling
+
 
 def _towards_step(cur: Tuple[int, int], dst: Tuple[int, int]) -> Tuple[int, int]:
     cx, cy = cur; dx = 0; dy = 0
@@ -96,7 +98,6 @@ def reinforce_planner_hook(planner, ctx: Dict[str, Any]) -> None:
 
     # Imports for features and action sampling from the planner model
     from models.planner_model.model import prepare_features
-    from training.planner.train_rl_planner import select_targets_with_sampling
 
     lateness_lambda = getattr(planner, "lateness_lambda", 0.0)
     full_capacity = getattr(planner, "full_capacity", None)
@@ -125,10 +126,10 @@ def reinforce_planner_hook(planner, ctx: Dict[str, Any]) -> None:
             d_model=getattr(planner._model, "d_model", 128),
             device=device,
         )
-        # Agents tensor [1,A,4] with time
+        # Agents tensor [1,A,3] plus shared time scalar
         import torch as _torch
         agents = obs["agent_states"]
-        agents_tensor = _torch.tensor([[ (a[0], a[1], a[2], t_now) for a in agents ]], dtype=_torch.float32, device=device)
+        agents_tensor = _torch.tensor([[ (a[0], a[1], a[2]) for a in agents ]], dtype=_torch.float32, device=device)
 
         # cap_full: [1,A]
         cap_full = _torch.full((1, agents_tensor.size(1)), float(full_capacity), dtype=_torch.float32, device=device)
@@ -143,6 +144,7 @@ def reinforce_planner_hook(planner, ctx: Dict[str, Any]) -> None:
             history_positions=None,
             history_indices=None,
             target_queue_len=1,
+            current_time=t_now,
         )
         # Sum log-probs across agents for this step
         step_logp = log_probs.sum()

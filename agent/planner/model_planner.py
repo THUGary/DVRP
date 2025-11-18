@@ -79,8 +79,8 @@ class ModelPlanner(BasePlanner):
 
         mask = [False] * N
         agents_tensor = [
-            (a.x, a.y, a.s, t) for a in agent_states
-        ]  # [A,4]
+            (a.x, a.y, a.s) for a in agent_states
+        ]  # [A,3]
         # cap_full: [1,A]，必须由构造时提供的 full_capacity 指定（来自 Config.capacity）
         if self.full_capacity is None:
             raise RuntimeError("ModelPlanner requires full_capacity (Config.capacity) at construction; pass full_capacity=cfg.capacity.")
@@ -94,7 +94,7 @@ class ModelPlanner(BasePlanner):
                 d_model=self.d_model,
                 device=self.device,
             )
-            agents_t = torch.tensor([agents_tensor], dtype=torch.float32, device=self.device)  # [1,A,4]
+            agents_t = torch.tensor([agents_tensor], dtype=torch.float32, device=self.device)  # [1,A,3]
             k = max(1, int(horizon))
             out = self._model.forward(
                 feats=feats,
@@ -102,6 +102,7 @@ class ModelPlanner(BasePlanner):
                 k=k,
                 lateness_lambda=self.lateness_lambda,
                 cap_full=cap_full,  # 回 depot 恢复容量
+                current_time=float(t),
             )
 
         # 解析输出到每个 agent 的 deque

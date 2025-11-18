@@ -6,12 +6,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.planner_model.model import DVRPNet
+from models.planner_model.model import DVRPNet, _broadcast_time_like
 
 from .base import RLAlgorithm, DecisionRecord
 from .sampling import aggregate_state_embedding
 from .critics import PairwiseGraphCritic
 from .rollout_buffer import RolloutBuffer
+
 
 
 def evaluate_sample(
@@ -24,6 +25,8 @@ def evaluate_sample(
 	feats = {k: v.to(device) for k, v in sample["feats"].items()}
 	agents = sample["agents"].to(device)
 	actions = sample["actions"].to(device)
+	current_time = sample.get("current_time", 0)
+	time_tensor = _broadcast_time_like(current_time, agents.size(0), agents.size(1), device, agents.dtype)
 	history_positions = sample.get("history_positions")
 	history_indices = sample.get("history_indices")
 	if history_positions is not None:
@@ -35,10 +38,10 @@ def evaluate_sample(
 		B = actions.size(0)
 		log_prob = torch.zeros(B, device=device)
 		entropy = torch.zeros(B, device=device)
-		# fall back to zeros if critic cannot handle empty state
+		agents_aug = torch.cat([agents, time_tensor.unsqueeze(-1)], dim=-1)
 		try:
-			value = critic(torch.zeros(B, 1, 4, device=device))  # [B,A,F] degenerate
-		except Exception:
+			value = critic(agents_aug)
+		except TypeError:
 			value = torch.zeros(B, device=device)
 		return log_prob, entropy, value
 
@@ -50,6 +53,7 @@ def evaluate_sample(
 		node_mask=node_mask,
 		enc_agents=enc_agents,
 		agents_tensor=agents,
+		agent_times=time_tensor,
 		nodes=feats.get("nodes"),
 		lateness_lambda=lateness_lambda,
 		history_indices=history_indices,
@@ -59,7 +63,7 @@ def evaluate_sample(
 	logp = torch.log_softmax(logits, dim=-1)
 	B, A, _ = probs.shape
 	# global context summarizing demand/depot graph for critic
-	global_ctx = aggregate_state_embedding(enc_nodes, enc_depot, node_mask)
+	global_ctx = aggregate_state_embedding(enc_nodes, enc_depot, node_mask, time_tensor)
 
 	log_terms = []
 	ent_terms = []
@@ -74,7 +78,8 @@ def evaluate_sample(
 		ent_terms.append(torch.stack(ent).sum())
 
 	# critic operates on agent graph; pass agents tensor
-	value = critic(agents, global_ctx)  # type: ignore[arg-type]
+	agents_aug = torch.cat([agents, time_tensor.unsqueeze(-1)], dim=-1)
+	value = critic(agents_aug, global_ctx)  # type: ignore[arg-type]
 	return torch.stack(log_terms), torch.stack(ent_terms), value.squeeze(-1)
 
 
@@ -119,8 +124,10 @@ def ppo_update(
 	accum_entropy = 0.0
 	ratio_mean_accum = 0.0
 	ratio_std_accum = 0.0
+	kl_accum = 0.0
 	T = len(buffer.steps)
 	batch_size = max(1, min(args.ppo_batch_size, T))
+	value_clip_eps = float(getattr(args, "value_clip", args.ppo_clip))
 
 	for _ in range(args.ppo_epochs):
 		perm = torch.randperm(T, device=device)
@@ -138,6 +145,7 @@ def ppo_update(
 						"feats": step.feats,
 						"agents": step.agents,
 						"actions": step.actions,
+						"current_time": step.current_time,
 					},
 					lateness_lambda,
 					device,
@@ -153,14 +161,21 @@ def ppo_update(
 			old_batch = old_log_probs[idx]
 			adv_batch = advantages[idx]
 			target_batch = returns[idx]
+			old_value_batch = values[idx]
 
 			ratio = torch.exp(new_log_probs - old_batch)
+			approx_kl = torch.mean(old_batch - new_log_probs)
+			kl_accum += approx_kl.item()
 			ratio_mean_accum += ratio.mean().item()
 			ratio_std_accum += ratio.std(unbiased=False).item()
 			surr1 = ratio * adv_batch
 			surr2 = torch.clamp(ratio, 1.0 - args.ppo_clip, 1.0 + args.ppo_clip) * adv_batch
 			policy_loss = -torch.min(surr1, surr2).mean()
-			value_loss = F.mse_loss(values_pred, target_batch)
+			value_delta = values_pred - old_value_batch
+			value_clipped = old_value_batch + value_delta.clamp(-value_clip_eps, value_clip_eps)
+			value_loss_unclipped = F.mse_loss(values_pred, target_batch, reduction="none")
+			value_loss_clipped = F.mse_loss(value_clipped, target_batch, reduction="none")
+			value_loss = torch.max(value_loss_unclipped, value_loss_clipped).mean()
 			entropy_bonus = entropies.mean()
 
 			total_loss = policy_loss + args.value_coef * value_loss - args.entropy_coef * entropy_bonus
@@ -187,6 +202,7 @@ def ppo_update(
 		"entropy": accum_entropy / total_batches,
 		"ratio_mean": ratio_mean_accum / total_batches,
 		"ratio_std": ratio_std_accum / total_batches,
+		"approx_kl": kl_accum / total_batches,
 	}
 
 
@@ -196,7 +212,7 @@ class PPOAlgorithm(RLAlgorithm):
 	def __init__(self, model: DVRPNet, optimizer: torch.optim.Optimizer, device: torch.device, args: Any) -> None:
 		super().__init__(model, optimizer, device, args)
 		# Shared-encoder pairwise graph critic over agent states (x,y,s,t) plus demand context
-		self.critic = PairwiseGraphCritic(agent_dim=4, hidden_dim=max(128, model.d_model), global_dim=2 * model.d_model).to(device)
+		self.critic = PairwiseGraphCritic(agent_dim=4, hidden_dim=max(128, model.d_model), global_dim=2 * model.d_model + 1).to(device)
 		self.critic.train()
 		self.value_opt = torch.optim.AdamW(self.critic.parameters(), lr=args.value_lr)
 		self.gamma = args.gamma
@@ -219,6 +235,7 @@ class PPOAlgorithm(RLAlgorithm):
 			actions=record.actions,
 			log_prob_sum=record.log_prob_sum,
 			value=record.state_value,
+			current_time=record.current_time if record.current_time is not None else 0.0,
 			reward=float(record.reward),
 			done=bool(record.done),
 		)

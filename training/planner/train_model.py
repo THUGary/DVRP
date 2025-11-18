@@ -39,11 +39,12 @@ class PlanRowsDataset(Dataset):
 def collate_rows(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     """将变长 nodes 的 row 批量化，支持多 agent 和 (A,K) 标签。
     期望 item 包含：
-      - nodes: List[(x,y,t_arrival,c,t_due)]，长度 N
-      - node_mask: List[bool]，长度 N（可选，默认全 False）
-      - agents: List[(x,y,s,t_agent)]，长度 A
-      - depot: (dx,dy,t)
-      - labels_ak: List[List[int]]，形状 [A,K]，值域 [0..N]（0 表示 depot，1..N 表示 nodes[0..N-1]）
+            - nodes: List[(x,y,t_arrival,c,t_due)]，长度 N
+            - node_mask: List[bool]，长度 N（可选，默认全 False）
+            - agents: List[(x,y,s)] 或旧格式 (x,y,s,t_agent)，长度 A
+            - depot: (dx,dy) 或旧格式 (dx,dy,t)
+    - labels_ak: List[List[int]]，形状 [A,K]，值域 [0..N]（0 表示 depot，1..N 表示 nodes[0..N-1]）
+    - current_time: （可选）全局时间，用于旧数据兼容
     """
     B = len(batch)
     maxN = max((len(item["nodes"]) for item in batch), default=0)
@@ -59,11 +60,29 @@ def collate_rows(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
 
     nodes = torch.zeros(B, maxN, 5, dtype=torch.float32)
     node_mask = torch.ones(B, maxN, dtype=torch.bool)
-    agents = torch.zeros(B, maxA, 4, dtype=torch.float32)
-    depot = torch.zeros(B, 1, 3, dtype=torch.float32)
+    agents = torch.zeros(B, maxA, 3, dtype=torch.float32)
+    agent_times = torch.zeros(B, maxA, dtype=torch.float32)
+    depot = torch.zeros(B, 1, 2, dtype=torch.float32)
     labels_ak = torch.full((B, maxA, maxK), fill_value=-1, dtype=torch.long)
     valid_N = torch.zeros(B, dtype=torch.long)
     cap_full = torch.zeros(B, maxA, dtype=torch.float32)
+
+    def _row_default_time(it: Dict[str, Any]) -> float:
+        if it.get("current_time") is not None:
+            return float(it["current_time"])
+        return float(it.get("planner_inputs", {}).get("time", 0.0))
+
+    def _split_agent(entry: Any, fallback_time: float) -> Tuple[float, float, float, float]:
+        if isinstance(entry, torch.Tensor):
+            entry = entry.tolist()
+        elif isinstance(entry, tuple):
+            entry = list(entry)
+        if len(entry) >= 4:
+            ax, ay, s, ta = entry[:4]
+        else:
+            ax, ay, s = entry[:3]
+            ta = fallback_time
+        return float(ax), float(ay), float(s), float(ta)
 
     for b, item in enumerate(batch):
         Ni = len(item["nodes"])
@@ -74,17 +93,22 @@ def collate_rows(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
             node_mask[b, :Ni] = mask_i
 
         # agents
+        default_time = _row_default_time(item)
         if "agents" in item and item["agents"] is not None:
             A_i = len(item["agents"]) if isinstance(item["agents"], (list, tuple)) else 1
             for a in range(min(maxA, A_i)):
-                ax, ay, s, ta = item["agents"][a]
-                agents[b, a] = torch.tensor([ax, ay, s, ta], dtype=torch.float32)
+                agent_entry = item["agents"][a]
+                ax, ay, s, ta = _split_agent(agent_entry, default_time)
+                agents[b, a] = torch.tensor([ax, ay, s], dtype=torch.float32)
+                agent_times[b, a] = float(ta)
         elif "agent" in item and item["agent"] is not None:
-            ax, ay, s, ta = item["agent"]
-            agents[b, 0] = torch.tensor([ax, ay, s, ta], dtype=torch.float32)
+            ax, ay, s, ta = _split_agent(item["agent"], default_time)
+            agents[b, 0] = torch.tensor([ax, ay, s], dtype=torch.float32)
+            agent_times[b, 0] = float(ta)
 
-        dx, dy, td = item["depot"]
-        depot[b, 0] = torch.tensor([dx, dy, td], dtype=torch.float32)
+        depot_entry = item["depot"]
+        dx, dy = depot_entry[:2]
+        depot[b, 0] = torch.tensor([dx, dy], dtype=torch.float32)
 
         # labels
         if "labels_ak" in item:
@@ -116,8 +140,9 @@ def collate_rows(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     return {
         "nodes": nodes,
         "node_mask": node_mask,
-        "agents": agents,        # [B,A,4]
-        "depot": depot,          # [B,1,3]
+        "agents": agents,        # [B,A,3]
+        "agent_times": agent_times,  # [B,A]
+        "depot": depot,          # [B,1,2]
         "labels_ak": labels_ak,  # [B,A,K]
         "valid_N": valid_N,
         "cap_full": cap_full,    # [B,A]
@@ -177,6 +202,10 @@ def evaluate(model: DVRPNet, loader: DataLoader, device: torch.device, lateness_
         nodes = batch["nodes"].to(device)
         node_mask = batch["node_mask"].to(device)
         agents = batch["agents"].to(device)
+        agent_times = batch.get("agent_times")
+        if agent_times is None:
+            agent_times = torch.zeros(agents.size(0), agents.size(1), dtype=torch.float32)
+        agent_times = agent_times.to(device).clone()
         depot = batch["depot"].to(device)
         labels_ak = batch["labels_ak"].to(device)  # [B,A,K]
 
@@ -203,6 +232,7 @@ def evaluate(model: DVRPNet, loader: DataLoader, device: torch.device, lateness_
                     node_mask=cur_mask,
                     enc_agents=enc_agents,
                     agents_tensor=ag,
+                    agent_times=agent_times,
                     nodes=nodes,
                     lateness_lambda=lateness_lambda,
                     history_indices=None,
@@ -287,7 +317,7 @@ def evaluate(model: DVRPNet, loader: DataLoader, device: torch.device, lateness_
                     cur_xy = ag[b, a, :2].long()
                     dt = (cur_xy[0] - dest_xy[0]).abs() + (cur_xy[1] - dest_xy[1]).abs()
                     ag[b, a, :2] = dest_xy.to(ag.dtype)
-                    ag[b, a, 3] = ag[b, a, 3] + dt.to(ag.dtype)
+                    agent_times[b, a] = agent_times[b, a] + dt.to(agent_times.dtype)
                     if 1 <= idx <= Nn:
                         d = nodes[b, idx - 1, 3].item()
                         ag[b, a, 2] = torch.clamp(ag[b, a, 2] - d, min=0.0)
@@ -333,6 +363,10 @@ def main():
                 nodes = batch["nodes"].to(device)
                 node_mask = batch["node_mask"].to(device)
                 agents = batch["agents"].to(device)
+                agent_times = batch.get("agent_times")
+                if agent_times is None:
+                    agent_times = torch.zeros(agents.size(0), agents.size(1), dtype=torch.float32)
+                agent_times = agent_times.to(device).clone()
                 depot = batch["depot"].to(device)
                 labels_ak = batch["labels_ak"].to(device)  # [B,A,K]
                 valid_N = batch["valid_N"].to(device)
@@ -368,6 +402,7 @@ def main():
                             node_mask=cur_mask,
                             enc_agents=enc_agents,
                             agents_tensor=ag,
+                            agent_times=agent_times,
                             nodes=nodes,
                             lateness_lambda=args.lateness_lambda,
                             history_indices=None,
@@ -450,7 +485,7 @@ def main():
                             cur_xy = ag[b, a, :2].long()
                             dt = (cur_xy[0] - dest_xy[0]).abs() + (cur_xy[1] - dest_xy[1]).abs()
                             ag[b, a, :2] = dest_xy.to(ag.dtype)
-                            ag[b, a, 3] = ag[b, a, 3] + dt.to(ag.dtype)
+                            agent_times[b, a] = agent_times[b, a] + dt.to(agent_times.dtype)
                             if 1 <= idx <= Nn:
                                 d = nodes[b, idx - 1, 3].item()
                                 ag[b, a, 2] = torch.clamp(ag[b, a, 2] - d, min=0.0)

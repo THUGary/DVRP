@@ -20,6 +20,7 @@ class RolloutStep:
     actions: torch.Tensor
     log_prob: torch.Tensor
     value: torch.Tensor
+    current_time: torch.Tensor
     reward: float
     done: bool
 
@@ -48,6 +49,7 @@ class RolloutBuffer:
         actions: torch.Tensor,
         log_prob_sum: torch.Tensor,
         value: torch.Tensor,
+        current_time: torch.Tensor | float | int,
         reward: float,
         done: bool,
     ) -> None:
@@ -70,6 +72,10 @@ class RolloutBuffer:
         logp_cpu = log_prob_sum.detach().cpu().clone()
         value_cpu = value.detach().cpu().clone()
 
+        if isinstance(current_time, torch.Tensor):
+            time_cpu = current_time.detach().cpu().clone().float()
+        else:
+            time_cpu = torch.tensor(float(current_time), dtype=torch.float32)
         step = RolloutStep(
             step_index=step_index,
             feats=feats_cpu,
@@ -77,6 +83,7 @@ class RolloutBuffer:
             actions=actions_cpu,
             log_prob=logp_cpu,
             value=value_cpu,
+            current_time=time_cpu,
             reward=float(reward),
             done=bool(done),
         )

@@ -119,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     """
     p = argparse.ArgumentParser(description="RL fine-tuning for DVRPNet (policy gradient)")
     p.add_argument("--episodes", type=int, default=200, help="Number of training episodes")
-    p.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
+    p.add_argument("--lr", type=float, default=3e-5, help="Learning rate")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     # If the flag is omitted entirely we do NOT warm-start.
@@ -134,18 +134,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ppo_diag_plot", type=str, default="runs/ppo_diagnostics.png", help="Path to save PPO diagnostic plot (ratio mean/std + value loss)")
     p.add_argument("--algo", type=str, default="reinforce", choices=["reinforce", "ppo"], help="Policy gradient algorithm to use")
     p.add_argument("--gamma", type=float, default=0.99, help="Discount factor for returns")
-    p.add_argument("--ppo_epochs", type=int, default=4, help="Number of PPO epochs per episode")
+    p.add_argument("--ppo_epochs", type=int, default=6, help="Number of PPO epochs per episode")
     p.add_argument("--ppo_batch_size", type=int, default=32, help="Mini-batch size for PPO updates")
-    p.add_argument("--ppo_clip", type=float, default=0.2, help="Clipping epsilon for PPO objective")
+    p.add_argument("--ppo_clip", type=float, default=0.25, help="Clipping epsilon for PPO objective")
+    p.add_argument("--value_clip", type=float, default=0.2, help="Value clipping epsilon (PPO2 style)")
     p.add_argument("--value_lr", type=float, default=1e-4, help="Learning rate for the value critic (PPO)")
     p.add_argument("--value_coef", type=float, default=0.5, help="Weight for value loss in PPO")
     p.add_argument("--entropy_coef", type=float, default=0.01, help="Entropy bonus coefficient for PPO")
-    p.add_argument("--normalize_adv", action="store_true", help="Normalize advantages before PPO update")
+    p.add_argument("--normalize_adv", action="store_true", help="(Deprecated) explicit flag to enable advantage normalization")
+    p.add_argument("--disable_adv_norm", action="store_true", help="Disable advantage normalization/whitening")
     p.add_argument("--target_queue_len", type=int, default=1, help="Length of autoregressive target queue to propose per agent")
     p.add_argument("--debug", action="store_true", help="Enable per-step debug printing of observed demands and new demands")
     p.add_argument("--deterministic", action="store_true", help="Enable deterministic torch/CuDNN behavior (may reduce performance)")
     p.add_argument("--tb_logdir", type=str, default="runs/tb", help="TensorBoard log directory (empty string to disable)")
-    return p.parse_args()
+    args = p.parse_args()
+    disable_norm = getattr(args, "disable_adv_norm", False)
+    if getattr(args, "normalize_adv", False):
+        disable_norm = False
+    args.normalize_adv = not disable_norm
+    return args
 
 
 def main() -> None:
@@ -241,6 +248,9 @@ def main() -> None:
     ratio_mean_history: List[float] = []
     ratio_std_history: List[float] = []
     value_loss_history: List[float] = []
+    approx_kl_history: List[float] = []
+    entropy_history: List[float] = []
+    success_history: List[float] = []
 
     for ep in range(1, args.episodes + 1):
         rl_algo.begin_episode(ep)
@@ -305,8 +315,9 @@ def main() -> None:
                 continue
 
             feats = prepare_features(nodes=[nodes_list], node_mask=[node_mask], depot=[depot], d_model=model.d_model, device=device)
-            agents = [(x, y, s, obs["time"]) for (x, y, s) in obs["agent_states"]]
+            agents = [(x, y, s) for (x, y, s) in obs["agent_states"]]
             agents_t = prepare_agents([agents], device=device)
+            current_time = obs["time"]
 
             # 组织历史位置序列 [B=1, A, T, 2]，无 padding（T 为各 agent 相同）
             T = max(len(h) for h in hist_pos)
@@ -332,6 +343,7 @@ def main() -> None:
                 history_positions=hp,
                 history_indices=hi,
                 target_queue_len=args.target_queue_len,
+                current_time=current_time,
             )
 
             if args.debug:
@@ -362,6 +374,7 @@ def main() -> None:
             record = DecisionRecord(
                 step_index=len(rewards_all) - 1,
                 log_prob_sum=log_prob_sum,
+                current_time=current_time,
                 reward=reward_val,
                 done=done,
             )
@@ -391,7 +404,11 @@ def main() -> None:
                 csv_writer.writerow([ep, total_reward])
 
         env_stats = getattr(env, "_episode_stats", {})
-        stats = rl_algo.end_episode(total_reward, rewards_all, dones_all, env_stats)
+        stats = rl_algo.end_episode(total_reward, rewards_all, dones_all, env_stats) or {}
+        demand_count_ep = env_stats.get("demand_count", 0)
+        served_count_ep = env_stats.get("served_count", 0)
+        success_rate = (served_count_ep / demand_count_ep) if demand_count_ep else 0.0
+        stats["success_rate"] = success_rate
         msg = format_metrics(stats)
         print(f"[EP {ep:04d}] return={total_reward:.5f}{msg}")
 
@@ -402,6 +419,12 @@ def main() -> None:
                 ratio_std_history.append(float(stats["ratio_std"]))
             if "value_loss" in stats:
                 value_loss_history.append(float(stats["value_loss"]))
+            if "approx_kl" in stats:
+                approx_kl_history.append(float(stats["approx_kl"]))
+            if "entropy" in stats:
+                entropy_history.append(float(stats["entropy"]))
+        if "success_rate" in stats:
+            success_history.append(float(stats["success_rate"]))
 
         if total_reward > best_return:
             best_return = total_reward
@@ -433,6 +456,7 @@ def main() -> None:
             writer.add_scalar("expired/capacity", expired_capacity, ep)
             writer.add_scalar("ratio/served_capacity_ratio", served_ratio, ep)
             writer.add_scalar("ratio/depot_ratio", depot_ratio, ep)
+            writer.add_scalar("episode/success_rate", success_rate, ep)
             if capacity_reward_term is not None:
                 writer.add_scalar("reward_parts/capacity_reward_term", capacity_reward_term, ep)
             if expired_penalty_mag is not None:
@@ -443,6 +467,11 @@ def main() -> None:
                 writer.add_scalar("reward_parts/exploration_penalty_value", exploration_penalty_value, ep)
             if pairwise_penalty_value is not None:
                 writer.add_scalar("reward_parts/pairwise_penalty_value", pairwise_penalty_value, ep)
+            if stats:
+                if "approx_kl" in stats:
+                    writer.add_scalar("ppo/approx_kl", stats["approx_kl"], ep)
+                if "entropy" in stats:
+                    writer.add_scalar("ppo/entropy", stats["entropy"], ep)
             writer.flush()
 
     if reward_history and args.reward_plot:
@@ -464,6 +493,8 @@ def main() -> None:
         ax1.plot(episodes_logged, ratio_mean_history, label="ratio_mean", color="tab:blue")
         if ratio_std_history:
             ax1.plot(episodes_logged[:len(ratio_std_history)], ratio_std_history, label="ratio_std", color="tab:orange")
+        if approx_kl_history:
+            ax1.plot(episodes_logged[:len(approx_kl_history)], approx_kl_history, label="approx_kl", color="tab:red", linestyle="--")
         ax1.set_xlabel("Episode")
         ax1.set_ylabel("Ratio stats")
         ax1.grid(True, linestyle="--", linewidth=0.5)
@@ -472,6 +503,8 @@ def main() -> None:
         if value_loss_history:
             ax2.plot(episodes_logged[:len(value_loss_history)], value_loss_history, label="value_loss", color="tab:green")
             ax2.set_ylabel("Value loss")
+        if entropy_history:
+            ax2.plot(episodes_logged[:len(entropy_history)], entropy_history, label="entropy", color="tab:purple", linestyle=":")
 
         lines_labels = ax1.get_legend_handles_labels()
         if value_loss_history:

@@ -64,21 +64,48 @@ def prepare_features(
 
 
 def prepare_agents(agents, device: str | torch.device = "cpu") -> torch.Tensor:
-    """
-    将 agents 转为张量（只做形状与 dtype 规整，不做特征工程）。
-    返回 [B, A, 4] float32，其中四维约定为 (x, y, s, t_agent) 。
-    """
+    """将 agents 转成张量，约定特征为 (x, y, s)。"""
     dev = torch.device(device)
     if isinstance(agents, torch.Tensor):
         t = agents.to(dev)
-        if t.dim() == 2:
-            t = t.unsqueeze(0)  # [1, A, 4]
-        return t
     else:
         t = torch.tensor(agents, dtype=torch.float32, device=dev)
-        if t.dim() == 2:
-            t = t.unsqueeze(0)
-        return t
+    if t.dim() == 2:
+        t = t.unsqueeze(0)
+    # 兼容旧格式：若存在第 4 维 (t_agent)，直接丢弃
+    if t.size(-1) > 3:
+        t = t[..., :3]
+    return t
+
+
+def _broadcast_time_like(
+    current_time: torch.Tensor | float | int,
+    batch_size: int,
+    num_agents: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """将标量/向量时间展开为 [B,A] 形状。"""
+    if current_time is None:
+        raise ValueError("current_time must be provided when computing lateness penalties.")
+    if isinstance(current_time, torch.Tensor):
+        t = current_time.to(device=device, dtype=dtype)
+    else:
+        t = torch.tensor(current_time, dtype=dtype, device=device)
+    if t.dim() == 0:
+        t = t.view(1)
+    numel = t.numel()
+    if numel == 1:
+        t = t.view(1, 1).expand(batch_size, num_agents).clone()
+    elif numel == batch_size:
+        t = t.view(batch_size, 1).expand(batch_size, num_agents).clone()
+    elif numel == batch_size * num_agents:
+        t = t.view(batch_size, num_agents)
+    else:
+        raise ValueError(
+            f"current_time shape incompatible with batch. Expected 1, B or B*A elements, got {numel}."
+        )
+    return t
 
 
 class DVRPNet(nn.Module):
@@ -122,6 +149,7 @@ class DVRPNet(nn.Module):
         node_mask: torch.Tensor,
         enc_agents: torch.Tensor,
         agents_tensor: Optional[torch.Tensor] = None,
+        agent_times: torch.Tensor | float | int | None = None,
         nodes: Optional[torch.Tensor] = None,
         lateness_lambda: float = 0.0,
         history_indices: Optional[torch.Tensor] = None,
@@ -133,7 +161,7 @@ class DVRPNet(nn.Module):
           - enc_nodes: [B, N, d]
           - enc_depot: [B, 1, d]
           - node_mask: [B, N] (bool) True=屏蔽/已选
-          - agents_tensor: [B, A, 4]  (x, y, s, t_agent)
+          - agents_tensor: [B, A, 3]  (x, y, s)
           - nodes: [B, N, 5]（可选，仅用于迟到惩罚计算）
                 返回：
                     - logits: [B, A, N+1]，按 [depot, nodes...]
@@ -156,13 +184,16 @@ class DVRPNet(nn.Module):
 
             # 1) 迟到惩罚（soft TW）
             if lateness_lambda and lateness_lambda > 0:
+                if agent_times is None:
+                    raise ValueError("agent_times must be provided when lateness_lambda > 0.")
+                agent_times_t = _broadcast_time_like(agent_times, B, A, agents_tensor.device, agents_tensor.dtype)
                 ax = agents_tensor[..., 0].unsqueeze(-1)  # [B,A,1]
                 ay = agents_tensor[..., 1].unsqueeze(-1)  # [B,A,1]
                 nx = nodes[..., 0].unsqueeze(1)          # [B,1,N]
                 ny = nodes[..., 1].unsqueeze(1)          # [B,1,N]
                 t_due = nodes[..., 4].unsqueeze(1)       # [B,1,N]
                 dist = (ax - nx).abs() + (ay - ny).abs()  # [B,A,N]
-                t_agent = agents_tensor[..., 3].unsqueeze(-1)  # [B,A,1]
+                t_agent = agent_times_t.unsqueeze(-1)            # [B,A,1]
                 eta = t_agent + dist                             # [B,A,N]
                 lateness = torch.clamp(eta - t_due, min=0.0)     # [B,A,N]
                 logits_nodes = logits_nodes - lateness_lambda * lateness
@@ -188,19 +219,20 @@ class DVRPNet(nn.Module):
         self,
         *,
         feats: Dict[str, torch.Tensor],
-        agents: torch.Tensor,        # [B, A, 4]
+        agents: torch.Tensor,        # [B, A, 3]
         k: int,                      # 规划未来 k 步
         lateness_lambda: float = 0.0,
         cap_full: torch.Tensor,       # [B,A]，必须由构造时提供的 full_capacity 指定（来自 Config.capacity）
+        current_time: torch.Tensor | float | int = 0,
     ) -> Dict[str, torch.Tensor]:
         """
         流程：
           1) 对静态信息（nodes/depot/mask）编码一次
           2) 重复 k 次：对所有 agent 同步解码一步，选 argmax；将选中的节点加入全局 mask；
              并基于选中目标更新每个 agent 的 (x,y,t)。
-        输入：
-          feats: {nodes[B,N,5], node_mask[B,N](bool), depot[B,1,3]}
-          agents: [B,A,4] (x,y,s,t)
+                输入：
+                    feats: {nodes[B,N,5], node_mask[B,N](bool), depot[B,1,2]}
+                    agents: [B,A,3] (x,y,s)
                 输出：
                     { "indices": [B,A,k] (每步选择的索引，0 表示 depot，1..N 表示 nodes[0..N-1]),
             "coords":  [B,A,k,2] (每步目标坐标) }
@@ -218,7 +250,8 @@ class DVRPNet(nn.Module):
         A = agents.size(1)
 
         # 状态拷贝（避免原地覆盖调用者张量）
-        ag = agents.clone()  # [B,A,4]
+        ag = agents.clone()  # [B,A,3]
+        agent_times = _broadcast_time_like(current_time, B, A, ag.device, ag.dtype)
         # cap_full must be provided by caller (来自 Config.capacity)。禁止退化为 agent 初始 s
         if cap_full is None:
             raise RuntimeError("cap_full (full capacity) must be provided to DVRPNet.forward — no fallback to agent initial s. Pass Config.capacity as cap_full.")
@@ -239,6 +272,7 @@ class DVRPNet(nn.Module):
                 node_mask=mask,
                 enc_agents=enc_agents,
                 agents_tensor=ag,
+                agent_times=agent_times,
                 nodes=nodes,
                 lateness_lambda=lateness_lambda,
                 history_indices=None,
@@ -306,7 +340,7 @@ class DVRPNet(nn.Module):
             cur_xy = ag[..., :2].long()            # [B,A,2]
             dist = self._manhattan(cur_xy, dest_xy).to(ag.dtype)  # [B,A]
             ag[..., 0:2] = dest_xy.to(ag.dtype)
-            ag[..., 3] = ag[..., 3] + dist
+            agent_times = agent_times + dist
             if N > 0:
                 for b in range(B):
                     for aidx in range(A):
@@ -324,19 +358,21 @@ class DVRPNet(nn.Module):
         self,
         feats: Dict[str, torch.Tensor],
         lateness_lambda: float = 0.0,
-        current_time: float | int = 0,
+        current_time: torch.Tensor | float | int = 0,
     ) -> torch.Tensor:
         if "agents" not in feats:
-            raise ValueError("decode_step requires 'agents' tensor in feats; include feats['agents'] of shape [B,A,4].")
+            raise ValueError("decode_step requires 'agents' tensor in feats; include feats['agents'] of shape [B,A,3].")
         enc = self.encode(feats)
         agents_tensor = feats["agents"]
         enc_agents = self.encoder.encode_agents(agents_tensor)
+        agent_times = _broadcast_time_like(current_time, agents_tensor.size(0), agents_tensor.size(1), agents_tensor.device, agents_tensor.dtype)
         logits = self.decode(
             enc_nodes=enc["H_nodes"],
             enc_depot=enc["H_depot"],
             node_mask=enc["node_mask"],
             enc_agents=enc_agents,
             agents_tensor=agents_tensor,
+            agent_times=agent_times,
             nodes=feats.get("nodes"),
             lateness_lambda=lateness_lambda,
             history_indices=None,

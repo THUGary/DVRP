@@ -13,6 +13,7 @@ class DecisionRecord:
 
 	step_index: int
 	log_prob_sum: torch.Tensor
+	current_time: float | int | torch.Tensor | None = None
 	feats: Optional[Dict[str, torch.Tensor]] = None
 	agents: Optional[torch.Tensor] = None
 	actions: Optional[torch.Tensor] = None

@@ -185,10 +185,10 @@ def collect_rows_from_call(
     A = len(agent_states_xyz)
 
     # agents 列表与二位标签 [A, K]
-    agents_list: List[Tuple[int, int, int, int]] = []
+    agents_list: List[Tuple[int, int, int]] = []
     labels_ak: List[List[int]] = []
     for agent_id, (ax, ay, s) in enumerate(agent_states_xyz):
-        agents_list.append((ax, ay, s, time_now))
+        agents_list.append((ax, ay, s))
         labels_k = _targets_to_k_labels(targets[agent_id], nodes_unique, k)
         # debug
         # print(f"Agent {agent_id} targets: {list(targets[agent_id])} -> labels: {labels_k}")
@@ -198,11 +198,12 @@ def collect_rows_from_call(
     row: Dict[str, Any] = {
         "nodes": nodes_unique,                    # List[(x, y, t_arrival, c, t_due)]
         "node_mask": [False] * N,                 # 简化版，全部可选；pad 时会额外mask
-        "agents": agents_list,                    # List[(x, y, s, t_agent)], 长度 A
-        "depot": (depot_xy[0], depot_xy[1], time_now),
+        "agents": agents_list,                    # List[(x, y, s)], 长度 A
+        "depot": (depot_xy[0], depot_xy[1]),
         "labels_ak": labels_ak,                   # List[List[int]], 形状 [A, K]，N==depot
         "full_capacity": int(full_capacity),      # 每个 agent 回 depot 恢复的满容量
         "valid_N": N,
+        "current_time": time_now,
         "planner_inputs": {
             "time": time_now,
             "k": k,
@@ -227,7 +228,7 @@ def collect_rows_from_call(
     # 若命中某节点 i (1<=i<=N)，则需要 nodes_unique[i-1][3] <= 当前空间。
     try:
         demands_vec = [int(x[3]) for x in nodes_unique]  # c 字段
-        for a_idx, (ax, ay, s, _ta) in enumerate(agents_list):
+        for a_idx, (ax, ay, s) in enumerate(agents_list):
             space = int(s)
             trace_space_before: List[int] = []
             trace_space_after: List[int] = []

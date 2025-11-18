@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 import torch
 
@@ -23,16 +23,17 @@ class ReinforceAlgorithm(RLAlgorithm):
 		self.logprob_traj: List[torch.Tensor] = []
 		self.critic = PairwiseGraphCritic(agent_dim=4, hidden_dim=max(128, getattr(model, "d_model", 128))).to(device)
 		self.critic.eval()  # currently unused for training
-		self._tmp_agents: List[torch.Tensor] = []
+		self._tmp_snapshots: List[Tuple[torch.Tensor, float]] = []
 
 	def begin_episode(self, episode_idx: int) -> None:
 		self.logprob_traj = []
-		self._tmp_agents = []
+		self._tmp_snapshots = []
 
 	def record_decision(self, record: DecisionRecord) -> None:
 		self.logprob_traj.append(record.log_prob_sum)
 		if record.agents is not None:
-			self._tmp_agents.append(record.agents)
+			time_val = float(record.current_time) if record.current_time is not None else 0.0
+			self._tmp_snapshots.append((record.agents, time_val))
 
 	def end_episode(
 		self,
@@ -64,10 +65,17 @@ class ReinforceAlgorithm(RLAlgorithm):
 
 		# Optional: compute critic estimates for logging (no grad)
 		critic_value = 0.0
-		if self._tmp_agents:
+		if self._tmp_snapshots:
 			with torch.no_grad():
-				agents_cat = torch.stack(self._tmp_agents, dim=0).to(self.device)  # [T,B,A,F] or [T,A,F]
-				# flatten time and maybe batch dims for a simple summary
+				agents_aug = []
+				for snap_agents, snap_time in self._tmp_snapshots:
+					time_tensor = torch.full(
+						(snap_agents.size(0), snap_agents.size(1), 1),
+						float(snap_time),
+						dtype=snap_agents.dtype,
+					)
+					agents_aug.append(torch.cat([snap_agents, time_tensor], dim=-1))
+				agents_cat = torch.stack(agents_aug, dim=0).to(self.device)
 				agents_flat = agents_cat.view(-1, agents_cat.size(-2), agents_cat.size(-1))
 				v = self.critic(agents_flat)
 				critic_value = float(v.mean().cpu().item())
