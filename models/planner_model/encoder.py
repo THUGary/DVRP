@@ -3,12 +3,11 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from .layers import TransformerBlock
 
 
 class Encoder(nn.Module):
     """
-    仅编码 nodes 与 depot 的 Encoder，并提供 agents 的编码接口（迁移自 Decoder）。
+    仅编码 nodes 与 depot 的 Encoder。
 
     输入（张量）:
       - nodes:     [B, N, 5]   (x, y, t_arrival, c/demand, t_due) — 顺序按仓库现有用法即可
@@ -29,72 +28,33 @@ class Encoder(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(d_model, d_model),
         )
-        self.depot_proj = nn.Sequential(
-            nn.Linear(2, d_model),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model, d_model),
-        )
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, batch_first=True, norm_first=True
         )
-        self.node_stack = nn.TransformerEncoder(encoder_layer, num_layers=nlayers)
-
-        # 可选：对 depot 做轻量变换（保持维度）
-        self.depot_norm = nn.LayerNorm(d_model)
-
-        # === Agents 编码（从 Decoder 迁移过来） ===
-        # Agent 编码块：Embedding + Self-Attn + FFN（Transformer 风格：残差 + Norm）
-        self.agent_mlp = nn.Sequential(
-            nn.Linear(4, d_model),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model, d_model),
-        )
-        # Agent block: use reusable TransformerBlock (pre-LN, attn+FFN)
-        self.agent_block = TransformerBlock(d_model, nhead, dim_ff=d_model * 4)
+        self.node_stack = nn.TransformerEncoder(encoder_layer, num_layers=nlayers, norm=nn.LayerNorm(d_model))
 
     def forward(self, feats: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         nodes: torch.Tensor = feats["nodes"]            # [B, N, 5]
         node_mask: torch.Tensor = feats["node_mask"]    # [B, N] (bool)
         depot: torch.Tensor = feats["depot"]            # [B, 1, 2]
 
-        H_nodes_in = self.node_proj(nodes)                 # [B, N, d]
-        # 将 node_mask 作为 key_padding_mask 传入，True=pad/屏蔽
-        # 当某个样本的所有 nodes 都被屏蔽（全 True）时，TransformerEncoder 的注意力可能产生 NaN。
-        # 为此做安全处理：对“全被屏蔽”的样本，直接输出 0 向量；其余样本正常通过 encoder。
-        B, N, d = H_nodes_in.shape
-        if N == 0:
-            H_nodes = H_nodes_in  # 空序列，直接返回（形状 [B,0,d]）
-        else:
-            all_masked = node_mask.all(dim=1)  # [B]
-            if all_masked.any():
-                H_nodes = torch.zeros_like(H_nodes_in)
-                # 仅对非全屏蔽样本做编码
-                keep_idx = (~all_masked).nonzero(as_tuple=False).squeeze(1)
-                if keep_idx.numel() > 0:
-                    H_nodes_keep = self.node_stack(
-                        H_nodes_in.index_select(0, keep_idx),
-                        src_key_padding_mask=node_mask.index_select(0, keep_idx),
-                    )
-                    H_nodes.index_copy_(0, keep_idx, H_nodes_keep)
-                # 全屏蔽样本保持 0 向量（安全，不含 NaN）
-            else:
-                H_nodes = self.node_stack(H_nodes_in, src_key_padding_mask=node_mask)
+        B, N, _ = nodes.shape
 
-        H_depot = self.depot_proj(depot)                # [B, 1, d]
-        H_depot = self.depot_norm(H_depot)
+        # 将 depot 视作额外一个“节点”，补齐 (x, y, 0, 0, 0)
+        depot_feats = torch.zeros(B, 1, 5, device=nodes.device, dtype=nodes.dtype)
+        depot_feats[..., :2] = depot
+        # TODO： Depot 的 due_time 设为稍大于 max_time 的值（例如 200），避免数值过大导致不稳定
+        depot_feats[..., 4:] = 200.0
+        tokens = torch.cat([depot_feats, nodes], dim=1)  # [B, 1+N, 5]
 
+        H_tokens_in = self.node_proj(tokens)
+        token_mask = torch.cat([
+            torch.zeros(B, 1, dtype=torch.bool, device=node_mask.device),
+            node_mask,
+        ], dim=1)  # [B, 1+N]
+
+        H_tokens = self.node_stack(H_tokens_in, src_key_padding_mask=token_mask)
+        H_depot = H_tokens[:, :1, :]
+        H_nodes = H_tokens[:, 1:, :]
         return H_nodes, H_depot, node_mask
-
-    def encode_agents(self, agents_tensor: torch.Tensor) -> torch.Tensor:
-        """
-        将 agents 状态编码为 [B, A, d] 表征。
-        输入: agents_tensor [B, A, 4]，四维含义为 (x, y, s, t_agent)
-        """
-        if agents_tensor is None:
-            raise ValueError("encode_agents requires agents_tensor with shape [B,A,4]")
-        h = self.agent_mlp(agents_tensor)                        # [B, A, d]
-        # Apply LayerNorm -> Attention -> LayerNorm -> FFN (pre-norm before each sublayer)
-        # Use the TransformerBlock wrapper which performs pre-LN -> Attn -> pre-LN -> FFN with residuals
-        h = self.agent_block(h)
-        return h

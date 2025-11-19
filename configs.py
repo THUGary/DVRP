@@ -35,7 +35,7 @@ class Config:
     exploration_penalty_scale: float = 0.0  # 先关掉探索惩罚
 
     # Generator params
-    generator_type: str = "net"  # "rule" | "net"
+    generator_type: str = "rule"  # "rule" | "net"
     generator_params: Dict[str, Any] = field(default_factory=lambda: {
         "max_per_step": 2, # not used in rule-based generator
         "depot": "__depot__",  # placeholder to be replaced with Config.depot (accepts "__depot__" or "__DEPOT__")
@@ -66,7 +66,7 @@ class Config:
         "d_model": 128,
         "nhead": 8,
         "nlayers": 2,
-        "ckpt": "checkpoints/planner_rl_best.pt",
+        "ckpt": "checkpoints/planner/planner_rl_300.pt",
     })
 
     # Controller params

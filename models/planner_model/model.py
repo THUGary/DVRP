@@ -108,11 +108,11 @@ class DVRPNet(nn.Module):
         H_nodes, H_depot, node_mask = self.encoder(feats)
         return {"H_nodes": H_nodes, "H_depot": H_depot, "node_mask": node_mask}
 
-    @torch.no_grad()
-    def encode_agents(self, agents_tensor: torch.Tensor) -> torch.Tensor:
-        """将 agents 状态编码为 [B, A, d]。
-        """
-        return self.encoder.encode_agents(agents_tensor)
+    # @torch.no_grad()
+    # def encode_agents(self, agents_tensor: torch.Tensor) -> torch.Tensor:
+    #     """将 agents 状态编码为 [B, A, d]。
+    #     """
+    #     return self.decoder.encode_agents(agents_tensor)
 
     def decode(
         self,
@@ -120,31 +120,34 @@ class DVRPNet(nn.Module):
         enc_nodes: torch.Tensor,
         enc_depot: torch.Tensor,
         node_mask: torch.Tensor,
-        enc_agents: torch.Tensor,
         agents_tensor: Optional[torch.Tensor] = None,
         nodes: Optional[torch.Tensor] = None,
         lateness_lambda: float = 0.0,
-        history_indices: Optional[torch.Tensor] = None,
         history_positions: Optional[torch.Tensor] = None,
+        history_target_coords: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         仅执行解码一步：输入为 encode 后的张量与当前 agents 状态。
-        参数：
-          - enc_nodes: [B, N, d]
-          - enc_depot: [B, 1, d]
-          - node_mask: [B, N] (bool) True=屏蔽/已选
-          - agents_tensor: [B, A, 4]  (x, y, s, t_agent)
-          - nodes: [B, N, 5]（可选，仅用于迟到惩罚计算）
+                参数：
+                    - enc_nodes: [B, N, d]
+                    - enc_depot: [B, 1, d]
+                    - node_mask: [B, N] (bool) True=屏蔽/已选
+                    - agents_tensor: [B, A, 4]  (x, y, s, t_agent)
+                    - nodes: [B, N, 5]（可选，仅用于迟到惩罚计算）
+                    - history_positions/history_target_coords: [B, A, T, 2]
                 返回：
                     - logits: [B, A, N+1]，按 [depot, nodes...]
         """
+        if agents_tensor is None:
+            raise ValueError("decode requires agents_tensor with shape [B,A,4]")
+
         logits = self.decoder(
             enc_nodes=enc_nodes,
             enc_depot=enc_depot,
             node_mask=node_mask,
-            enc_agents=enc_agents,
-            history_indices=history_indices,
+            agents_tensor=agents_tensor,
             history_positions=history_positions,
+            history_target_coords=history_target_coords,
         )  # [B, A, N+1]
 
         # 若提供 nodes，可对 nodes 段施加时间窗惩罚与容量可行性屏蔽
@@ -232,16 +235,15 @@ class DVRPNet(nn.Module):
 
         for step in range(k):
             # 单次 decode，随后基于置信度贪心分配，避免同一步冲突
-            enc_agents = self.encoder.encode_agents(ag)
             logits = self.decode(
                 enc_nodes=Hn,
                 enc_depot=Hd,
                 node_mask=mask,
-                enc_agents=enc_agents,
                 agents_tensor=ag,
                 nodes=nodes,
                 lateness_lambda=lateness_lambda,
-                history_indices=None,
+                history_positions=None,
+                history_target_coords=None,
             )  # [B,A,N+1]
 
             sel = torch.full((B, A), N, dtype=torch.long, device=nodes.device)
@@ -330,16 +332,13 @@ class DVRPNet(nn.Module):
             raise ValueError("decode_step requires 'agents' tensor in feats; include feats['agents'] of shape [B,A,4].")
         enc = self.encode(feats)
         agents_tensor = feats["agents"]
-        enc_agents = self.encoder.encode_agents(agents_tensor)
         logits = self.decode(
             enc_nodes=enc["H_nodes"],
             enc_depot=enc["H_depot"],
             node_mask=enc["node_mask"],
-            enc_agents=enc_agents,
             agents_tensor=agents_tensor,
             nodes=feats.get("nodes"),
             lateness_lambda=lateness_lambda,
-            history_indices=None,
         )  # [B,A,N+1]
         # 历史用法假定 A==1 并返回 [B,N+1]
         if logits.size(1) == 1:

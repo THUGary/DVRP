@@ -267,11 +267,12 @@ def main() -> None:
 
         # 初始化历史：记录初始位置
         done = False
-        hist_pos: List[List[Tuple[int, int]]] = []  # 每个 agent 的 (x,y) 列表
-        hist_idx: List[List[int]] = []              # 每个 agent 的 选择索引序列 (0=depot,1..N=node)
+        hist_pos: List[List[Tuple[int, int]]] = []       # 每个 agent 的 (x,y) 列表
+        hist_targets: List[List[Tuple[int, int]]] = []    # 每个 agent 的目标节点 (x,y)
+        depot_xy0 = (int(obs["depot"][0]), int(obs["depot"][1]))
         for (x, y, s) in obs["agent_states"]:
             hist_pos.append([(int(x), int(y))])
-            hist_idx.append([0])  # 初始位置视作 depot
+            hist_targets.append([depot_xy0])
         depot_select_count = 0
         total_select_count = 0
         while not done:
@@ -309,28 +310,29 @@ def main() -> None:
             agents_t = prepare_agents([agents], device=device)
 
             # 组织历史位置序列 [B=1, A, T, 2]，无 padding（T 为各 agent 相同）
-            T = max(len(h) for h in hist_pos)
+            T_pos = max(len(h) for h in hist_pos)
+            T_tgt = max(len(h) for h in hist_targets)
+            T = max(T_pos, T_tgt)
             A = len(hist_pos)
             hp = torch.full((1, A, T, 2), -1, dtype=torch.float32, device=device)
-            hi = torch.full((1, A, T), -1, dtype=torch.long, device=device)
-            for a_idx, (seq_pos, seq_idx) in enumerate(zip(hist_pos, hist_idx)):
+            ht = torch.full((1, A, T, 2), -1, dtype=torch.float32, device=device)
+            for a_idx, (seq_pos, seq_tgt) in enumerate(zip(hist_pos, hist_targets)):
                 for t_idx, (px, py) in enumerate(seq_pos):
                     hp[0, a_idx, t_idx, 0] = float(px)
                     hp[0, a_idx, t_idx, 1] = float(py)
-                # 索引序列长度与位置序列一致（决策后追加），截断或填充
-                for t_idx, idx_val in enumerate(seq_idx):
-                    if t_idx < T:
-                        hi[0, a_idx, t_idx] = int(idx_val)
+                for t_idx, (tx, ty) in enumerate(seq_tgt):
+                    ht[0, a_idx, t_idx, 0] = float(tx)
+                    ht[0, a_idx, t_idx, 1] = float(ty)
 
             critic_module = getattr(rl_algo, "critic", None)
-            sel, dest_xy, log_probs, state_value, queue_indices, queue_coords = select_targets_with_sampling(
+            sel, dest_xy, log_probs, _entropies, state_value, queue_indices, queue_coords = select_targets_with_sampling(
                 model=model,
                 feats=feats,
                 agents_tensor=agents_t,
                 lateness_lambda=args.lateness_lambda,
                 critic=critic_module,
                 history_positions=hp,
-                history_indices=hi,
+                history_target_coords=ht,
                 target_queue_len=args.target_queue_len,
             )
 
@@ -371,7 +373,7 @@ def main() -> None:
                 record.actions = sel.detach().cpu().clone()
                 record.state_value = state_value.detach().cpu().clone() if state_value is not None else None
                 record.history_positions = hp.detach().cpu().clone()
-                record.history_indices = hi.detach().cpu().clone()
+                record.history_targets = ht.detach().cpu().clone()
                 record.queue_indices = queue_indices.detach().cpu().clone()
                 record.queue_coords = queue_coords.detach().cpu().clone()
             rl_algo.record_decision(record)
@@ -382,7 +384,10 @@ def main() -> None:
             # 更新历史：追加新位置（下一状态）
             # 更新历史：追加下一状态位置与本步选择的索引（sel 已对应目标点，长度与 agent 数一致）
             hist_pos = [seq + [(int(x), int(y))] for seq, (x, y, s) in zip(hist_pos, obs["agent_states"]) ]
-            hist_idx = [seq + [int(sel[0, a].item())] for a, seq in enumerate(hist_idx)]
+            hist_targets = [
+                seq + [(int(dest_xy[0, a, 0].item()), int(dest_xy[0, a, 1].item()))]
+                for a, seq in enumerate(hist_targets)
+            ]
 
         reward_history.append(total_reward)
         if args.reward_log:

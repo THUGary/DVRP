@@ -25,11 +25,11 @@ def evaluate_sample(
 	agents = sample["agents"].to(device)
 	actions = sample["actions"].to(device)
 	history_positions = sample.get("history_positions")
-	history_indices = sample.get("history_indices")
+	history_target_coords = sample.get("history_target_coords")
 	if history_positions is not None:
 		history_positions = history_positions.to(device)
-	if history_indices is not None:
-		history_indices = history_indices.to(device)
+	if history_target_coords is not None:
+		history_target_coords = history_target_coords.to(device)
 
 	if feats["nodes"].size(1) == 0:
 		B = actions.size(0)
@@ -43,17 +43,15 @@ def evaluate_sample(
 		return log_prob, entropy, value
 
 	enc_nodes, enc_depot, node_mask = model.encoder(feats)
-	enc_agents = model.encoder.encode_agents(agents)
 	logits = model.decode(
 		enc_nodes=enc_nodes,
 		enc_depot=enc_depot,
 		node_mask=node_mask,
-		enc_agents=enc_agents,
 		agents_tensor=agents,
 		nodes=feats.get("nodes"),
 		lateness_lambda=lateness_lambda,
-		history_indices=history_indices,
 		history_positions=history_positions,
+		history_target_coords=history_target_coords,
 	)
 	probs = torch.softmax(logits, dim=-1)
 	logp = torch.log_softmax(logits, dim=-1)

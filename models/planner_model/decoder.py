@@ -1,10 +1,12 @@
 from __future__ import annotations
-from typing import Tuple, Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import math
 import torch
 import torch.nn as nn
-from .layers import TransformerBlock, CrossAttentionBlock
+import warnings
+
+from .layers import CrossAttentionBlock, TransformerBlock
 
 
 class Decoder(nn.Module):
@@ -25,173 +27,191 @@ class Decoder(nn.Module):
         super().__init__()
         self.d_model = d_model
 
-        # 历史序列自注意力（可融合坐标与节点嵌入）
-        # 历史自注意力与 FFN：使用封装好的 TransformerBlock（pre-LN）
-        self.hist_block = TransformerBlock(d_model, nhead, dim_ff=d_model * 4)
-
-        # 跨 agent 的历史交互（让每个 agent 感知他人近期意图）
-        # 先将 enc_agents 与 hist_summary 融合到 d 维，再在 agent 维度做自注意力
-        self.agent_ctx_proj = nn.Sequential(
-            nn.Linear(2 * d_model, d_model),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model, d_model),
-        )
-        self.agent_ctx_norm = nn.LayerNorm(d_model)
-        # 跨-agent 交互：在 agent 维度上使用 TransformerBlock
-        self.agent_block = TransformerBlock(d_model, nhead, dim_ff=d_model * 4)
-
-        # 历史位置投影 (x,y) -> d
-        self.hist_pos_proj = nn.Sequential(
+        # 历史序列处理：将位置和节点嵌入融合后交给 TransformerBlock
+        self.history_block = TransformerBlock(d_model, nhead, dim_ff=d_model * 4)
+        self.history_pos_encoder = nn.Sequential(
             nn.Linear(2, d_model),
             nn.ReLU(inplace=True),
             nn.Linear(d_model, d_model),
         )
-        # 位置 + 节点嵌入 融合线性（拼接 2d -> d）
-        self.hist_fuse_proj = nn.Sequential(
+        self.history_target_encoder = nn.Sequential(
+            nn.Linear(2, d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_model, d_model),
+        )
+        self.history_fusion = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_model, d_model),
+        )
+        self.history_pe_projection = nn.Sequential(
             nn.Linear(2 * d_model, d_model),
             nn.ReLU(inplace=True),
             nn.Linear(d_model, d_model),
         )
 
-        # 2) 与 depot 拼接后降回 d 维
-        self.ctx_proj = nn.Sequential(
+        # 跨 agent 交互：先拼接 agent 编码和历史摘要，再用 TransformerBlock 聚合
+        self.agent_fusion = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_model, d_model),
+        )
+        self.agent_block = TransformerBlock(d_model, nhead, dim_ff=d_model * 4)
+
+        # context 构建：将 agent / depot / 历史摘要拼接压回 d 维
+        self.context_projection = nn.Sequential(
             nn.Linear(3 * d_model, d_model),
             nn.ReLU(inplace=True),
             nn.Linear(d_model, d_model),
         )
-        self.ctx_norm = nn.LayerNorm(d_model)
+        self.context_norm = nn.LayerNorm(d_model)
 
-        # Cross-Attn (Q=context, K/V=kv) + FFN (Transformer 风格)
-        # Cross-Attn (Q=context, K/V=kv) + FFN，用 CrossAttentionBlock
+        # agent 编码：从原 Encoder 迁移而来
+        self.agent_embed = nn.Sequential(
+            nn.Linear(4, d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_model, d_model),
+        )
+        self.agent_embed_block = TransformerBlock(d_model, nhead, dim_ff=d_model * 4)
+
+        # 交叉注意力：使用 CrossAttentionBlock 完成 cross-attn + FFN
         self.cross_block = CrossAttentionBlock(d_model, nhead, dim_ff=d_model * 4)
 
-        # 4) 单独的打分头（缩放点积）
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        # 最后打分头（缩放点积）
+        self.query_projection = nn.Linear(d_model, d_model, bias=False)
+        self.key_projection = nn.Linear(d_model, d_model, bias=False)
 
     def forward(
         self,
         enc_nodes: torch.Tensor,      # [B, N, d]
         enc_depot: torch.Tensor,      # [B, 1, d]
         node_mask: torch.Tensor,      # [B, N] (bool)
-        enc_agents: torch.Tensor,     # [B, A, d]
-        history_indices: Optional[torch.Tensor] = None,  # [B, A, T] (每个值为 0..N-1；若为 -1 表示 padding)
-        history_positions: Optional[torch.Tensor] = None, # [B, A, T, 2] (x,y)，若提供则优先使用
+        agents_tensor: torch.Tensor,  # [B, A, 4]
+        history_positions: Optional[torch.Tensor] = None,       # [B, A, T, 2] agent 轨迹
+        history_target_coords: Optional[torch.Tensor] = None,   # [B, A, T, 2] 目标节点坐标
     ) -> torch.Tensor:
-        B, N, d = enc_nodes.shape
-        A = enc_agents.size(1)
+        batch_size, num_nodes, d_model = enc_nodes.shape
+        num_agents = agents_tensor.size(1)
 
-        # 1) 历史编码（融合坐标 + 目标节点）
-        if (history_positions is not None and history_positions.numel() > 0) and \
-           (history_indices is not None and history_indices.numel() > 0):
-            hp = history_positions  # [B,A,T,2]
-            hi = history_indices    # [B,A,T]
-            pad_pos = (hp[..., 0] < 0) | (hp[..., 1] < 0)
-            pad_idx = hi < 0
-            pad = pad_pos | pad_idx  # 综合 padding
-            BA, T = B * A, hp.size(2)
-            # 位置嵌入
-            pos_emb = self.hist_pos_proj(hp.view(BA, T, 2))      # [BA,T,d]
-            # 节点嵌入（索引 0=depot，1..N=nodes；-1 padding）
-            idx_clamped = hi.clamp(min=0, max=N)                 # 允许取 N 表示越界暂不使用
-            # 构造包含 depot + nodes 的全集嵌入以便索引：先拼接 depot 与 nodes
-            full_nodes = torch.cat([enc_depot, enc_nodes], dim=1)  # [B,1+N,d]
-            b_idx = torch.arange(B, device=enc_nodes.device).view(B,1,1).expand(B, A, T)
-            # 防止越界：将 >N 的置为 0
-            idx_full = idx_clamped.clamp(0, N)  # depot=0, nodes=1..N
-            node_emb = full_nodes[b_idx, idx_full, :]             # [B,A,T,d]
-            node_emb = node_emb.view(BA, T, d)
-            # 融合（拼接 2d -> d）
-            fuse = torch.cat([pos_emb, node_emb], dim=-1)         # [BA,T,2d]
-            fuse = self.hist_fuse_proj(fuse)                      # [BA,T,d]
-            pe = self._build_sinusoidal_pe(T, d, fuse.device)
-            fuse = fuse + pe.unsqueeze(0)
-            # Use wrapped TransformerBlock (pre-LN attn + FFN)
-            fuse = self.hist_block(fuse, key_padding_mask=pad.view(BA, T))
-            lengths = (~pad.view(BA, T)).sum(dim=1)
-            last_idx = torch.clamp(lengths - 1, min=0)
-            arange_ba = torch.arange(BA, device=fuse.device)
-            hist_summary = fuse[arange_ba, last_idx, :].view(B, A, d)
-        elif history_positions is not None and history_positions.numel() > 0:
-            hp = history_positions
-            pad2d = (hp[..., 0] < 0) | (hp[..., 1] < 0)
-            BA, T = B * A, hp.size(2)
-            hp2d = hp.view(BA, T, 2)
-            emb = self.hist_pos_proj(hp2d)
-            pe = self._build_sinusoidal_pe(T, d, emb.device)
-            emb = emb + pe.unsqueeze(0)
-            emb = self.hist_block(emb, key_padding_mask=pad2d.view(BA, T))
-            lengths = (~pad2d.view(BA, T)).sum(dim=1)
-            last_idx = torch.clamp(lengths - 1, min=0)
-            arange_ba = torch.arange(BA, device=emb.device)
-            hist_summary = emb[arange_ba, last_idx, :].view(B, A, d)
-        elif history_indices is not None and history_indices.numel() > 0:
-            hist_pad = history_indices < 0
-            idx = history_indices.clamp(min=0, max=N-1)
-            b_idx = torch.arange(B, device=enc_nodes.device).view(B,1,1).expand_as(idx)
-            hist = enc_nodes[b_idx, idx, :]
-            hist = hist.masked_fill(hist_pad.unsqueeze(-1), 0.0)
-            BA, T = B * A, hist.size(2)
-            hist2d = hist.view(BA, T, d)
-            pad2d = hist_pad.view(BA, T)
-            pe = self._build_sinusoidal_pe(T, d, hist2d.device)
-            hist2d = hist2d + pe.unsqueeze(0)
-            hist2d = self.hist_block(hist2d, key_padding_mask=pad2d)
-            lengths = (~pad2d).sum(dim=1)
-            last_idx = torch.clamp(lengths - 1, min=0)
-            arange_ba = torch.arange(BA, device=enc_nodes.device)
-            hist_summary = hist2d[arange_ba, last_idx, :].view(B, A, d)
-            # no extra ffn here (kept similar to original branch)
-        else:
-            hist_summary = torch.zeros(B, A, d, device=enc_nodes.device, dtype=enc_nodes.dtype)
+        enc_agents = self.encode_agents(agents_tensor)
+        history_summary = self.encode_history(
+            enc_nodes=enc_nodes,
+            enc_depot=enc_depot,
+            num_nodes=num_nodes,
+            num_agents=num_agents,
+            history_positions=history_positions,
+            history_target_coords=history_target_coords,
+        )
 
-        # 2) 跨-agent 历史交互：让每个 agent 感知他人近期意图
-        #    将 enc_agents 与上一步得到的 hist_summary 融合为 agent_ctx，
-        #    在 agent 维度上做一次自注意力与 FFN 残差堆叠，得到跨-agent 强化后的“历史摘要”。
-        agent_ctx = torch.cat([enc_agents, hist_summary], dim=-1)   # [B,A,2d]
-        agent_ctx = self.agent_ctx_proj(agent_ctx)                   # [B,A,d]
-        # Use TransformerBlock for agent-agent interaction along agent dimension
-        agent_ctx = self.agent_block(agent_ctx)
-        # 用跨-agent 交互后的摘要替换原先的 hist_summary
-        hist_summary = agent_ctx
+        # --- 2) 跨-agent 历史交互 ---
+        agent_context = torch.cat([enc_agents, history_summary], dim=-1)
+        agent_context = self.agent_fusion(agent_context)
+        agent_context = self.agent_block(agent_context)
+        history_summary = agent_context
 
-        # 3) 与 depot 拼接后过 MLP -> context（每个 agent 一个 context）
-        depot_expand = enc_depot.expand(-1, A, -1)               # [B, A, d]
-        context = torch.cat([enc_agents, depot_expand, hist_summary], dim=-1)    # [B, A, 3d]
-        context = self.ctx_proj(context)                         # [B, A, d]
-        # Pre-LN before cross-attention
-        context = self.ctx_norm(context)
+        # --- 3) 构造每个 agent 的 context ---
+        depot_expanded = enc_depot.expand(-1, num_agents, -1)
+        context = torch.cat([enc_agents, depot_expanded, history_summary], dim=-1)
+        context = self.context_projection(context)
+        context = self.context_norm(context)
 
         if torch.isnan(enc_nodes).any() or torch.isinf(enc_nodes).any():
-            print(f"[ERROR] nodes contains NaN/Inf")
+            print("[ERROR] nodes contains NaN/Inf")
 
-        # 4) 标准 Cross-Attn：Q=context, K/V=kv
-        kv = torch.cat([enc_depot, enc_nodes], dim=1)            # [B,1+N,d]
+        # --- 4) Cross-Attn：Q=context, K/V=concat(depot, nodes) ---
+        kv = torch.cat([enc_depot, enc_nodes], dim=1)
         kv_mask = torch.cat([
-            torch.zeros(B, 1, dtype=torch.bool, device=node_mask.device),  # depot 不屏蔽
-            node_mask
-        ], dim=1)                                                # [B,1+N]
-        # Cross-attention + FFN via CrossAttentionBlock
+            torch.zeros(batch_size, 1, dtype=torch.bool, device=node_mask.device),
+            node_mask,
+        ], dim=1)
         context = self.cross_block(context, kv, kv, key_padding_mask=kv_mask)
         if torch.isnan(context).any() or torch.isinf(context).any():
-            print(f"[ERROR][cross-block] context contains NaN/Inf")
+            print("[ERROR][cross-block] context contains NaN/Inf")
 
-        # 5) 打分（未归一化 logits）：scores = (Q K^T) / sqrt(d)
-        Q = self.q_proj(context)                                 # [B, A, d]
-        K = self.k_proj(kv)                                      # [B, 1+N, d]
-        scores = torch.matmul(Q, K.transpose(1, 2)) / math.sqrt(self.d_model)  # [B, A, 1+N]
-        # 如果有 nan 或 inf，则打印 scores
+        # --- 5) 缩放点积打分 ---
+        query = self.query_projection(context)
+        key = self.key_projection(kv)
+        scores = torch.matmul(query, key.transpose(1, 2)) / math.sqrt(self.d_model)
         if torch.isnan(scores).any() or torch.isinf(scores).any():
-            print(f"[ERROR] scores contains NaN/Inf")
+            print("[ERROR] scores contains NaN/Inf")
 
-        # 将 nodes 段按 mask 置为 -inf；depot 段（index 0）不屏蔽
-        # scores[..., 0] 对应 depot；scores[..., 1:] 对应 nodes
+        # 先做 tanh 压缩数值范围，再做 mask
+        scores = 10.0 * torch.tanh(scores)
+
         neg_inf = torch.finfo(scores.dtype).min
-        scores_nodes = scores[..., 1:]                           # [B, A, N]
-        scores_nodes = scores_nodes.masked_fill(node_mask.unsqueeze(1), neg_inf)
-        # 拼回 [depot, nodes...] 顺序
-        logits = torch.cat([scores[..., 0:1], scores_nodes], dim=-1)
+        node_scores = scores[..., 1:]
+        node_scores = node_scores.masked_fill(node_mask.unsqueeze(1), neg_inf)
+        logits = torch.cat([scores[..., :1], node_scores], dim=-1)
         return logits
+
+    def encode_agents(self, agents_tensor: torch.Tensor) -> torch.Tensor:
+        """将 agents (x, y, s, t) -> [B, A, d]"""
+        if agents_tensor is None:
+            raise ValueError("encode_agents requires agents_tensor with shape [B,A,4]")
+        if agents_tensor.dim() != 3 or agents_tensor.size(-1) != 4:
+            raise ValueError(
+                f"agents_tensor must be [B,A,4], got {tuple(agents_tensor.shape)}"
+            )
+        h = self.agent_embed(agents_tensor)
+        h = self.agent_embed_block(h)
+        return h
+
+    def encode_history(
+        self,
+        *,
+        enc_nodes: torch.Tensor,
+        enc_depot: torch.Tensor,
+        num_nodes: int,
+        num_agents: int,
+        history_positions: Optional[torch.Tensor],
+        history_target_coords: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        batch_size = enc_nodes.size(0)
+        device = enc_nodes.device
+        dtype = enc_nodes.dtype
+        if num_agents == 0:
+            return torch.zeros(batch_size, 0, self.d_model, device=device, dtype=dtype)
+
+        has_pos = history_positions is not None and history_positions.numel() > 0
+        has_target = history_target_coords is not None and history_target_coords.numel() > 0
+        if has_pos ^ has_target:
+            warnings.warn(
+                "history_positions 与 history_target_coords 必须同时提供或同时为空；检测到仅出现其中之一，将视为都未提供。",
+                UserWarning,
+            )
+            return torch.zeros(batch_size, num_agents, self.d_model, device=device, dtype=dtype)
+
+        if not (has_pos and has_target):
+            return torch.zeros(batch_size, num_agents, self.d_model, device=device, dtype=dtype)
+
+        hist_pos = history_positions  # [B, A, T, 2]
+        hist_target = history_target_coords  # [B, A, T, 2]
+        pad_pos = (hist_pos[..., 0] < 0) | (hist_pos[..., 1] < 0)
+        pad_target = (hist_target[..., 0] < 0) | (hist_target[..., 1] < 0)
+        pad_mask = pad_pos | pad_target
+
+        batch_agents, hist_len = batch_size * num_agents, hist_pos.size(2)
+        fused_hist = torch.cat(
+            [
+                self.history_pos_encoder(hist_pos.view(batch_agents, hist_len, 2)),
+                self.history_target_encoder(hist_target.view(batch_agents, hist_len, 2)),
+            ],
+            dim=-1,
+        )
+        fused_hist = self.history_fusion(fused_hist)
+        pe = self._build_sinusoidal_pe(hist_len, self.d_model, fused_hist.device)
+        pe_expanded = pe.unsqueeze(0).expand(batch_agents, hist_len, -1)
+        fused_hist = torch.cat([fused_hist, pe_expanded], dim=-1)
+        fused_hist = self.history_pe_projection(fused_hist)
+        fused_hist = self.history_block(
+            fused_hist,
+            key_padding_mask=pad_mask.view(batch_agents, hist_len),
+        )
+        valid_lengths = (~pad_mask.view(batch_agents, hist_len)).sum(dim=1)
+        last_valid = torch.clamp(valid_lengths - 1, min=0)
+        gather_index = torch.arange(batch_agents, device=fused_hist.device)
+        history_summary = fused_hist[gather_index, last_valid, :].view(batch_size, num_agents, self.d_model)
+        return history_summary
 
     @staticmethod
     def _build_sinusoidal_pe(T: int, d_model: int, device: torch.device) -> torch.Tensor:

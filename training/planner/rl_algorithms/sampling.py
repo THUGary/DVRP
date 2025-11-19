@@ -32,10 +32,11 @@ def select_targets_with_sampling(
 	lateness_lambda: float,
 	critic: Optional[torch.nn.Module] = None,
 	history_positions: Optional[torch.Tensor] = None,
-	history_indices: Optional[torch.Tensor] = None,
+	history_target_coords: Optional[torch.Tensor] = None,
 	target_queue_len: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
-	"""Sample target indices per agent using the current policy logits."""
+	selection_strategy: str = "stochastic",
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+	"""Select target indices per agent using either stochastic sampling or greedy argmax."""
 	dev = agents_tensor.device
 	queue_len = max(1, int(target_queue_len))
 	if feats["nodes"].size(1) == 0:
@@ -45,6 +46,7 @@ def select_targets_with_sampling(
 		sel = torch.zeros(B, A, dtype=torch.long, device=dev)
 		dest_xy = depot_xy.unsqueeze(1).repeat(1, A, 1)
 		log_probs = torch.zeros(B, A, dtype=torch.float32, device=dev)
+		entropies = torch.zeros(B, A, dtype=torch.float32, device=dev)
 		value = None
 		if critic is not None:
 			embed = torch.zeros(B, critic.input_dim, device=dev)
@@ -53,20 +55,18 @@ def select_targets_with_sampling(
 		queue_coords = torch.zeros(B, A, queue_len, 2, dtype=torch.long, device=dev)
 		queue_indices[..., 0] = sel
 		queue_coords[..., 0, :] = dest_xy
-		return sel, dest_xy, log_probs, value, queue_indices, queue_coords
+		return sel, dest_xy, log_probs, entropies, value, queue_indices, queue_coords
 
 	enc_nodes, enc_depot, node_mask = model.encoder(feats)
-	enc_agents = model.encoder.encode_agents(agents_tensor)
 	logits = model.decode(
 		enc_nodes=enc_nodes,
 		enc_depot=enc_depot,
 		node_mask=node_mask,
-		enc_agents=enc_agents,
 		agents_tensor=agents_tensor,
 		nodes=feats["nodes"],
 		lateness_lambda=lateness_lambda,
-		history_indices=history_indices,
 		history_positions=history_positions,
+		history_target_coords=history_target_coords,
 	)
 
 	probs = torch.softmax(logits, dim=-1)
@@ -77,15 +77,23 @@ def select_targets_with_sampling(
 	node_xy = feats["nodes"][..., :2].long()
 	queue_indices = torch.zeros(B, A, queue_len, dtype=torch.long, device=dev)
 	queue_coords = torch.zeros(B, A, queue_len, 2, dtype=torch.long, device=dev)
+	entropies = -(probs * logp).sum(dim=-1)
 
 	sel = torch.zeros(B, A, dtype=torch.long, device=dev)
 	dest_xy = torch.zeros(B, A, 2, dtype=torch.long, device=dev)
 	log_probs = torch.zeros(B, A, dtype=torch.float32, device=dev)
 
+	selection_strategy = selection_strategy.lower()
+	if selection_strategy not in {"stochastic", "greedy"}:
+		raise ValueError(f"Unknown selection strategy: {selection_strategy}")
 	for b in range(B):
 		for a in range(A):
-			cat = Categorical(probs[b, a])
-			idx = cat.sample()
+			if selection_strategy == "greedy":
+				idx = torch.argmax(logits[b, a]).item()
+				idx = int(idx)
+			else:
+				cat = Categorical(probs[b, a])
+				idx = int(cat.sample().item())
 			sel[b, a] = idx
 			log_probs[b, a] = logp[b, a, idx]
 			if 1 <= idx <= N:
@@ -144,17 +152,15 @@ def select_targets_with_sampling(
 		for step in range(1, queue_len):
 			if (~mask_roll).sum().item() == 0:
 				break
-			enc_agents_step = model.encoder.encode_agents(agents_roll)
 			logits_step = model.decode(
 				enc_nodes=enc_nodes,
 				enc_depot=enc_depot,
 				node_mask=mask_roll,
-				enc_agents=enc_agents_step,
 				agents_tensor=agents_roll,
 				nodes=feats["nodes"],
 				lateness_lambda=lateness_lambda,
-				history_indices=history_indices,
 				history_positions=history_positions,
+				history_target_coords=history_target_coords,
 			)
 			next_idx = torch.argmax(logits_step, dim=-1)
 			queue_indices[..., step] = next_idx
@@ -168,4 +174,4 @@ def select_targets_with_sampling(
 			mark_selected(mask_roll, next_idx)
 			advance_agents(agents_roll, queue_coords[..., step, :], next_idx)
 
-	return sel, dest_xy, log_probs, value, queue_indices, queue_coords
+	return sel, dest_xy, log_probs, entropies, value, queue_indices, queue_coords

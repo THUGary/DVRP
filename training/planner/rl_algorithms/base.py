@@ -18,7 +18,7 @@ class DecisionRecord:
 	actions: Optional[torch.Tensor] = None
 	state_value: Optional[torch.Tensor] = None
 	history_positions: Optional[torch.Tensor] = None
-	history_indices: Optional[torch.Tensor] = None
+	history_targets: Optional[torch.Tensor] = None
 	queue_indices: Optional[torch.Tensor] = None
 	queue_coords: Optional[torch.Tensor] = None
 	reward: float = 0.0

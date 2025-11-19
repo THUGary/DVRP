@@ -139,7 +139,7 @@ class GridEnvironment:
 		self._pos_history: List[List[Tuple[int,int]]] = [[(a.x, a.y)] for a in agent_states]
 		return self._obs()
 
-	def step(self, actions: List[Action]) -> Tuple[Dict, float, bool, Dict]:
+	def step(self, actions: List[Action], verbose: bool = True) -> Tuple[Dict, float, bool, Dict]:
 
 		assert self._state is not None, "Call reset() first"
 		t = self._state.time
@@ -457,9 +457,9 @@ class GridEnvironment:
 			capacity_reward_term
 			+ wait_penalty
 			+ switch_penalty_term
-			+ pairwise_penalty_value
+			# + pairwise_penalty_value
 			+ move_penalty_value
-			+ approach_bonus_value
+			# + approach_bonus_value
 		)		#  + exploration_penalty_value
 
 		# update episode-level stats
@@ -533,24 +533,29 @@ class GridEnvironment:
 			self._episode_stats["collision_count"] += len(collided_agents)
 		if done:
 			es = self._episode_stats
-			print("=== Episode summary ===")
-			print(f"Total demands encountered: count={es['demand_count']}, total_capacity={es['demand_capacity']}")
-			print(f"Served: count={es['served_count']}, served_capacity={es['served_capacity']}, capacity_reward={es.get('capacity_reward_term', 0.0)}")
-			if es.get('expired_count', 0) > 0:
-				print(f"Expired (timed-out): count={es.get('expired_count',0)}, capacity={es.get('expired_capacity',0.0)}, penalty={es.get('expired_penalty',0.0)}")
-			if es.get('collision_count', 0) > 0:
-				print(f"Agent collision resolutions: {es.get('collision_count', 0)}")
-			if es.get('switch_count', 0) > 0:
-				print(f"Target switches penalized: count={es.get('switch_count', 0)}, penalty={es.get('switch_penalty', 0.0)}")
-			if self.exploration_history_n > 1:
-				print(f"Exploration revisit penalty: raw={es.get('exploration_penalty_raw', 0.0)}, value={es.get('exploration_penalty_value', 0.0)}")
-			remaining_count = len(self._state.demands)
-			remaining_capacity = sum(float(d.c) for d in self._state.demands)
-			# print(f"Remaining unserved: count={remaining_count}, capacity={remaining_capacity}")
-			# for i, td in enumerate(es['agent_total_distances']):
-			# 	print(f"Agent {i} total distance: {td}")
-			# print(f"Total distance this episode: {es['total_distance']}")
-			print(f"Episode cumulative reward: {es['episode_reward']}")
+			if verbose:
+				print("=== Episode summary ===")
+				print(f"Total demands encountered: count={es['demand_count']}, total_capacity={es['demand_capacity']}")
+				print(f"Served: count={es['served_count']}, served_capacity={es['served_capacity']}, capacity_reward={es.get('capacity_reward_term', 0.0)}")
+				print(f"Waiting penalty accumulated: {es.get('wait_penalty_value', 0.0)}")
+				# if es.get('expired_count', 0) > 0:
+				# 	print(f"Expired (timed-out): count={es.get('expired_count',0)}, capacity={es.get('expired_capacity',0.0)}, penalty={es.get('expired_penalty',0.0)}")
+				# if es.get('collision_count', 0) > 0:
+				# 	print(f"Agent collision resolutions: {es.get('collision_count', 0)}")
+				# if es.get('switch_count', 0) > 0:
+				# 	print(f"Target switches penalized: count={es.get('switch_count', 0)}, penalty={es.get('switch_penalty', 0.0)}")
+				# if self.exploration_history_n > 1:
+				# 	print(f"Exploration revisit penalty: raw={es.get('exploration_penalty_raw', 0.0)}, value={es.get('exploration_penalty_value', 0.0)}")
+				remaining_count = len(self._state.demands)
+				remaining_capacity = sum(float(d.c) for d in self._state.demands)
+				# print(f"Remaining unserved: count={remaining_count}, capacity={remaining_capacity}")
+				
+				print(f"Agent total distance: {es['agent_total_distances']}")
+				print(f"Total distance this episode: {es['total_distance']}")
+				print(f"Episode cumulative reward: {es['episode_reward']}")
+			else:
+				remaining_count = len(self._state.demands)
+				remaining_capacity = sum(float(d.c) for d in self._state.demands)
 			# also return stats in info for external use
 			info['episode_stats'] = {
 				'counts': {'encountered': es['demand_count'], 'served': es['served_count'], 'remaining': remaining_count},
