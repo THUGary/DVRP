@@ -88,7 +88,8 @@ def build_env_from_cfg(cfg: Config) -> GridEnvironment:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="REINFORCE training with explicit baseline model comparison")
-    p.add_argument("--episodes", type=int, default=200, help="Number of training episodes")
+    p.add_argument("--batches", type=int, default=200, help="Number of training batches (gradient updates)")
+    p.add_argument("--batch_size", type=int, default=1, help="Number of episodes per batch (gradient accumulation)")
     p.add_argument("--lr", type=float, default=1e-4, help="Learning rate for the policy model")
     p.add_argument("--seed", type=int, default=0, help="Global random seed")
     p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device for training")
@@ -98,13 +99,13 @@ def parse_args() -> argparse.Namespace:
         "--save_best",
         type=str,
         default="checkpoints/planner_rl",
-        help="Base filename (without episode suffix) used when storing periodic checkpoints",
+        help="Base filename (without batch suffix) used when storing periodic checkpoints",
     )
     p.add_argument("--generator", type=str, choices=["rule", "net"], default="rule", help="Demand generator override")
     p.add_argument("--lateness_lambda", type=float, default=0.0, help="Soft lateness penalty during decode")
     p.add_argument("--target_queue_len", type=int, default=1, help="Length of autoregressive queue during rollout")
-    p.add_argument("--reward_log", type=str, default="runs/baseline_rl_rewards.csv", help="CSV log for episode rewards")
-    p.add_argument("--update_cycle", type=int, default=20, help="Number of training episodes between baseline evaluation cycles")
+    p.add_argument("--reward_log", type=str, default="runs/baseline_rl_rewards.csv", help="CSV log for batch rewards")
+    p.add_argument("--update_cycle", type=int, default=20, help="Number of training batches between baseline evaluation cycles")
     p.add_argument("--val_num", type=int, default=15, help="Number of validation environments in the evaluation dataset")
     p.add_argument("--val_data_path", type=str, default="training/planner/data/baseline_val.pt", help="Path to the validation seed dataset file")
     p.add_argument("--gen_val_data", action="store_true", help="Regenerate the validation seed dataset before training")
@@ -113,7 +114,7 @@ def parse_args() -> argparse.Namespace:
         "--entropy_decay",
         type=float,
         default=1.0,
-        help="Multiplicative decay applied to λ after each episode (use <1.0 to decay)",
+        help="Multiplicative decay applied to λ after each batch (use <1.0 to decay)",
     )
     p.add_argument("--debug", action="store_true", help="Print per-step demand information")
     p.add_argument("--deterministic", action="store_true", help="Enable deterministic CuDNN behavior")
@@ -128,7 +129,7 @@ def plot_training_curves(csv_path: str, output_dir: str, run_name: str):
     if not os.path.exists(csv_path):
         return
 
-    episodes = []
+    batches = []
     policy_rewards = []
     baseline_rewards = []
     advantages = []
@@ -137,7 +138,7 @@ def plot_training_curves(csv_path: str, output_dir: str, run_name: str):
         with open(csv_path, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                episodes.append(int(row["episode"]))
+                batches.append(int(row["batch"]))
                 policy_rewards.append(float(row["policy_reward"]))
                 baseline_rewards.append(float(row["baseline_reward"]))
                 advantages.append(float(row["advantage"]))
@@ -145,7 +146,7 @@ def plot_training_curves(csv_path: str, output_dir: str, run_name: str):
         print(f"[PLOT] Error reading CSV: {e}")
         return
 
-    if not episodes:
+    if not batches:
         return
 
     os.makedirs(output_dir, exist_ok=True)
@@ -153,16 +154,16 @@ def plot_training_curves(csv_path: str, output_dir: str, run_name: str):
     
     # Plot 1: Rewards
     plt.figure(figsize=(10, 6))
-    plt.plot(episodes, policy_rewards, label="Policy Reward", alpha=0.7)
-    plt.plot(episodes, baseline_rewards, label="Baseline Reward", alpha=0.7, linestyle="--")
+    plt.plot(batches, policy_rewards, label="Policy Reward", alpha=0.7)
+    plt.plot(batches, baseline_rewards, label="Baseline Reward", alpha=0.7, linestyle="--")
     
     # Calculate moving average for policy reward
     window_size = min(50, len(policy_rewards))
     if window_size > 1:
         ma = np.convolve(policy_rewards, np.ones(window_size)/window_size, mode='valid')
-        plt.plot(episodes[window_size-1:], ma, label=f"Policy MA({window_size})", color='red', linewidth=2)
+        plt.plot(batches[window_size-1:], ma, label=f"Policy MA({window_size})", color='red', linewidth=2)
 
-    plt.xlabel("Episode")
+    plt.xlabel("Batch")
     plt.ylabel("Total Reward")
     plt.title(f"Training Rewards - {run_name}")
     plt.legend()
@@ -172,9 +173,9 @@ def plot_training_curves(csv_path: str, output_dir: str, run_name: str):
 
     # Plot 2: Advantage
     plt.figure(figsize=(10, 6))
-    plt.plot(episodes, advantages, label="Advantage", color='purple', alpha=0.6)
+    plt.plot(batches, advantages, label="Advantage", color='purple', alpha=0.6)
     plt.axhline(y=0, color='black', linestyle='-', alpha=0.3)
-    plt.xlabel("Episode")
+    plt.xlabel("Batch")
     plt.ylabel("Advantage (Policy - Baseline)")
     plt.title(f"Advantage over Baseline - {run_name}")
     plt.legend()
@@ -472,117 +473,147 @@ def main() -> None:
     if args.reward_log == "runs/baseline_rl_rewards.csv":
         args.reward_log = os.path.join(log_dir, "rewards.csv")
     
-    ensure_log_file(args.reward_log, ["episode", "policy_reward", "baseline_reward", "advantage"])
+    ensure_log_file(args.reward_log, ["batch", "policy_reward", "baseline_reward", "advantage"])
 
     save_dir, save_prefix = _checkpoint_dir_and_prefix(args)
 
-    def dump_checkpoint(ep: int) -> Optional[pathlib.Path]:
-        if ep <= 0:
+    def dump_checkpoint(batch_idx: int) -> Optional[pathlib.Path]:
+        if batch_idx <= 0:
             return None
-        path = save_dir / f"{save_prefix}_{ep}.pt"
-        torch.save({"model": model.state_dict(), "episode": ep}, path)
+        path = save_dir / f"{save_prefix}_{batch_idx}.pt"
+        torch.save({"model": model.state_dict(), "batch": batch_idx}, path)
         print(f"[SAVE] checkpoint => {path}")
         return path
 
-    last_completed_episode = 0
+    last_completed_batch = 0
     latest_checkpoint: Optional[pathlib.Path] = None
 
     try:
-        for ep in range(1, args.episodes + 1):
-            seed_ep = args.seed + ep
-            model.train()
-            train_result = run_episode(
-                model=model,
-                env=env_train,
-                controller=controller_train,
-                args=args,
-                device=device,
-                seed=seed_ep,
-                collect_traces=True,
-                env_verbose=True,
-                action_selection="stochastic",
-            )
-
-            baseline_args = argparse.Namespace(**vars(args))
-            baseline_args.debug = False
-            baseline_result = run_episode(
-                model=baseline_model,
-                env=env_baseline,
-                controller=controller_baseline,
-                args=baseline_args,
-                device=device,
-                seed=seed_ep,
-                collect_traces=False,
-                env_verbose=False,
-                action_selection="greedy",
-            )
-
-            advantage = train_result.total_reward - baseline_result.total_reward
-            loss_value: Optional[float] = None
-            entropy_value: Optional[float] = None
-
-            if train_result.log_probs:
-                # Normalize log-prob and entropy by the number of steps (mean over time)
-                # This keeps the loss magnitude stable regardless of episode length.
-                logprob_stack = torch.stack(train_result.log_probs)
-                sum_logprob = logprob_stack.mean()
-
-                if train_result.entropies:
-                    entropy_stack = torch.stack(train_result.entropies)
-                    entropy_mean = entropy_stack.mean()
-                else:
-                    entropy_mean = torch.zeros(1, device=sum_logprob.device)
-
-                current_entropy_coef = max(0.0, args.entropy_coef * (args.entropy_decay ** max(0, ep - 1)))
-                loss_rl = -advantage * sum_logprob
-                loss = loss_rl - current_entropy_coef * entropy_mean
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                loss_value = float(loss.item())
-                entropy_value = float((current_entropy_coef * entropy_mean).item()) if current_entropy_coef > 0 else 0.0
-                
-                # TensorBoard logging: Training Step
-                writer.add_scalar("Train/Loss_Total", loss_value, ep)
-                writer.add_scalar("Train/Loss_Policy", float(loss_rl.item()), ep)
-                writer.add_scalar("Train/Entropy_Coef", current_entropy_coef, ep)
-                if train_result.entropies:
-                    writer.add_scalar("Train/Entropy_Raw", float(entropy_mean.item()), ep)
-            else:
-                print(f"[EP {ep:04d}] No actionable steps; skipping update")
-
-            # TensorBoard logging: Episode Stats
-            writer.add_scalar("Reward/Policy", train_result.total_reward, ep)
-            writer.add_scalar("Reward/Baseline", baseline_result.total_reward, ep)
-            writer.add_scalar("Reward/Advantage", advantage, ep)
-            writer.add_scalar("Episode/Length", len(train_result.rewards), ep)
+        for batch_idx in range(1, args.batches + 1):
+            optimizer.zero_grad()
             
-            # Log detailed environment stats if available
-            for key, val in train_result.env_stats.items():
-                if isinstance(val, (int, float)):
-                    writer.add_scalar(f"EnvStats/{key}", val, ep)
+            batch_policy_rewards = []
+            batch_baseline_rewards = []
+            batch_advantages = []
+            batch_losses = []
+            batch_entropies = []
+            batch_env_stats = []
+
+            # Gradient Accumulation Loop
+            for _ in range(args.batch_size):
+                # Use a different seed for each episode within the batch to ensure diversity
+                # We can derive it from batch_idx and loop index
+                seed_ep = args.seed + (batch_idx - 1) * args.batch_size + _
+                
+                model.train()
+                train_result = run_episode(
+                    model=model,
+                    env=env_train,
+                    controller=controller_train,
+                    args=args,
+                    device=device,
+                    seed=seed_ep,
+                    collect_traces=True,
+                    env_verbose=False, # Reduce verbosity for batch training
+                    action_selection="stochastic",
+                )
+
+                baseline_args = argparse.Namespace(**vars(args))
+                baseline_args.debug = False
+                baseline_result = run_episode(
+                    model=baseline_model,
+                    env=env_baseline,
+                    controller=controller_baseline,
+                    args=baseline_args,
+                    device=device,
+                    seed=seed_ep,
+                    collect_traces=False,
+                    env_verbose=False,
+                    action_selection="greedy",
+                )
+
+                advantage = train_result.total_reward - baseline_result.total_reward
+                
+                batch_policy_rewards.append(train_result.total_reward)
+                batch_baseline_rewards.append(baseline_result.total_reward)
+                batch_advantages.append(advantage)
+                batch_env_stats.append(train_result.env_stats)
+
+                if train_result.log_probs:
+                    # Normalize log-prob and entropy by the number of steps (mean over time)
+                    logprob_stack = torch.stack(train_result.log_probs)
+                    sum_logprob = logprob_stack.mean()
+
+                    if train_result.entropies:
+                        entropy_stack = torch.stack(train_result.entropies)
+                        entropy_mean = entropy_stack.mean()
+                    else:
+                        entropy_mean = torch.zeros(1, device=sum_logprob.device)
+
+                    current_entropy_coef = max(0.0, args.entropy_coef * (args.entropy_decay ** max(0, batch_idx - 1)))
+                    loss_rl = -advantage * sum_logprob
+                    loss = loss_rl - current_entropy_coef * entropy_mean
+                    
+                    # Normalize loss by batch_size for gradient accumulation
+                    loss = loss / args.batch_size
+                    loss.backward()
+                    
+                    batch_losses.append(loss.item() * args.batch_size) # Store un-normalized loss for logging
+                    batch_entropies.append(entropy_mean.item())
+                else:
+                    # No actionable steps
+                    pass
+
+            # Update parameters after accumulating gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            # Aggregated Stats
+            avg_policy_reward = np.mean(batch_policy_rewards) if batch_policy_rewards else 0.0
+            avg_baseline_reward = np.mean(batch_baseline_rewards) if batch_baseline_rewards else 0.0
+            avg_advantage = np.mean(batch_advantages) if batch_advantages else 0.0
+            avg_loss = np.mean(batch_losses) if batch_losses else 0.0
+            avg_entropy = np.mean(batch_entropies) if batch_entropies else 0.0
+            current_entropy_coef = max(0.0, args.entropy_coef * (args.entropy_decay ** max(0, batch_idx - 1)))
+
+            # TensorBoard logging: Training Step
+            writer.add_scalar("Train/Loss_Total", avg_loss, batch_idx)
+            writer.add_scalar("Train/Entropy_Coef", current_entropy_coef, batch_idx)
+            writer.add_scalar("Train/Entropy_Raw", avg_entropy, batch_idx)
+
+            # TensorBoard logging: Batch Stats
+            writer.add_scalar("Reward/Policy", avg_policy_reward, batch_idx)
+            writer.add_scalar("Reward/Baseline", avg_baseline_reward, batch_idx)
+            writer.add_scalar("Reward/Advantage", avg_advantage, batch_idx)
+            
+            # Log detailed environment stats (averaged over batch)
+            if batch_env_stats:
+                keys = batch_env_stats[0].keys()
+                for key in keys:
+                    vals = [s.get(key, 0) for s in batch_env_stats]
+                    if vals and isinstance(vals[0], (int, float)):
+                         writer.add_scalar(f"EnvStats/{key}", np.mean(vals), batch_idx)
 
             if args.reward_log:
                 with open(args.reward_log, "a", newline="") as fh:
-                    csv.writer(fh).writerow([ep, train_result.total_reward, baseline_result.total_reward, advantage])
+                    csv.writer(fh).writerow([batch_idx, avg_policy_reward, avg_baseline_reward, avg_advantage])
 
-            status = "encourage" if advantage >= 0 else "penalize"
+            status = "encourage" if avg_advantage >= 0 else "penalize"
             print(
-                f"[EP {ep:04d}] policy={train_result.total_reward:.2f} baseline={baseline_result.total_reward:.2f} "
-                f"adv={advantage:.2f} action={status}"
-                + (f" loss={loss_value:.4f}" if loss_value is not None else "")
+                f"[BATCH {batch_idx:04d}] policy={avg_policy_reward:.2f} baseline={avg_baseline_reward:.2f} "
+                f"adv={avg_advantage:.2f} action={status}"
+                + (f" loss={avg_loss:.4f}" if batch_losses else "")
                 + (
-                    f" entropy_term={entropy_value:.4f}"
-                    if entropy_value is not None and args.entropy_coef > 0
+                    f" entropy_term={avg_entropy * current_entropy_coef:.4f}"
+                    if batch_entropies and args.entropy_coef > 0
                     else ""
                 )
             )
 
-            if ep % 100 == 0:
-                latest_checkpoint = dump_checkpoint(ep) or latest_checkpoint
+            if batch_idx % 100 == 0:
+                latest_checkpoint = dump_checkpoint(batch_idx) or latest_checkpoint
 
-            if ep % args.update_cycle == 0:
+            if batch_idx % args.update_cycle == 0:
                 avg_policy = evaluate_model_on_dataset(
                     model=model,
                     cfg=cfg,
@@ -597,26 +628,26 @@ def main() -> None:
                     device=device,
                     seeds=val_seeds,
                 )
-                print(f"[VAL][EP {ep:04d}] policy_avg={avg_policy:.2f} baseline_avg={avg_baseline:.2f}")
+                print(f"[VAL][BATCH {batch_idx:04d}] policy_avg={avg_policy:.2f} baseline_avg={avg_baseline:.2f}")
                 
                 # TensorBoard logging: Validation
-                writer.add_scalar("Val/Policy_Avg_Reward", avg_policy, ep)
-                writer.add_scalar("Val/Baseline_Avg_Reward", avg_baseline, ep)
+                writer.add_scalar("Val/Policy_Avg_Reward", avg_policy, batch_idx)
+                writer.add_scalar("Val/Baseline_Avg_Reward", avg_baseline, batch_idx)
                 
                 if avg_policy > avg_baseline:
                     baseline_model.load_state_dict(model.state_dict())
                     baseline_model.eval()
-                    print(f"[BASELINE] Updated baseline model at EP {ep:04d}")
-                    writer.add_scalar("Baseline/Updates", 1, ep)
+                    print(f"[BASELINE] Updated baseline model at BATCH {batch_idx:04d}")
+                    writer.add_scalar("Baseline/Updates", 1, batch_idx)
                 else:
-                    writer.add_scalar("Baseline/Updates", 0, ep)
+                    writer.add_scalar("Baseline/Updates", 0, batch_idx)
 
-            last_completed_episode = ep
+            last_completed_batch = batch_idx
 
     except KeyboardInterrupt:
         print("[INTERRUPT] Training interrupted; final checkpoint will be saved.")
     finally:
-        final_path = dump_checkpoint(last_completed_episode)
+        final_path = dump_checkpoint(last_completed_batch)
         if final_path is not None:
             latest_checkpoint = final_path
         
@@ -629,7 +660,7 @@ def main() -> None:
     if latest_checkpoint is not None:
         print(f"[DONE] Latest checkpoint saved to {latest_checkpoint}")
     else:
-        print("[DONE] Training finished but no episodes were completed; no checkpoint saved.")
+        print("[DONE] Training finished but no batches were completed; no checkpoint saved.")
 
 
 if __name__ == "__main__":
