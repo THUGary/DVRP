@@ -66,7 +66,7 @@ class Config:
         "d_model": 128,
         "nhead": 8,
         "nlayers": 2,
-        "ckpt": "checkpoints/planner/planner_rl_300.pt",
+        "ckpt": "checkpoints/planner/planner_rl_100.pt",
     })
 
     # Controller params

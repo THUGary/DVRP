@@ -130,3 +130,4 @@ data/
 *.zip
 runs/tb/*
 training/planner/runs/tb/*
+tmp
