@@ -1,0 +1,221 @@
+from __future__ import annotations
+import argparse
+import random
+import os
+from typing import List, Tuple
+
+from configs import get_default_config, Config
+from environment.env import GridEnvironment
+from agent.controller import RuleBasedController
+from utils.pygame_renderer import PygameRenderer
+from utils.state_manager import PlanningState, update_planning_state
+from agent.generator.base import BaseDemandGenerator
+from agent.planner.base import BasePlanner
+from agent.planner import RuleBasedPlanner
+from agent.planner import FastReactiveInserter
+from agent.planner import RepairBasedStabilityOptimizer
+from agent.planner import DistributedCooperativePlanner
+from agent.planner import ModelPlanner
+
+
+def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, BaseDemandGenerator, BasePlanner, RuleBasedController]:
+	# choose generator class by config
+	if cfg.generator_type == "net":
+		# lazy import to avoid unnecessary dependencies when not used
+		from agent.generator.net_generator import NetDemandGenerator as GenClass
+	else:
+		from agent.generator import RuleBasedGenerator as GenClass
+
+	gen = GenClass(cfg.width, cfg.height, **cfg.generator_params)
+	env = GridEnvironment(
+		width=cfg.width,
+		height=cfg.height,
+		num_agents=cfg.num_agents,
+		capacity=cfg.capacity,
+		depot=cfg.depot,
+		generator=gen,
+		max_time=cfg.max_time,
+		expiry_penalty_scale=float(getattr(cfg, "expiry_penalty_scale", 5.0)),
+		switch_penalty_scale=float(getattr(cfg, "switch_penalty_scale", 0.01)),
+		capacity_reward_scale=float(getattr(cfg, "capacity_reward_scale", 10.0)),
+		exploration_history_n=int(getattr(cfg, "exploration_history_n", 0)),
+		exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
+		wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
+		max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2)),
+		include_service_time=bool(getattr(cfg, "include_service_time", False)),
+	)
+	env.num_agents = cfg.num_agents
+	if planner_type == "greedy":
+		# 使用 Rule-based Planner（需要显式传入 full_capacity 来自 Config.capacity）
+		planner = RuleBasedPlanner(full_capacity=cfg.capacity, **cfg.planner_params)
+	elif planner_type == "fri":
+		# 使用 Fast Reactive Inserter
+		planner = FastReactiveInserter()
+	elif planner_type == "rbso":
+		# 使用 Repair-based Stability Optimizer（带参数）
+		planner = RepairBasedStabilityOptimizer(destroy_ratio=0.3, local_search_iters=10)
+	elif planner_type == "dcp":
+		# 使用 Distributed Cooperative Planner（带参数）
+		planner = DistributedCooperativePlanner(auction_rounds=5, bid_strategy='time_urgency')
+	elif planner_type == "model":
+		planner_params = dict(cfg.model_planner_params)
+		ckpt_path = planner_params.pop("ckpt", None)
+		planner = ModelPlanner(full_capacity=cfg.capacity, **planner_params)
+		if ckpt_path:
+			if hasattr(planner, "load_from_ckpt"):
+				planner.load_from_ckpt(ckpt_path)
+			else:
+				raise RuntimeError("Selected planner does not support checkpoint loading.")
+	else:
+		raise ValueError(f"Unknown planner type: {planner_type}")
+	controller = RuleBasedController(**cfg.controller_params)
+	return env, gen, planner, controller
+
+
+def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10, planner: str = "greedy") -> None:
+	# deterministically randomize depot location per episode
+	rng = random.Random(seed)
+	depot = (rng.randint(0, cfg.width - 1), rng.randint(0, cfg.height - 1))
+	cfg.depot = depot
+	cfg.generator_params = {**cfg.generator_params, "depot": depot}
+	#print model used
+	print(f"Using planner: {planner}")
+	planner_type = planner
+	if planner_type == "model":
+		ckpt_info = cfg.model_planner_params.get("ckpt")
+		if ckpt_info:
+			print(f"Loading model checkpoint: {ckpt_info}")
+	env, gen, planner_impl, controller = build_env(cfg, planner_type=planner_type)
+	obs = env.reset(seed)
+	total_reward = 0.0
+	done = False
+	step = 0
+	renderer = None
+
+	# 初始化规划状态管理器
+	planning_state = PlanningState()
+	planning_state.reset(cfg.num_agents)
+
+	# 记录上一步的需求，用于检测新增需求
+	prev_demands = []
+
+	if render:
+		renderer = PygameRenderer(cfg.width, cfg.height)
+		renderer.init()
+
+	while not done:
+		# 检测新增的需求
+		current_demands = obs["demands"]
+		new_demands = [d for d in current_demands if d not in prev_demands]
+
+		# 更新规划状态（在规划之前）
+		agent_states = obs["agent_states"]  # list of (x,y,s)
+		update_planning_state(
+			planning_state=planning_state,
+			agent_states=agent_states,
+			new_demands=new_demands,
+			obs_demands=current_demands,
+		)
+
+		# Plan targets using current observation with enhanced information
+		agents = [type("S", (), {"x": x, "y": y, "s": s}) for (x, y, s) in agent_states]
+		plan_horizon = 1
+		if planner_type == "model":
+			plan_horizon = max(1, int(cfg.model_planner_params.get("time_plan", 1)))
+		targets = planner_impl.plan(
+			observations=obs["demands"],  # [(x, y, t_arrival, c, t_due), ...]
+			agent_states=agents,
+			depot=obs["depot"],
+			t=obs["time"],
+			horizon=plan_horizon,
+			current_plans=planning_state.current_plans,  # 新增：当前规划路径
+			global_nodes=planning_state.global_nodes.nodes,  # 新增：全局节点列表 [(x, y, t_arrival, t_due, demand), ...]
+			serve_mark=planning_state.global_nodes.serve_mark,  # 新增：服务标记
+			unserved_count=planning_state.get_unserved_count(),  # 新增：未服务节点数量
+		)
+
+		# 更新规划结果到状态管理器
+		planning_state.update_plans(targets)
+
+		# Controller decides per-agent move
+		actions: List[Tuple[int, int]] = []
+		for i, (x, y, s) in enumerate(agent_states):
+			actions.append(controller.act((x, y), targets[i]))
+
+		# 执行动作并更新环境
+		obs, reward, done, info = env.step(actions)
+		prev_demands = list(current_demands)
+
+		if renderer is not None:
+			if not renderer.render(obs):
+				break
+			# throttle
+			if fps > 0:
+				import time
+				time.sleep(1.0 / fps)
+		total_reward += reward
+		step += 1
+		if step % 10 == 0 or done:
+			unserved = planning_state.get_unserved_count()
+			print(f"Step {step:03d} | time={obs['time']} | reward={reward:.0f} | total={total_reward:.0f} | demands={len(obs['demands'])} | unserved={unserved}")
+	print(f"Episode done in {step} steps. Total reward={total_reward:.0f}")
+	if renderer is not None:
+		renderer.close()
+
+
+def main() -> None:
+	# --------------------------------------------------------------
+	# Minimal CLI: keep only seed, render, fps, pmodel, gmodel
+	# --------------------------------------------------------------
+	parser = argparse.ArgumentParser(description="DVRP runner")
+	parser.add_argument("--seed", type=int, default=2025, help="Random seed (default: 2025)")
+	parser.add_argument("--render", action="store_true", help="Use pygame to visualize")
+	parser.add_argument("--fps", type=int, default=10, help="Render FPS when --render (default: 10)")
+	# --pmodel optionally accepts a checkpoint path; if omitted, use default from cfg
+	parser.add_argument("--pmodel", nargs="?", const="__DEFAULT__", help="Use model planner; optionally pass checkpoint path (.pt/.pth). Example: --pmodel checkpoints/planner/planner_rl_best.pt")
+	parser.add_argument("--gmodel", action="store_true", help="Use neural net demand generator; otherwise rule")
+	parser.add_argument("--service-time", action="store_true", help="Enable service times for demands (vehicles must remain on-site before completion)")
+	parser.add_argument("--num-agents", type=int, default=2, help="Override number of agents for the episode (overrides config)")
+	args = parser.parse_args()
+
+	cfg = get_default_config()
+	cfg.include_service_time = bool(args.service_time)
+	# override number of agents if provided on CLI
+	if args.num_agents is not None and args.num_agents > 0:
+		cfg.num_agents = int(args.num_agents)
+
+	# Planner: model if --pmodel provided (with or without path); else greedy
+	use_model_planner = args.pmodel is not None
+	planner_choice = "model" if use_model_planner else "greedy"
+	if use_model_planner:
+		cfg.planner_type = "model"  # use defaults from cfg.model_planner_params
+		# If a path is provided after --pmodel, resolve it
+		if isinstance(args.pmodel, str) and args.pmodel != "__DEFAULT__":
+			raw = os.path.expanduser(args.pmodel)
+			candidates = [
+				raw,
+				os.path.join("checkpoints", raw) if not os.path.isabs(raw) else raw,
+				os.path.join("checkpoints", "planner", os.path.basename(raw)),
+			]
+			ckpt_path = None
+			for p in candidates:
+				p_abs = os.path.abspath(p)
+				if os.path.isfile(p_abs):
+					ckpt_path = p_abs
+					break
+			# If not found, still set the expanded absolute path for downstream attempt
+			if ckpt_path is None:
+				ckpt_path = os.path.abspath(raw)
+				print(f"WARNING: Planner checkpoint not found at {ckpt_path}. Will attempt to load; ensure path is correct.")
+			cfg.model_planner_params["ckpt"] = ckpt_path
+
+	# Generator: net if --gmodel else keep default (rule)
+	if args.gmodel:
+		cfg.generator_type = "net"
+
+	# Run
+	run_episode(cfg, seed=args.seed, render=args.render, fps=args.fps, planner=planner_choice)
+
+
+if __name__ == "__main__":
+	main()
