@@ -18,6 +18,7 @@ python train_rl_planner.py --episodes 200 --algo ppo --ckpt_init planner_20_2_20
 
 ### 亮点
 - 网格环境：`environment/env.py` 实现了需求生成/过期、容量在仓库补满、非仓库碰撞规避等机制。
+- 网格环境：`environment/env.py` 实现了需求生成/过期、容量在仓库补满、非仓库碰撞规避等机制；`environment/env_tensor.py` 提供了等价的张量化批量环境，可在 GPU 上并行推进多局仿真并直接输出 torch 张量。
 - 生成器：`agent/generator/` 支持规则生成与基于扩散模型的神经生成（`NetDemandGenerator`）。
 - 规划器：`agent/planner/` 提供贪心、FRI、RBSO、DCP 等启发式，以及基于 DVRPNet 的 `ModelPlanner`。
 - 控制器：`agent/controller/` 将目标队列转化为单步移动。
@@ -209,6 +210,20 @@ python training/planner/train_rl_planner.py --algo ppo ... --critic_diag_dir run
 ```
 
 会在 `run/planner/critic_YYYYmmdd-HHMMSS/` 下生成 `critic_metrics.csv` 与 `critic_metrics.png`，包含 value loss、预测值/returns/advantage 的均值与方差，便于后续排查。
+
+### 向量化 REINFORCE（TensorEnv + DVRPNet）
+批量 rollout 使用 `TensorGridEnvironment` 在 GPU 上并行推进多局 episode，减少 Python 循环与环境重置开销：
+
+```bash
+python training/planner/train_batch_rl.py --batches 50 --batch_size 8 --device cuda --gen_val_data
+```
+
+要点：
+- `--batch_size` 即并行环境数量；脚本会在单个 `step` 中同时计算 8 份行动与梯度贡献。
+- 仍使用 DVRPNet + RuleBasedController 组合，并与克隆出的 baseline 模型比较得到 advantage。
+- 依赖 `environment/env_tensor.py`，不会修改原有的 `GridEnvironment` 或旧版脚本。
+- 验证阶段同样采用向量化，默认沿用训练时的 `--batch_size` 作为验证并行度，减少额外配置并保持显存占用一致。
+奖励曲线/CSV 将写入 `runs/` 目录。
 
 在 `run.py` 中使用训练好的规划器：
 ```bash

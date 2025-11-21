@@ -120,7 +120,7 @@ class GridEnvironment:
 		self._state = EnvState(time=0, agent_states=agent_states, depot=self.depot, demands=[])
 		# initialize episode-level statistics
 		self._episode_stats = {
-			"seen_demands_keys": set(),
+			"seen_demands_ids": set(),
 			"demand_count": 0,
 			"demand_capacity": 0.0,
 			"served_count": 0,
@@ -174,9 +174,8 @@ class GridEnvironment:
 
 		# record any newly observed demands (covers both generated and externally appended demands)
 		for d in self._state.demands:
-			signature = (int(d.x), int(d.y), int(d.t), int(d.end_t), int(d.c), int(getattr(d, "service_time", 0)))
-			if signature not in self._episode_stats["seen_demands_keys"]:
-				self._episode_stats["seen_demands_keys"].add(signature)
+			if id(d) not in self._episode_stats["seen_demands_ids"]:
+				self._episode_stats["seen_demands_ids"].add(id(d))
 				self._episode_stats["demand_count"] += 1
 				self._episode_stats["demand_capacity"] += float(d.c)
 		# 2) apply actions to agents
@@ -451,16 +450,17 @@ class GridEnvironment:
 
 		# --- Reward aggregation ---
 		capacity_reward_term = float(self.capacity_reward_scale) * float(capacity_reward)
+		switch_penalty_term = - float(self.switch_penalty_scale) * float(switch_count)
 		# Combine capacity reward with the per-step waiting penalty (negative)
 		# and the density-scaled pairwise proximity penalty.
 		reward = (
 			capacity_reward_term
 			+ wait_penalty
-			+ pairwise_penalty_value
+			+ switch_penalty_term
+			# + pairwise_penalty_value
 			+ move_penalty_value
-			+ approach_bonus_value
-			+ exploration_penalty_value
-		)
+			# + approach_bonus_value
+		)		#  + exploration_penalty_value
 
 		# update episode-level stats
 		self._episode_stats["served_count"] += served_count
@@ -489,7 +489,7 @@ class GridEnvironment:
 		self._episode_stats["total_distance"] += movement_distance
 		self._episode_stats["episode_reward"] += reward
 		self._episode_stats["switch_count"] += switch_count
-		# switch penalty term removed from reward; keep count for diagnostics only
+		self._episode_stats["switch_penalty"] += float(switch_penalty_term)
 		if self.exploration_history_n > 1:
 			self._episode_stats.setdefault("exploration_penalty_raw", 0.0)
 			self._episode_stats.setdefault("exploration_penalty_value", 0.0)
