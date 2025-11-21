@@ -105,6 +105,22 @@ def _sanitize_for_torch_save(obj: Any) -> Any:
     return str(obj)
 
 
+def _clip_history_sequences(
+    history: List[List[Tuple[int, int]]],
+    window: int,
+) -> List[List[Tuple[int, int]]]:
+    """裁剪历史序列长度，确保仅保留最近 window 个坐标，并规范化为 int。"""
+    trimmed: List[List[Tuple[int, int]]] = []
+    max_len = max(1, int(window))
+    for seq in history:
+        if not seq:
+            trimmed.append([])
+            continue
+        sliced = seq[-max_len:]
+        trimmed.append([(int(x), int(y)) for (x, y) in sliced])
+    return trimmed
+
+
 def _build_planner(planner_type: str, capacity: int | None = None):
     if planner_type == "greedy":
         return RuleBasedPlanner(full_capacity=capacity)
@@ -169,6 +185,9 @@ def collect_rows_from_call(
     serve_mark: List[int] | None,
     unserved_count: int | None,
     targets: List[deque[Tuple[int, int]]],
+    history_positions: List[List[Tuple[int, int]]],
+    history_targets: List[List[Tuple[int, int]]],
+    history_window: int,
     meta: Dict[str, Any],
     full_capacity: int,
 ) -> Dict[str, Any]:
@@ -203,6 +222,8 @@ def collect_rows_from_call(
         "labels_ak": labels_ak,                   # List[List[int]], 形状 [A, K]，N==depot
         "full_capacity": int(full_capacity),      # 每个 agent 回 depot 恢复的满容量
         "valid_N": N,
+        "history_positions": _clip_history_sequences(history_positions, history_window),
+        "history_targets": _clip_history_sequences(history_targets, history_window),
         "planner_inputs": {
             "time": time_now,
             "k": k,
@@ -280,11 +301,13 @@ def generate_dataset(
     val_ratio: float,
     replan_policy: str = "always",  # "always" | "on_new_or_empty"
     k: int = 3,
+    history_window: int = 16,
 ) -> Dict[str, str]:
     """运行 episodes，收集 rows 并落盘"""
     _ensure_dir(out_dir)
     all_rows: List[Dict[str, Any]] = []
     rng = None
+    history_window = max(1, int(history_window))
 
     for ep in range(episodes):
         # 将 depot 传入生成器，避免生成与 depot 重叠的需求
@@ -320,6 +343,13 @@ def generate_dataset(
 
         prev_demands = []
         done = False
+        # 初始化历史轨迹（位置 & 目标）
+        history_positions = [deque(maxlen=history_window) for _ in range(cfg.num_agents)]
+        history_targets = [deque(maxlen=history_window) for _ in range(cfg.num_agents)]
+        depot_xy0 = (int(obs["depot"][0]), int(obs["depot"][1]))
+        for agent_idx, (ax, ay, _s) in enumerate(obs["agent_states"]):
+            history_positions[agent_idx].append((int(ax), int(ay)))
+            history_targets[agent_idx].append(depot_xy0)
 
         step_id = 0
         while not done:
@@ -367,6 +397,9 @@ def generate_dataset(
                 "capacity": cfg.capacity,
                 "max_time": cfg.max_time,
             }
+            hist_pos_snapshot = [[(int(px), int(py)) for (px, py) in seq] for seq in history_positions]
+            hist_tgt_snapshot = [[(int(tx), int(ty)) for (tx, ty) in seq] for seq in history_targets]
+
             row = collect_rows_from_call(
                 time_now=obs["time"],
                 observations=demands,
@@ -378,6 +411,9 @@ def generate_dataset(
                 serve_mark=planning_state.global_nodes.serve_mark,
                 unserved_count=planning_state.get_unserved_count(),
                 targets=targets,
+                history_positions=hist_pos_snapshot,
+                history_targets=hist_tgt_snapshot,
+                history_window=history_window,
                 meta=meta,
                 full_capacity=cfg.capacity,
             )
@@ -386,15 +422,24 @@ def generate_dataset(
             # 环境前进一步
             # 让每个 agent 朝队首目标移动一步（与 train.py 一致）
             actions: List[Tuple[int, int]] = []
+            assigned_targets: List[Tuple[int, int]] = []
+            depot_xy_loop = (int(obs["depot"][0]), int(obs["depot"][1]))
             for i, (x, y, s) in enumerate(agent_states):
                 # 弹出已到达
                 while len(planning_state.current_plans[i]) > 0 and planning_state.current_plans[i][0] == (x, y):
                     planning_state.current_plans[i].popleft()
                 if len(planning_state.current_plans[i]) == 0:
                     actions.append((0, 0))
+                    assigned_targets.append(depot_xy_loop)
                 else:
                     actions.append(controller.act((x, y), planning_state.current_plans[i]))
-            obs, reward, done, info = env.step(actions)
+                    assigned_targets.append(tuple(planning_state.current_plans[i][0]))
+            next_obs, reward, done, info = env.step(actions)
+            for idx, tgt_xy in enumerate(assigned_targets):
+                history_targets[idx].append((int(tgt_xy[0]), int(tgt_xy[1])))
+            for idx, (nx_pos, ny_pos, _ns) in enumerate(next_obs["agent_states"]):
+                history_positions[idx].append((int(nx_pos), int(ny_pos)))
+            obs = next_obs
             prev_demands = list(demands)
             step_id += 1
 
@@ -438,6 +483,7 @@ def main():
     ap.add_argument("--out_dir", type=str, default="data")
     ap.add_argument("--replan_policy", type=str, default="always", choices=["always", "on_new_or_empty"])
     ap.add_argument("--k", type=int, default=3, help="每个监督样本的未来步数标签")
+    ap.add_argument("--history_window", type=int, default=16, help="每条样本保留的历史轨迹长度")
     args = ap.parse_args()
 
     cfg = get_default_config()
@@ -454,6 +500,7 @@ def main():
         val_ratio=args.val_ratio,
         replan_policy=args.replan_policy,
         k=args.k,
+        history_window=args.history_window,
     )
 
 

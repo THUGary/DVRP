@@ -44,6 +44,7 @@ def collate_rows(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
       - agents: List[(x,y,s,t_agent)]，长度 A
       - depot: (dx,dy,t)
       - labels_ak: List[List[int]]，形状 [A,K]，值域 [0..N]（0 表示 depot，1..N 表示 nodes[0..N-1]）
+            - history_positions/history_targets: List[List[(x,y)]]，按 agent 存储的历史轨迹
     """
     B = len(batch)
     maxN = max((len(item["nodes"]) for item in batch), default=0)
@@ -56,14 +57,26 @@ def collate_rows(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
             return len(it["labels_k"])  # 兼容单 agent 老格式
         return 0
     maxK = max((_get_k(item) for item in batch), default=0)
+    def _max_hist_len(key: str) -> int:
+        length = 0
+        for item in batch:
+            seqs = item.get(key) or []
+            for seq in seqs:
+                if seq:
+                    length = max(length, len(seq))
+        return length
+
+    max_hist = max(1, _max_hist_len("history_positions"), _max_hist_len("history_targets"))
 
     nodes = torch.zeros(B, maxN, 5, dtype=torch.float32)
     node_mask = torch.ones(B, maxN, dtype=torch.bool)
     agents = torch.zeros(B, maxA, 4, dtype=torch.float32)
-    depot = torch.zeros(B, 1, 3, dtype=torch.float32)
+    depot = torch.zeros(B, 1, 2, dtype=torch.float32)
     labels_ak = torch.full((B, maxA, maxK), fill_value=-1, dtype=torch.long)
     valid_N = torch.zeros(B, dtype=torch.long)
     cap_full = torch.zeros(B, maxA, dtype=torch.float32)
+    history_pos = torch.full((B, maxA, max_hist, 2), fill_value=-1.0, dtype=torch.float32)
+    history_tgt = torch.full((B, maxA, max_hist, 2), fill_value=-1.0, dtype=torch.float32)
 
     for b, item in enumerate(batch):
         Ni = len(item["nodes"])
@@ -74,17 +87,29 @@ def collate_rows(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
             node_mask[b, :Ni] = mask_i
 
         # agents
+        agents_entry: List[Tuple[float, float, float, float]] = []
         if "agents" in item and item["agents"] is not None:
-            A_i = len(item["agents"]) if isinstance(item["agents"], (list, tuple)) else 1
-            for a in range(min(maxA, A_i)):
-                ax, ay, s, ta = item["agents"][a]
-                agents[b, a] = torch.tensor([ax, ay, s, ta], dtype=torch.float32)
+            if isinstance(item["agents"], (list, tuple)):
+                agents_entry = list(item["agents"])
+            else:
+                agents_entry = [item["agents"]]
         elif "agent" in item and item["agent"] is not None:
-            ax, ay, s, ta = item["agent"]
-            agents[b, 0] = torch.tensor([ax, ay, s, ta], dtype=torch.float32)
+            agents_entry = [item["agent"]]
 
-        dx, dy, td = item["depot"]
-        depot[b, 0] = torch.tensor([dx, dy, td], dtype=torch.float32)
+        for a in range(min(maxA, len(agents_entry))):
+            ax, ay, s, ta = agents_entry[a]
+            agents[b, a] = torch.tensor([ax, ay, s, ta], dtype=torch.float32)
+
+        depot_raw = item["depot"]
+        if isinstance(depot_raw, (list, tuple)):
+            if len(depot_raw) < 2:
+                raise RuntimeError("Depot entry must provide at least (x, y)")
+            dx, dy = depot_raw[0], depot_raw[1]
+        else:
+            dx = dy = float(depot_raw)
+        depot[b, 0, 0] = float(dx)
+        depot[b, 0, 1] = float(dy)
+        depot_xy = (int(dx), int(dy))
 
         # labels
         if "labels_ak" in item:
@@ -113,6 +138,31 @@ def collate_rows(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
             raise RuntimeError("Row 'full_capacity' must be > 0 (Config.capacity). Found: {}".format(full_c))
         cap_full[b, :].fill_(full_c)
 
+        hist_pos_entry = item.get("history_positions") or []
+        hist_tgt_entry = item.get("history_targets") or []
+        for a in range(maxA):
+            if a < len(hist_pos_entry) and hist_pos_entry[a]:
+                seq_pos = hist_pos_entry[a][-max_hist:]
+            elif a < len(agents_entry):
+                seq_pos = [(int(agents_entry[a][0]), int(agents_entry[a][1]))]
+            else:
+                seq_pos = [depot_xy]
+            for t_idx, (hx, hy) in enumerate(seq_pos):
+                if t_idx >= max_hist:
+                    break
+                history_pos[b, a, t_idx, 0] = float(hx)
+                history_pos[b, a, t_idx, 1] = float(hy)
+
+            if a < len(hist_tgt_entry) and hist_tgt_entry[a]:
+                seq_tgt = hist_tgt_entry[a][-max_hist:]
+            else:
+                seq_tgt = [depot_xy]
+            for t_idx, (tx, ty) in enumerate(seq_tgt):
+                if t_idx >= max_hist:
+                    break
+                history_tgt[b, a, t_idx, 0] = float(tx)
+                history_tgt[b, a, t_idx, 1] = float(ty)
+
     return {
         "nodes": nodes,
         "node_mask": node_mask,
@@ -121,6 +171,8 @@ def collate_rows(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         "labels_ak": labels_ak,  # [B,A,K]
         "valid_N": valid_N,
         "cap_full": cap_full,    # [B,A]
+        "history_positions": history_pos,
+        "history_targets": history_tgt,
     }
 
 
@@ -180,6 +232,8 @@ def evaluate(model: DVRPNet, loader: DataLoader, device: torch.device, lateness_
         depot = batch["depot"].to(device)
         depot_xy = depot[..., :2]
         labels_ak = batch["labels_ak"].to(device)  # [B,A,K]
+        history_pos = batch["history_positions"].to(device)
+        history_tgt = batch["history_targets"].to(device)
 
         B = nodes.size(0)
         A = agents.size(1)
@@ -204,6 +258,8 @@ def evaluate(model: DVRPNet, loader: DataLoader, device: torch.device, lateness_
                     agents_tensor=ag,
                     nodes=nodes,
                     lateness_lambda=lateness_lambda,
+                    history_positions=history_pos,
+                    history_target_coords=history_tgt,
                 )  # [B,A,N+1]
 
                 # debug
@@ -335,6 +391,8 @@ def main():
                 depot_xy = depot[..., :2]
                 labels_ak = batch["labels_ak"].to(device)  # [B,A,K]
                 valid_N = batch["valid_N"].to(device)
+                history_pos = batch["history_positions"].to(device)
+                history_tgt = batch["history_targets"].to(device)
                 # 可选：打印批次统计
                 # print(_tensor_stats("Train batch nodes", nodes))
                 # print(_tensor_stats("Train batch depot", depot))
@@ -367,6 +425,8 @@ def main():
                             agents_tensor=ag,
                             nodes=nodes,
                             lateness_lambda=args.lateness_lambda,
+                            history_positions=history_pos,
+                            history_target_coords=history_tgt,
                         )  # [B,A,N+1]
                         labels_step = labels_ak[:, :, step]                  # [B,A]
                         logits_flat = logits.reshape(-1, logits.size(-1))    # [B*A,N+1]

@@ -17,6 +17,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 import datetime
+import time
 
 # Ensure project root on sys.path
 _ROOT = pathlib.Path(__file__).resolve().parent
@@ -107,7 +108,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reward_log", type=str, default="runs/baseline_rl_rewards.csv", help="CSV log for batch rewards")
     p.add_argument("--update_cycle", type=int, default=20, help="Number of training batches between baseline evaluation cycles")
     p.add_argument("--val_num", type=int, default=15, help="Number of validation environments in the evaluation dataset")
-    p.add_argument("--val_data_path", type=str, default="training/planner/data/baseline_val.pt", help="Path to the validation seed dataset file")
+    p.add_argument("--val_data_path", type=str, default="training/planner/data/baseline_val_nobatch.pt", help="Path to the validation seed dataset file")
     p.add_argument("--gen_val_data", action="store_true", help="Regenerate the validation seed dataset before training")
     p.add_argument("--entropy_coef", type=float, default=0.01, help="Initial entropy regularization coefficient λ")
     p.add_argument(
@@ -490,6 +491,7 @@ def main() -> None:
 
     try:
         for batch_idx in range(1, args.batches + 1):
+            batch_start = time.time()
             optimizer.zero_grad()
             
             batch_policy_rewards = []
@@ -599,6 +601,7 @@ def main() -> None:
                     csv.writer(fh).writerow([batch_idx, avg_policy_reward, avg_baseline_reward, avg_advantage])
 
             status = "encourage" if avg_advantage >= 0 else "penalize"
+            batch_time = time.time() - batch_start
             print(
                 f"[BATCH {batch_idx:04d}] policy={avg_policy_reward:.2f} baseline={avg_baseline_reward:.2f} "
                 f"adv={avg_advantage:.2f} action={status}"
@@ -608,6 +611,7 @@ def main() -> None:
                     if batch_entropies and args.entropy_coef > 0
                     else ""
                 )
+                + f" time={batch_time:.2f}s"
             )
 
             if batch_idx % 100 == 0:
