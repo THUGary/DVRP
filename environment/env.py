@@ -1,0 +1,607 @@
+from __future__ import annotations
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass, field
+from agent.planner.base import AgentState
+from agent.generator.base import BaseDemandGenerator, Demand
+import math
+
+
+Action = Tuple[int, int]  # (dx, dy) per agent
+
+
+@dataclass
+class EnvState:
+	time: int
+	agent_states: List[AgentState]
+	depot: Tuple[int, int]
+	demands: List[Demand] = field(default_factory=list)
+
+
+class GridEnvironment:
+	"""Grid world DVRP environment skeleton.
+
+	State = {agents + depot + current demands}. Action is per-agent (dx, dy) with unit moves.
+	"""
+
+	def __init__(
+		self,
+		width: int,
+		height: int,
+		num_agents: int,
+		capacity: int,
+		depot: Tuple[int, int] = (0, 0),
+		generator: Optional[BaseDemandGenerator] = None,
+		max_time: int = 100,
+		# Interpretation changed: max_time is the last demand generation time.
+		# Episode does NOT end at max_time immediately. After max_time, the
+		# episode will terminate when there are no unserved demands AND all
+		# agents are back at the depot; or when hitting max_end_time.
+		expiry_penalty_scale: float = 5.0,
+		switch_penalty_scale: float = 0.01,
+		capacity_reward_scale: float = 10.0,
+		exploration_history_n: int = 0,
+		exploration_penalty_scale: float = 0.0,
+		# per-step waiting penalty scale: at each timestep each active (unserved)
+		# demand contributes penalty = - wait_penalty_scale * demand.c
+		wait_penalty_scale: float = 0.001,
+		# density-based pairwise distance penalty between agents
+		distance_penalty_base: float = 0.0,
+		distance_penalty_min_dist: float = 1.0,
+		# per-step movement penalty encourages shorter, smoother paths
+		move_penalty_scale: float = 0.0,
+		# reward shaping for moving closer to nearby demands
+		approach_bonus_scale: float = 0.0,
+		approach_bonus_max_dist: float = 10.0,
+		# Hard cap on episode length; regardless of vehicle positions, if the
+		# current time reaches max_end_time, the episode ends.
+		max_end_time: Optional[int] = None,
+		include_service_time: bool = False,
+	) -> None:
+		self.width = width
+		self.height = height
+		self.max_time = max_time
+		self.depot = depot
+		self.capacity = capacity
+		self._generator = generator
+		self.expiry_penalty_scale = expiry_penalty_scale
+		self.switch_penalty_scale = switch_penalty_scale
+		self.capacity_reward_scale = capacity_reward_scale
+		self.exploration_history_n = max(0, int(exploration_history_n))
+		self.exploration_penalty_scale = float(exploration_penalty_scale)
+		self.wait_penalty_scale = float(wait_penalty_scale)
+		self.distance_penalty_base = float(distance_penalty_base)
+		self.distance_penalty_min_dist = float(distance_penalty_min_dist)
+		self.move_penalty_scale = float(move_penalty_scale)
+		self.approach_bonus_scale = float(approach_bonus_scale)
+		self.approach_bonus_max_dist = float(max(0.0, approach_bonus_max_dist))
+		self.include_service_time = bool(include_service_time)
+		# If not specified, default to max_time to preserve previous behavior
+		self.max_end_time = int(max_time if max_end_time is None else max_end_time)
+		self._state: Optional[EnvState] = None
+
+		# cache for resolved full capacity to avoid repeated imports
+		self._resolved_full_capacity: Optional[int] = None
+		self._prev_actions: List[Action] = []
+		self._active_services: Dict[int, Tuple[Demand, int]] = {}
+
+	def _full_capacity(self) -> int:
+		"""Return the vehicle full capacity.
+
+		Priority:
+		1) self.capacity if available
+		2) configs.capacity (from project-level configs.py) as a fallback
+		"""
+		# Fast path: explicitly provided on init
+		if getattr(self, "capacity", None) is not None:
+			return int(self.capacity)
+		# Cached fallback if already resolved once
+		if self._resolved_full_capacity is not None:
+			return int(self._resolved_full_capacity)
+		# Try to import from configs.py
+		try:
+			import configs  # type: ignore
+			value = int(getattr(configs, "capacity"))
+			self._resolved_full_capacity = value
+			return value
+		except Exception:
+			# Last-resort default to 0 to avoid crashes; callers should handle if needed
+			self._resolved_full_capacity = 0
+			return 0
+
+	# --- Core API ---
+	def reset(self, seed: Optional[int] = None) -> Dict:
+		if self._generator:
+			self._generator.reset(seed)
+		num_agents = getattr(self, "_num_agents", None)
+		if num_agents is None or num_agents <= 0:
+			num_agents = 1
+			self._num_agents = num_agents
+		agent_states = self._spawn_initial_agent_states(num_agents, seed)
+		self._state = EnvState(time=0, agent_states=agent_states, depot=self.depot, demands=[])
+		# initialize episode-level statistics
+		self._episode_stats = {
+			"seen_demands_ids": set(),
+			"demand_count": 0,
+			"demand_capacity": 0.0,
+			"served_count": 0,
+			"served_capacity": 0.0,
+			"served_details": [],
+			"agent_total_distances": [0.0 for _ in agent_states],
+			"total_distance": 0.0,
+			"episode_reward": 0.0,
+			"pairwise_penalty_value": 0.0,
+		}
+		self._episode_stats["switch_count"] = 0
+		self._episode_stats["switch_penalty"] = 0.0
+		self._prev_actions = [(0, 0) for _ in agent_states]
+		self._active_services = {}
+		# maintain per-agent position history for exploration penalty
+		self._pos_history: List[List[Tuple[int,int]]] = [[(a.x, a.y)] for a in agent_states]
+		return self._obs()
+
+	def step(self, actions: List[Action], verbose: bool = True) -> Tuple[Dict, float, bool, Dict]:
+
+		assert self._state is not None, "Call reset() first"
+		t = self._state.time
+		# 1) new demands appear
+		if self._generator:
+			new_demands = self._generator.sample(t)
+			self._state.demands.extend(new_demands)
+		else:
+			new_demands = []
+		# 1.5) detect and remove expired demands (strictly after end_t)
+		# expired demands are those with end_t < t (they should have been handled before this step)
+		expired = [d for d in self._state.demands if d.end_t < t]
+		expired_count = len(expired)
+		expired_capacity = sum(float(d.c) for d in expired)
+		# remove expired demands
+		self._state.demands = [d for d in self._state.demands if t <= d.end_t]
+		# snapshot demand positions prior to servicing for shaping rewards
+		demand_positions_snapshot = [(d.x, d.y) for d in self._state.demands]
+
+		# Previously the environment applied a one-shot expiry penalty when a
+		# demand actually expired. We now replace that with a per-step waiting
+		# penalty: each active (unexpired) demand contributes a small negative
+		# reward proportional to its capacity. Keep expired stats but set the
+		# one-shot expiry_penalty to 0 for backward compatibility.
+		
+		# apply expiry penalty (negative), scaled by expiry_penalty_scale
+		expiry_penalty = - float(self.expiry_penalty_scale) * expired_capacity if expired_count > 0 else 0.0
+
+		# compute per-step waiting penalty over currently active demands
+		active_total_capacity = sum(float(d.c) for d in self._state.demands)
+		wait_penalty = - float(self.wait_penalty_scale) * active_total_capacity if active_total_capacity > 0 else 0.0
+
+		# record any newly observed demands (covers both generated and externally appended demands)
+		for d in self._state.demands:
+			if id(d) not in self._episode_stats["seen_demands_ids"]:
+				self._episode_stats["seen_demands_ids"].add(id(d))
+				self._episode_stats["demand_count"] += 1
+				self._episode_stats["demand_capacity"] += float(d.c)
+		# 2) apply actions to agents
+		# record previous positions to compute route distance
+		prev_states = [
+			AgentState(
+				x=a.x,
+				y=a.y,
+				s=a.s,
+				service_time_remaining=a.service_time_remaining,
+				servicing_demand_id=a.servicing_demand_id,
+			)
+			for a in self._state.agent_states
+		]
+		prev_positions = [(a.x, a.y) for a in prev_states]
+		num_agents = len(prev_states)
+		# determine executed actions (agents in service are forced to wait)
+		effective_actions: List[Action] = []
+		for idx in range(num_agents):
+			raw_act = actions[idx] if idx < len(actions) else (0, 0)
+			if self.include_service_time and prev_states[idx].service_time_remaining > 0:
+				effective_actions.append((0, 0))
+			else:
+				dx = max(-1, min(1, raw_act[0]))
+				dy = max(-1, min(1, raw_act[1]))
+				effective_actions.append((dx, dy))
+		# stability penalty: count agents that changed their intended direction
+		if not self._prev_actions or len(self._prev_actions) != len(effective_actions):
+			self._prev_actions = [(0, 0) for _ in range(len(effective_actions))]
+		switch_count = 0
+		for idx, act in enumerate(effective_actions):
+			prev_act = self._prev_actions[idx]
+			if prev_act != (0, 0) and act != prev_act:
+				switch_count += 1
+		capacity_reward = 0.0
+		candidate_states: List[AgentState] = []
+		for i, (dx, dy) in enumerate(effective_actions):
+			a_prev = prev_states[i]
+			if self.include_service_time and a_prev.service_time_remaining > 0:
+				candidate_states.append(
+					AgentState(
+						x=a_prev.x,
+						y=a_prev.y,
+						s=a_prev.s,
+						service_time_remaining=a_prev.service_time_remaining,
+						servicing_demand_id=a_prev.servicing_demand_id,
+					)
+				)
+				continue
+			nx = max(0, min(self.width - 1, a_prev.x + dx))
+			ny = max(0, min(self.height - 1, a_prev.y + dy))
+			# if agent arrives at depot, refill to full capacity
+			new_s = a_prev.s
+			if (nx, ny) == self.depot:
+				new_s = self._full_capacity()
+			candidate_states.append(
+				AgentState(
+					x=nx,
+					y=ny,
+					s=new_s,
+					service_time_remaining=0,
+					servicing_demand_id=None,
+				)
+			)
+
+		# resolve collisions with "first-wins" policy:
+		# If multiple agents attempt to occupy the same non-depot cell this step, the lowest-index agent keeps the move
+		# (winner), and all other agents (losers) revert to their previous state.
+		pos_to_indices: Dict[Tuple[int, int], List[int]] = {}
+		for idx, st in enumerate(candidate_states):
+			pos_to_indices.setdefault((st.x, st.y), []).append(idx)
+		collided_agents: List[int] = []
+		for pos, indices in pos_to_indices.items():
+			if len(indices) > 1 and pos != self.depot:
+				indices_sorted = sorted(indices)
+				winner = indices_sorted[0]
+				losers = indices_sorted[1:]
+				for idx in losers:
+					prev = prev_states[idx]
+					candidate_states[idx] = AgentState(
+						x=prev.x,
+						y=prev.y,
+						s=prev.s,
+						service_time_remaining=prev.service_time_remaining,
+						servicing_demand_id=prev.servicing_demand_id,
+					)
+				collided_agents.extend(losers)
+
+		# second pass to ensure uniqueness after reverting (should hold if prev states were unique)
+		self._state.agent_states = candidate_states
+
+		# --- Demand approach bonus (potential shaping) ---
+		approach_bonus_value = 0.0
+		if self.approach_bonus_scale > 0.0 and demand_positions_snapshot:
+			max_cap = self.approach_bonus_max_dist if self.approach_bonus_max_dist > 0 else None
+			approach_delta = 0.0
+			for idx, (prev_pos, agent_state) in enumerate(zip(prev_positions, self._state.agent_states)):
+				px, py = prev_pos
+				after_pos = (agent_state.x, agent_state.y)
+				before_dist = min(math.hypot(px - dx, py - dy) for dx, dy in demand_positions_snapshot)
+				after_dist = min(math.hypot(after_pos[0] - dx, after_pos[1] - dy) for dx, dy in demand_positions_snapshot)
+				if max_cap is not None and max_cap > 0:
+					before_dist = min(before_dist, max_cap)
+					after_dist = min(after_dist, max_cap)
+				delta = before_dist - after_dist
+				if delta > 0:
+					approach_delta += delta
+			approach_bonus_value = self.approach_bonus_scale * approach_delta
+		# 3) serve demands, honoring service-time if enabled
+		served_count = 0
+		served_capacity = 0.0
+		served_details: List[Tuple[int, int, float]] = []
+		if self.include_service_time:
+			updated_agents = list(self._state.agent_states)
+			new_active_services: Dict[int, Tuple[Demand, int]] = {}
+			if getattr(self, "_active_services", None):
+				for agent_idx, (demand, remaining) in self._active_services.items():
+					new_active_services[agent_idx] = (demand, int(remaining))
+			# progress ongoing services
+			for agent_idx, agent in enumerate(updated_agents):
+				session = new_active_services.get(agent_idx)
+				if not session:
+					continue
+				demand, remaining = session
+				remaining = max(0, int(remaining) - 1)
+				if remaining <= 0:
+					new_s = max(0, agent.s - demand.c)
+					updated_agents[agent_idx] = AgentState(
+						x=agent.x,
+						y=agent.y,
+						s=new_s,
+						service_time_remaining=0,
+						servicing_demand_id=None,
+					)
+					capacity_reward += float(demand.c)
+					served_count += 1
+					served_capacity += float(demand.c)
+					served_details.append((demand.x, demand.y, float(demand.c)))
+					new_active_services.pop(agent_idx, None)
+				else:
+					updated_agents[agent_idx] = AgentState(
+						x=agent.x,
+						y=agent.y,
+						s=agent.s,
+						service_time_remaining=remaining,
+						servicing_demand_id=id(demand),
+					)
+					new_active_services[agent_idx] = (demand, remaining)
+			# attempt to start new services on co-located demands
+			pos_to_agent_idx = {(a.x, a.y): idx for idx, a in enumerate(updated_agents)}
+			remaining_demands: List[Demand] = []
+			for demand in self._state.demands:
+				agent_idx = pos_to_agent_idx.get((demand.x, demand.y))
+				if agent_idx is not None and agent_idx not in new_active_services:
+					agent = updated_agents[agent_idx]
+					if agent.s >= demand.c:
+						service_time = int(getattr(demand, "service_time", 0))
+						if service_time > 0:
+							updated_agents[agent_idx] = AgentState(
+								x=agent.x,
+								y=agent.y,
+								s=agent.s,
+								service_time_remaining=service_time,
+								servicing_demand_id=id(demand),
+							)
+							new_active_services[agent_idx] = (demand, service_time)
+							continue
+						else:
+							new_s = agent.s - demand.c
+							updated_agents[agent_idx] = AgentState(
+								x=agent.x,
+								y=agent.y,
+								s=new_s,
+								service_time_remaining=0,
+								servicing_demand_id=None,
+							)
+							capacity_reward += float(demand.c)
+							served_count += 1
+							served_capacity += float(demand.c)
+							served_details.append((demand.x, demand.y, float(demand.c)))
+							continue
+				remaining_demands.append(demand)
+			self._state.demands = remaining_demands
+			self._state.agent_states = updated_agents
+			self._active_services = new_active_services
+		else:
+			remaining: List[Demand] = []
+			pos_to_agent_idx = {(a.x, a.y): idx for idx, a in enumerate(self._state.agent_states)}
+			for d in self._state.demands:
+				agent_idx = pos_to_agent_idx.get((d.x, d.y))
+				if agent_idx is not None:
+					# agent on the demand cell
+					a = self._state.agent_states[agent_idx]
+					# Assumption: must have enough capacity to serve; otherwise skip
+					if a.s >= d.c:
+						# serve immediately
+						new_s = a.s - d.c
+						self._state.agent_states[agent_idx] = AgentState(
+							x=a.x,
+							y=a.y,
+							s=new_s,
+							service_time_remaining=0,
+							servicing_demand_id=None,
+						)
+						capacity_reward += float(d.c)
+						served_count += 1
+						served_capacity += float(d.c)
+						served_details.append((d.x, d.y, float(d.c)))
+						continue
+				# keep demand (not served)
+				remaining.append(d)
+			self._state.demands = remaining
+			self._active_services = {}
+		# compute route distance (Euclidean) this step
+		movement_distance = 0.0
+		agent_distances: List[float] = []
+		for idx, a in enumerate(self._state.agent_states):
+			px, py = prev_positions[idx]
+			d = math.hypot(a.x - px, a.y - py)
+			agent_distances.append(d)
+			movement_distance += d
+
+		# --- Density-scaled pairwise proximity penalty between agents ---
+		pairwise_penalty = 0.0
+		if self.distance_penalty_base > 0.0:
+			agents_now = self._state.agent_states
+			num_agents = len(agents_now)
+			if num_agents > 1:
+				grid_area = float(max(1, self.width * self.height))
+				active_total_capacity = sum(float(d.c) for d in self._state.demands)
+				# demand density: more active capacity per area -> stronger penalty
+				demand_density = active_total_capacity / grid_area
+				if demand_density > 0.0:
+					for i in range(num_agents):
+						ai = agents_now[i]
+						for j in range(i + 1, num_agents):
+							aj = agents_now[j]
+							dij = math.hypot(ai.x - aj.x, ai.y - aj.y)
+							if dij < self.distance_penalty_min_dist:
+								gap = self.distance_penalty_min_dist - dij
+								if gap > 0.0:
+									pairwise_penalty += gap * demand_density
+		pairwise_penalty_value = - self.distance_penalty_base * pairwise_penalty if pairwise_penalty > 0.0 else 0.0
+
+		# movement penalty discouraging zig-zag motion
+		move_penalty_value = - self.move_penalty_scale * movement_distance if self.move_penalty_scale > 0.0 else 0.0
+
+		# --- Exploration revisit penalty ---
+		exploration_penalty = 0.0
+		if self.exploration_history_n > 1:
+			for idx, a in enumerate(self._state.agent_states):
+				# ensure history list exists
+				if idx >= len(self._pos_history):
+					self._pos_history.append([])
+				hist = self._pos_history[idx]
+				cur_pos = (a.x, a.y)
+				# look back positions at t-2 .. t-n (skip immediate previous which is at end)
+				# hist stores chronological positions; last element is previous step position
+				look_back = min(len(hist)-1, self.exploration_history_n)
+				if look_back >= 2:
+					# indices: -2 (t-1), -3 (t-2), ... but we need t-2 .. t-n relative to current t after move
+					# Because we append later, hist[-1] is previous position (t-1). We compare current position with older ones.
+					for offset, h_index in enumerate(range(2, look_back+1), start=1):
+						past_pos = hist[-h_index]
+						if past_pos == cur_pos:
+							# weight rule: if match with position from t-2 (closest older), penalty = (exploration_history_n-1);
+							# if match with t-n (farthest), penalty = 1. offset=1 corresponds to t-2.
+							weight = max(1, (self.exploration_history_n - offset))
+							exploration_penalty += float(weight)
+		# scale exploration penalty (negative contribution)
+		exploration_penalty_value = - self.exploration_penalty_scale * exploration_penalty if exploration_penalty > 0 else 0.0
+
+		# --- Reward aggregation ---
+		capacity_reward_term = float(self.capacity_reward_scale) * float(capacity_reward)
+		switch_penalty_term = - float(self.switch_penalty_scale) * float(switch_count)
+		# Combine capacity reward with the per-step waiting penalty (negative)
+		# and the density-scaled pairwise proximity penalty.
+		reward = (
+			capacity_reward_term
+			+ wait_penalty
+			+ switch_penalty_term
+			# + pairwise_penalty_value
+			+ move_penalty_value
+			# + approach_bonus_value
+		)		#  + exploration_penalty_value
+
+		# update episode-level stats
+		self._episode_stats["served_count"] += served_count
+		self._episode_stats["served_capacity"] += served_capacity
+		self._episode_stats["pairwise_penalty_value"] += pairwise_penalty_value
+		self._episode_stats.setdefault('capacity_reward_term', 0)
+		self._episode_stats["capacity_reward_term"] += capacity_reward_term
+		self._episode_stats.setdefault("move_penalty_value", 0.0)
+		self._episode_stats["move_penalty_value"] += move_penalty_value
+		self._episode_stats.setdefault("approach_bonus_value", 0.0)
+		self._episode_stats["approach_bonus_value"] += approach_bonus_value
+		self._episode_stats["served_details"].extend(served_details)
+		# update expired stats in episode-level tracking
+		if expired_count > 0:
+			self._episode_stats.setdefault('expired_count', 0)
+			self._episode_stats.setdefault('expired_capacity', 0.0)
+			self._episode_stats['expired_count'] += expired_count
+			self._episode_stats['expired_capacity'] += expired_capacity
+			self._episode_stats.setdefault('expired_penalty', 0.0)
+			self._episode_stats['expired_penalty'] += -expiry_penalty  # store positive value for capacity, penalty stored as positive magnitude
+		for idx, d in enumerate(agent_distances):
+			# ensure agent_total_distances is large enough (in case num_agents was set after reset)
+			if idx >= len(self._episode_stats["agent_total_distances"]):
+				self._episode_stats["agent_total_distances"].extend([0] * (idx + 1 - len(self._episode_stats["agent_total_distances"])))
+			self._episode_stats["agent_total_distances"][idx] += d
+		self._episode_stats["total_distance"] += movement_distance
+		self._episode_stats["episode_reward"] += reward
+		self._episode_stats["switch_count"] += switch_count
+		self._episode_stats["switch_penalty"] += float(switch_penalty_term)
+		if self.exploration_history_n > 1:
+			self._episode_stats.setdefault("exploration_penalty_raw", 0.0)
+			self._episode_stats.setdefault("exploration_penalty_value", 0.0)
+			self._episode_stats["exploration_penalty_raw"] += exploration_penalty
+			self._episode_stats["exploration_penalty_value"] += exploration_penalty_value
+		# record per-step waiting penalty (negative or zero)
+		self._episode_stats.setdefault("wait_penalty_value", 0.0)
+		self._episode_stats["wait_penalty_value"] += wait_penalty
+		self._prev_actions = list(effective_actions)
+		# update position histories AFTER computing penalty
+		for idx, a in enumerate(self._state.agent_states):
+			if idx >= len(self._pos_history):
+				self._pos_history.append([])
+			hist = self._pos_history[idx]
+			hist.append((a.x, a.y))
+			# trim history to n+2 (keep some buffer) to bound memory
+			max_keep = max(2, self.exploration_history_n + 2)
+			if len(hist) > max_keep:
+				self._pos_history[idx] = hist[-max_keep:]
+
+		# 4) time update
+		self._state.time += 1
+		# Termination logic:
+		# - If reached hard cap max_end_time -> done
+		# - Else if past last generation time (max_time) and there are no
+		#   unserved demands AND all agents are at depot -> done
+		# - Else -> continue
+		if self._state.time >= self.max_end_time:
+			done = True
+		elif self._state.time > self.max_time:
+			no_unserved = (len(self._state.demands) == 0)
+			all_at_depot = all((a.x, a.y) == self.depot for a in self._state.agent_states)
+			done = bool(no_unserved and all_at_depot)
+		else:
+			done = False
+		# on episode end, print aggregated statistics and return them in info
+		info: Dict = {}
+		if collided_agents:
+			info["collisions"] = len(collided_agents)
+			self._episode_stats.setdefault("collision_count", 0)
+			self._episode_stats["collision_count"] += len(collided_agents)
+		if done:
+			es = self._episode_stats
+			if verbose:
+				print("=== Episode summary ===")
+				print(f"Total demands encountered: count={es['demand_count']}, total_capacity={es['demand_capacity']}")
+				print(f"Served: count={es['served_count']}, served_capacity={es['served_capacity']}, capacity_reward={es.get('capacity_reward_term', 0.0)}")
+				print(f"Waiting penalty accumulated: {es.get('wait_penalty_value', 0.0)}")
+				# if es.get('expired_count', 0) > 0:
+				# 	print(f"Expired (timed-out): count={es.get('expired_count',0)}, capacity={es.get('expired_capacity',0.0)}, penalty={es.get('expired_penalty',0.0)}")
+				# if es.get('collision_count', 0) > 0:
+				# 	print(f"Agent collision resolutions: {es.get('collision_count', 0)}")
+				# if es.get('switch_count', 0) > 0:
+				# 	print(f"Target switches penalized: count={es.get('switch_count', 0)}, penalty={es.get('switch_penalty', 0.0)}")
+				# if self.exploration_history_n > 1:
+				# 	print(f"Exploration revisit penalty: raw={es.get('exploration_penalty_raw', 0.0)}, value={es.get('exploration_penalty_value', 0.0)}")
+				remaining_count = len(self._state.demands)
+				remaining_capacity = sum(float(d.c) for d in self._state.demands)
+				# print(f"Remaining unserved: count={remaining_count}, capacity={remaining_capacity}")
+				
+				print(f"Agent total distance: {es['agent_total_distances']}")
+				print(f"Total distance this episode: {es['total_distance']}")
+				print(f"Episode cumulative reward: {es['episode_reward']}")
+			else:
+				remaining_count = len(self._state.demands)
+				remaining_capacity = sum(float(d.c) for d in self._state.demands)
+			# also return stats in info for external use
+			info['episode_stats'] = {
+				'counts': {'encountered': es['demand_count'], 'served': es['served_count'], 'remaining': remaining_count},
+				'capacities': {'encountered': es['demand_capacity'], 'served': es['served_capacity'], 'remaining': remaining_capacity},
+				'served_details': list(es['served_details']),
+				'agent_total_distances': list(es['agent_total_distances']),
+				'total_distance': es['total_distance'],
+				'episode_reward': es['episode_reward'],
+				'switch_penalty': es.get('switch_penalty', 0.0),
+				'switch_count': es.get('switch_count', 0),
+			}
+		return self._obs(), reward, done, info
+
+	# --- Helpers ---
+	def _obs(self) -> Dict:
+		assert self._state is not None
+		active_demands = [d for d in self._state.demands if d.t <= self._state.time]
+		return {
+			"time": self._state.time,
+			"depot": self._state.depot,
+			"agent_states": [(a.x, a.y, a.s) for a in self._state.agent_states],
+			"demands": [(d.x, d.y, d.t, d.c, d.end_t) for d in active_demands],
+			"width": self.width,
+			"height": self.height,
+			**(
+				{
+					"demands_with_service": [(d.x, d.y, d.t, d.c, d.end_t, d.service_time) for d in active_demands],
+					"demand_service_times": [d.service_time for d in active_demands],
+					"agent_service_time_remaining": [a.service_time_remaining for a in self._state.agent_states],
+				}
+				if self.include_service_time else {}
+			),
+		}
+
+	# Property to set/get number of agents post-init
+	@property
+	def num_agents(self) -> int:
+		return getattr(self, "_num_agents", len(self._state.agent_states) if self._state else 0)
+
+	@num_agents.setter
+	def num_agents(self, n: int) -> None:
+		self._num_agents = n
+
+	def _spawn_initial_agent_states(self, num_agents: int, seed: Optional[int]) -> List[AgentState]:
+		if num_agents <= 0:
+			return []
+		dx, dy = self.depot
+		full = self._full_capacity()
+		return [AgentState(x=dx, y=dy, s=full) for _ in range(num_agents)]
