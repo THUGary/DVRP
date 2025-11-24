@@ -301,32 +301,32 @@ class Neighborhood:
     def _sample_cluster_2d(self, n_points: int, burst_mode:bool=False) -> np.ndarray:
         """sample points in 2D with exponential decay from center"""
 
-        scale_factor= self.local_params.get("scale_factor")
-        if scale_factor is None:
-            print("No cluster distribution params!")
-            return None
-        
+        scale_factor = self.local_params.get("scale_factor", 1.0)
         if burst_mode:
-            scale_factor=np.sqrt(n_points)/5.0
+            scale_factor = max(np.sqrt(n_points) / 5.0, 1e-3)  # 避免 scale_factor 太小导致概率溢出
         
         W, H = self.width, self.height
-        
+
         # create distance grid
         x_coords, y_coords = np.meshgrid(np.arange(W), np.arange(H))
-        distances = np.sqrt((x_coords - self.center_x)**2 + (y_coords - self.center_y)**2)
+        distances = np.sqrt((x_coords - self.center_x) ** 2 + (y_coords - self.center_y) ** 2)
 
         # compute exponential decay probabilities
         probabilities = np.exp(-distances / scale_factor).flatten()
-        probabilities /= probabilities.sum()  # normalize
+        
+        # 防止全零导致 NaN
+        if np.all(probabilities == 0):
+            probabilities = np.ones_like(probabilities)
+        probabilities /= probabilities.sum()
 
         # sample according to probabilities
         total_cells = W * H
         indices = np.random.choice(total_cells, size=n_points, replace=(n_points > total_cells), p=probabilities)
-        
+
         # index to (x,y)
         x_selected = indices % W
         y_selected = indices // W
-        
+
         return np.column_stack((x_selected, y_selected))
 
     def _sample_explosion_2d(self, n_points: int, burst_mode:bool=False) -> np.ndarray:  ##############
@@ -358,28 +358,27 @@ class Neighborhood:
         y_selected = indices // W
         return np.column_stack((x_selected, y_selected))
 
-    def _sample_implosion_2d(self, n_points: int, burst_mode:bool=False) -> np.ndarray:##############
-        """sample points in 2D with exponential decay from center"""
+    def _sample_implosion_2d(self, n_points: int, burst_mode: bool = False) -> np.ndarray:
+        """sample points in 2D with 'implosion' pattern (sharply decaying towards center)"""
 
-        scale_factor= self.local_params.get("scale_factor")
-        if scale_factor is None:
-            print("No cluster distribution params!")
-            return None
-        
+        scale_factor = self.local_params.get("scale_factor", 1.0)
         if burst_mode:
-            scale_factor=np.sqrt(n_points)/5.0
+            scale_factor = max(np.sqrt(n_points) / 5.0, 1e-3)  # 避免 scale_factor 太小
         
         W, H = self.width, self.height
-        
-        x_coords, y_coords = np.meshgrid(np.arange(W), np.arange(H))
-        distances = np.sqrt((x_coords - self.center_x)**2 + (y_coords - self.center_y)**2)
-
-        # Implosion: sharply decaying exponential (strongly centered)
-        probabilities = np.exp(-(distances / scale_factor)**2)
-        probabilities = probabilities.flatten()
-        probabilities /= probabilities.sum()
 
         # distance grid
+        x_coords, y_coords = np.meshgrid(np.arange(W), np.arange(H))
+        distances = np.sqrt((x_coords - self.center_x) ** 2 + (y_coords - self.center_y) ** 2)
+
+        # Implosion: sharply decaying exponential
+        probabilities = np.exp(-(distances / scale_factor) ** 2).flatten()
+
+        # 防止全零导致 NaN
+        if np.all(probabilities == 0):
+            probabilities = np.ones_like(probabilities)
+        probabilities /= probabilities.sum()
+
         total_cells = W * H
         indices = np.random.choice(total_cells, size=n_points, replace=(n_points > total_cells), p=probabilities)
 
