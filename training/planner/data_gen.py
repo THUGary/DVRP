@@ -1,0 +1,640 @@
+from __future__ import annotations
+import argparse
+import os
+from typing import List, Tuple, Dict, Any
+from collections import deque
+
+import torch
+import math
+
+# Ensure project root on sys.path from nested training directory
+import sys
+import pathlib
+_ROOT = pathlib.Path(__file__).resolve().parent
+while _ROOT != _ROOT.parent and not (_ROOT / "configs.py").exists():
+    _ROOT = _ROOT.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+try:
+    import numpy as _np  # 仅用于保存前的类型规整；加载时无需 numpy
+except Exception:  # numpy 可选依赖
+    _np = None
+
+from configs import get_default_config, Config
+from environment.env import GridEnvironment
+from agent.generator import RuleBasedGenerator
+from agent.generator.base import Demand, BaseDemandGenerator
+from agent.controller import RuleBasedController
+from agent.planner import (
+    RuleBasedPlanner,
+    FastReactiveInserter,
+    RepairBasedStabilityOptimizer,
+    DistributedCooperativePlanner,
+)
+from agent.planner.base import AgentState, Target
+from utils.state_manager import PlanningState, update_planning_state
+
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def _to_builtin_number(x: Any) -> Any:
+    """将 numpy 标量/torch 标量 转换为内置 Python number，其他类型原样返回。"""
+    # numpy 标量
+    if _np is not None and isinstance(x, _np.generic):
+        return x.item()
+    # torch 标量张量
+    if isinstance(x, torch.Tensor) and x.dim() == 0:
+        return x.item()
+    return x
+
+
+def _sanitize_for_torch_save(obj: Any) -> Any:
+    """
+    递归地将对象转换为 PyTorch 2.6+ 在默认 weights_only 加载下也安全/可兼容的结构：
+    - 仅包含基础类型(int/float/bool/str/None)、
+      以及由 list/tuple/dict 组合的容器；
+    - 对 numpy.ndarray 转换为嵌套 Python 列表（其中元素再递归规整为内置标量）；
+    - 对 numpy 标量/torch 0D 张量转换为内置标量；
+    - 对 torch 张量保留为张量（weights_only 允许张量）；
+    - 对 deque/set 转换为 list。
+    注意：不引入任何用户自定义类实例，避免触发反序列化限制。
+    """
+    # None 或基础类型
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        # 防止 NaN/Inf 作为 float 落盘造成解析差异：统一为 Python float
+        if isinstance(obj, float):
+            if math.isnan(obj):
+                return float("nan")
+            if math.isinf(obj):
+                return float("inf") if obj > 0 else float("-inf")
+        return obj
+
+    # numpy 数组
+    if _np is not None and isinstance(obj, _np.ndarray):
+        # 转换为嵌套 list，并递归规整元素
+        return _sanitize_for_torch_save(obj.tolist())
+
+    # numpy 标量 / torch 标量
+    builtin_num = _to_builtin_number(obj)
+    if builtin_num is not obj:
+        return builtin_num
+
+    # torch 张量（非标量）
+    if isinstance(obj, torch.Tensor):
+        return obj.contiguous()
+
+    # 容器类型
+    if isinstance(obj, (list, tuple, set, deque)):
+        seq = list(obj)  # 统一为 list
+        return [_sanitize_for_torch_save(v) for v in seq]
+
+    if isinstance(obj, dict):
+        # 键尽量转为 str，值递归规整
+        new_dict: Dict[str, Any] = {}
+        for k, v in obj.items():
+            if isinstance(k, (int, float, bool)):
+                k = str(k)
+            elif not isinstance(k, str):
+                k = str(k)
+            new_dict[k] = _sanitize_for_torch_save(v)
+        return new_dict
+
+    # 元组(如坐标)可能出现在上面的分支；若落到这里，兜底转字符串避免自定义类型
+    return str(obj)
+
+
+class StaticSnapshotGenerator(BaseDemandGenerator):
+    """Wrap an existing generator so all demands appear at time 0 (static VRP snapshot)."""
+
+    def __init__(self, base_generator: BaseDemandGenerator):
+        super().__init__(base_generator.width, base_generator.height, **base_generator.params)
+        self._base = base_generator
+        self._snapshot: List[Demand] = []
+        self._released = False
+
+    def reset(self, seed: int | None = None) -> None:
+        self._base.reset(seed)
+        self._snapshot = []
+        max_time = int(self.params.get("max_time", getattr(self._base, "max_time", 1)))
+        max_time = max(1, max_time)
+        for t in range(max_time):
+            demands_t = self._base.sample(t)
+            if not demands_t:
+                continue
+            for demand in demands_t:
+                static_demand = Demand(
+                    x=int(demand.x),
+                    y=int(demand.y),
+                    t=0,
+                    c=int(demand.c),
+                    end_t=int(demand.end_t),
+                    service_time=int(getattr(demand, "service_time", 0)),
+                )
+                self._snapshot.append(static_demand)
+        self._released = False
+
+    def sample(self, t: int) -> List[Demand]:
+        if t == 0 and not self._released:
+            self._released = True
+            # 返回一个副本，避免调用方修改内部缓存
+            return list(self._snapshot)
+        return []
+
+
+def _clip_history_sequences(
+    history: List[List[Tuple[int, int]]],
+    window: int,
+) -> List[List[Tuple[int, int]]]:
+    """裁剪历史序列长度，确保仅保留最近 window 个坐标，并规范化为 int。"""
+    trimmed: List[List[Tuple[int, int]]] = []
+    max_len = max(1, int(window))
+    for seq in history:
+        if not seq:
+            trimmed.append([])
+            continue
+        sliced = seq[-max_len:]
+        trimmed.append([(int(x), int(y)) for (x, y) in sliced])
+    return trimmed
+
+
+def _build_planner(planner_type: str, capacity: int | None = None):
+    if planner_type == "greedy":
+        return RuleBasedPlanner(full_capacity=capacity)
+    if planner_type == "fri":
+        return FastReactiveInserter()
+    if planner_type == "rbso":
+        return RepairBasedStabilityOptimizer(destroy_ratio=0.3, local_search_iters=10)
+    if planner_type == "dcp":
+        return DistributedCooperativePlanner(auction_rounds=5, bid_strategy="time_urgency")
+    raise ValueError(f"Unknown planner type: {planner_type}")
+
+
+def _unique_nodes_by_xy(observations: List[Tuple[int, int, int, int, int]]) -> List[Tuple[int, int, int, int, int]]:
+    """去重：按 (x,y) 保留第一条，且忽略 c<=0 的点（与 RuleBasedPlanner 的可行性过滤一致）。"""
+    seen = set()
+    uniq: List[Tuple[int, int, int, int, int]] = []
+    for (x, y, t_arrival, c, t_due) in observations:
+        if c <= 0:
+            continue
+        key = (x, y)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append((x, y, t_arrival, c, t_due))
+    return uniq
+
+
+def _target_to_label(
+    target: Tuple[int, int] | None,
+    nodes_unique: List[Tuple[int, int, int, int, int]],
+) -> int:
+    """将目标坐标映射为分类标签索引。约定 depot=0，nodes 为 1..N（对应 nodes_unique[0..N-1]）。"""
+    N = len(nodes_unique)
+    if target is None:
+        return 0
+    tx, ty = target
+    for i, (x, y, *_rest) in enumerate(nodes_unique):
+        if (x, y) == (tx, ty):
+            return i + 1
+    return 0
+
+def _targets_to_labels(
+    tgt_deque: deque[Tuple[int, int]],
+    nodes_unique: List[Tuple[int, int, int, int, int]],
+    max_len: int | None = None,
+) -> List[int]:
+    """将完整目标序列转换为标签（不再裁剪为固定 k）。"""
+    labels: List[int] = []
+    sanitized_len = max_len if (max_len is not None and max_len > 0) else None
+    for xy in tgt_deque:
+        labels.append(_target_to_label(xy, nodes_unique))
+        if sanitized_len is not None and len(labels) >= sanitized_len:
+            break
+    if not labels:
+        labels.append(0)
+    return labels
+
+
+def collect_rows_from_call(
+    time_now: int,
+    observations: List[Tuple[int, int, int, int, int]],
+    agent_states_xyz: List[Tuple[int, int, int]],
+    depot_xy: Tuple[int, int],
+    current_plans: List[deque[Tuple[int, int]]],
+    global_nodes: List[Tuple[int, int, int, int, int]] | None,
+    serve_mark: List[int] | None,
+    unserved_count: int | None,
+    targets: List[deque[Tuple[int, int]]],
+    history_positions: List[List[Tuple[int, int]]],
+    history_targets: List[List[Tuple[int, int]]],
+    history_window: int,
+    meta: Dict[str, Any],
+    full_capacity: int,
+    target_k: int | None = None,
+) -> Dict[str, Any]:
+    """从一次 planner 调用组装一个包含所有 agents 的监督样本 row（labels 为变长序列）。"""
+    nodes_unique = _unique_nodes_by_xy(observations)
+    # 校验：禁止需求点与 depot 坐标重合（硬错误，避免错误样本进入数据集）
+    for (x, y, _ta, _c, _due) in nodes_unique:
+        if (x, y) == tuple(depot_xy):
+            raise ValueError(
+                f"[DATA-CHECK][depot-overlap] Encountered a demand at depot position {depot_xy} at time={time_now}. "
+                f"Please adjust generator or map size to avoid overlaps."
+            )
+    N = len(nodes_unique)
+    A = len(agent_states_xyz)
+
+    # agents 列表与二位标签 [A, K]
+    agents_list: List[Tuple[int, int, int, int]] = []
+    labels_ak: List[List[int]] = []
+    for agent_id, (ax, ay, s) in enumerate(agent_states_xyz):
+        agents_list.append((ax, ay, s, time_now))
+        labels_k = _targets_to_labels(targets[agent_id], nodes_unique, max_len=target_k)
+        # debug
+        # print(f"Agent {agent_id} targets: {list(targets[agent_id])} -> labels: {labels_k}")
+        labels_ak.append(labels_k)
+
+    # 基本行数据
+    row: Dict[str, Any] = {
+        "nodes": nodes_unique,                    # List[(x, y, t_arrival, c, t_due)]
+        "node_mask": [False] * N,                 # 简化版，全部可选；pad 时会额外mask
+        "agents": agents_list,                    # List[(x, y, s, t_agent)], 长度 A
+        "depot": (depot_xy[0], depot_xy[1], time_now),
+        "labels_ak": labels_ak,                   # List[List[int]]，每个 agent 为变长序列
+        "full_capacity": int(full_capacity),      # 每个 agent 回 depot 恢复的满容量
+        "valid_N": N,
+        "history_positions": _clip_history_sequences(history_positions, history_window),
+        "history_targets": _clip_history_sequences(history_targets, history_window),
+        "target_k": int(target_k) if target_k is not None and target_k > 0 else None,
+        "planner_inputs": {
+            "time": time_now,
+            "horizon": max((len(q) for q in targets), default=0),
+            "current_plans": [list(q) for q in current_plans],
+            # 注意：global_nodes 在 state_manager 中为 (x,y,t_arrival,t_due,demand)
+            "global_nodes": list(global_nodes) if global_nodes is not None else [],
+            "serve_mark": list(serve_mark) if serve_mark is not None else None,
+            "unserved_count": int(unserved_count) if unserved_count is not None else None,
+            "depot": depot_xy,
+        },
+        "meta": {**meta, "agent_num": A, "target_k": target_k},
+        "time_now": int(time_now),
+    }
+    # 调试输出（可按需开启）
+    # print(f"[DATA-COLLECT] ep={meta.get('episode_id')} step={meta.get('step_id')}")
+    # print(f"agents: {agents_list}")
+    # print(f"depot: {depot_xy} {time_now}")
+    # print(f"labels_ak: {labels_ak}")
+    # print(f"nodes_unique: {nodes_unique}")
+
+    # 额外一致性校验（仅日志，不修改标签）：确保 labels_ak 不违反容量约束
+    # 规则：从各自 agent 的当前空间 s 出发，按 labels_ak 顺序执行；若命中 depot(0)，则将空间恢复为 full_capacity；
+    # 若命中某节点 i (1<=i<=N)，则需要 nodes_unique[i-1][3] <= 当前空间。
+    try:
+        demands_vec = [int(x[3]) for x in nodes_unique]  # c 字段
+        for a_idx, (ax, ay, s, _ta) in enumerate(agents_list):
+            space = int(s)
+            trace_space_before: List[int] = []
+            trace_space_after: List[int] = []
+            trace_labels: List[int] = []
+            trace_demands: List[int] = []
+            violated_detail = None
+            for step_idx, lab in enumerate(labels_ak[a_idx]):
+                trace_space_before.append(space)
+                trace_labels.append(lab)
+                if lab == 0:
+                    trace_demands.append(-1)
+                    space = int(full_capacity)
+                    trace_space_after.append(space)
+                    continue
+                if 1 <= lab <= N:
+                    req = demands_vec[lab - 1]
+                    trace_demands.append(int(req))
+                    if req > space and violated_detail is None:
+                        violated_detail = (step_idx, lab, int(req), int(space))
+                    space = max(0, space - req)
+                    trace_space_after.append(space)
+                else:
+                    trace_demands.append(-2)
+                    space = int(full_capacity)
+                    trace_space_after.append(space)
+            if violated_detail is not None:
+                v_step, v_lab, v_req, v_space = violated_detail
+                # 输出更详细的轨迹，便于定位原因
+                print(
+                    f"[DATA-CHECK][cap-violation] ep={meta.get('episode_id')} step={meta.get('step_id')} agent={a_idx} "
+                    f"k={v_step} label_node={v_lab} demand={v_req} space={v_space} — labels imply demand>space\n"
+                    f"  labels_k={trace_labels}\n  demands@labels={trace_demands}\n  space_before={trace_space_before}\n  space_after={trace_space_after}"
+                )
+                # 返回错误
+                raise ValueError(
+                    f"Capacity violation detected for agent {a_idx} at step {v_step} in episode {meta.get('episode_id')} step {meta.get('step_id')}: "
+                    f"label_node={v_lab}, demand={v_req}, available_space={v_space}."
+                )
+    except Exception as e:
+        print(f"[DATA-CHECK] capacity validation skipped due to error: {e}")
+    return row
+
+
+def generate_dataset(
+    cfg: Config,
+    episodes: int,
+    planner_type: str,
+    seed: int,
+    out_dir: str,
+    val_ratio: float,
+    replan_policy: str = "always",  # "always" | "on_new_or_empty"
+    plan_horizon: int = 6,
+    history_window: int = 16,
+    mode: str = "dynamic",
+    snapshot_only: bool = False,
+    static_full_episode: bool = False,
+    target_k: int | None = None,
+    prefix: str = "plans",
+) -> Dict[str, str]:
+    """运行 episodes，收集 rows 并落盘"""
+    mode = mode.lower()
+    if mode not in {"dynamic", "static"}:
+        raise ValueError(f"Unsupported mode '{mode}'. Expected 'dynamic' or 'static'.")
+    _ensure_dir(out_dir)
+    all_rows: List[Dict[str, Any]] = []
+    rng = None
+    history_window = max(1, int(history_window))
+
+    for ep in range(episodes):
+        # 将 depot 传入生成器，避免生成与 depot 重叠的需求
+        # cfg.generator_params 可能已包含 'depot'（在 configs.__post_init__ 中替换占位符），
+        # 为避免重复关键字参数导致 TypeError，我们先复制并弹出可能的重复项。
+        gen_params = dict(cfg.generator_params) if cfg.generator_params is not None else {}
+        gen_params.pop("depot", None)
+        base_gen = RuleBasedGenerator(cfg.width, cfg.height, depot=cfg.depot, **gen_params)
+        gen = StaticSnapshotGenerator(base_gen) if mode == "static" else base_gen
+        env = GridEnvironment(
+            width=cfg.width,
+            height=cfg.height,
+            num_agents=cfg.num_agents,
+            capacity=cfg.capacity,
+            depot=cfg.depot,
+            generator=gen,
+            max_time=cfg.max_time,
+            expiry_penalty_scale=float(getattr(cfg, "expiry_penalty_scale", 5.0)),
+            switch_penalty_scale=float(getattr(cfg, "switch_penalty_scale", 0.01)),
+            capacity_reward_scale=float(getattr(cfg, "capacity_reward_scale", 10.0)),
+            exploration_history_n=int(getattr(cfg, "exploration_history_n", 0)),
+            exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
+            wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
+            max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2)),
+            include_service_time=bool(getattr(cfg, "include_service_time", False)),
+        )
+        env.num_agents = cfg.num_agents
+        planner = _build_planner(planner_type, capacity=cfg.capacity)
+        controller = RuleBasedController(**cfg.controller_params)
+
+        obs = env.reset(seed + ep)
+        if mode == "static":
+            seeded = []
+            generator = getattr(env, "_generator", None)
+            env_state = getattr(env, "_state", None)
+            if generator is not None and env_state is not None:
+                try:
+                    seeded = generator.sample(0)
+                except Exception:
+                    seeded = []
+            if seeded and env_state is not None:
+                env_state.demands.extend(seeded)
+                stats = getattr(env, "_episode_stats", None)
+                if isinstance(stats, dict) and "seen_demands_ids" in stats:
+                    for demand in seeded:
+                        demand_id = id(demand)
+                        if demand_id in stats["seen_demands_ids"]:
+                            continue
+                        stats["seen_demands_ids"].add(demand_id)
+                        stats["demand_count"] += 1
+                        stats["demand_capacity"] += float(getattr(demand, "c", 0))
+                # refresh observation so the very first planner call sees seeded demands
+                try:
+                    obs = env._obs()  # type: ignore[attr-defined]
+                except AttributeError:
+                    # fallback: reconstruct minimal observation
+                    obs = {
+                        "time": env_state.time,
+                        "depot": env_state.depot,
+                        "agent_states": [(a.x, a.y, a.s) for a in env_state.agent_states],
+                        "demands": [(d.x, d.y, d.t, d.c, d.end_t) for d in env_state.demands],
+                        "width": env.width,
+                        "height": env.height,
+                    }
+        planning_state = PlanningState()
+        planning_state.reset(cfg.num_agents)
+
+        prev_demands = []
+        done = False
+        # 初始化历史轨迹（位置 & 目标）
+        history_positions = [deque(maxlen=history_window) for _ in range(cfg.num_agents)]
+        history_targets = [deque(maxlen=history_window) for _ in range(cfg.num_agents)]
+        depot_xy0 = (int(obs["depot"][0]), int(obs["depot"][1]))
+        for agent_idx, (ax, ay, _s) in enumerate(obs["agent_states"]):
+            history_positions[agent_idx].append((int(ax), int(ay)))
+            history_targets[agent_idx].append(depot_xy0)
+
+        step_id = 0
+        while not done:
+            demands = obs["demands"]  # [(x, y, t, c, end_t), ...]
+            new_demands = [d for d in demands if d not in prev_demands]
+
+            agent_states = obs["agent_states"]  # [(x,y,s), ...]
+            update_planning_state(
+                planning_state=planning_state,
+                agent_states=agent_states,
+                new_demands=new_demands,
+                obs_demands=demands,
+            )
+
+            # 确定是否重规划
+            can_continue = all(len(q) > 0 for q in planning_state.current_plans)
+            need_replan = True if replan_policy == "always" else (len(new_demands) > 0 or not can_continue)
+
+            # 计划（兼容 BasePlanner.plan 的全部参数）
+            if need_replan:
+                agents = [AgentState(x=a[0], y=a[1], s=a[2]) for a in agent_states]
+                targets = planner.plan(
+                    observations=demands,
+                    agent_states=agents,
+                    depot=obs["depot"],
+                    t=obs["time"],
+                    horizon=plan_horizon,
+                    current_plans=planning_state.current_plans,
+                    global_nodes=planning_state.global_nodes.nodes,
+                    serve_mark=planning_state.global_nodes.serve_mark,
+                    unserved_count=planning_state.get_unserved_count(),
+                )
+                planning_state.update_plans(targets)
+            else:
+                targets = planning_state.current_plans
+
+            # 收集监督样本 rows（以“下一步目标”作为标签）
+            meta = {
+                "episode_id": ep,
+                "step_id": step_id,
+                "planner": planner_type,
+                "map_wid": cfg.width,
+                "map_hei": cfg.height,
+                "agent_num": cfg.num_agents,
+                "capacity": cfg.capacity,
+                "max_time": cfg.max_time,
+                "mode": mode,
+                "plan_horizon": plan_horizon,
+                "target_k": target_k,
+            }
+            hist_pos_snapshot = [[(int(px), int(py)) for (px, py) in seq] for seq in history_positions]
+            hist_tgt_snapshot = [[(int(tx), int(ty)) for (tx, ty) in seq] for seq in history_targets]
+
+            row = collect_rows_from_call(
+                time_now=obs["time"],
+                observations=demands,
+                agent_states_xyz=agent_states,
+                depot_xy=obs["depot"],
+                current_plans=planning_state.current_plans,
+                global_nodes=planning_state.global_nodes.nodes,
+                serve_mark=planning_state.global_nodes.serve_mark,
+                unserved_count=planning_state.get_unserved_count(),
+                targets=targets,
+                history_positions=hist_pos_snapshot,
+                history_targets=hist_tgt_snapshot,
+                history_window=history_window,
+                meta=meta,
+                full_capacity=cfg.capacity,
+                target_k=target_k,
+            )
+            all_rows.append(row)
+
+            if mode == "static" and static_full_episode:
+                depot_xy_now = (int(obs["depot"][0]), int(obs["depot"][1]))
+                all_demands_cleared = len(obs["demands"]) == 0
+                all_agents_home = all(
+                    int(ax) == depot_xy_now[0] and int(ay) == depot_xy_now[1]
+                    for (ax, ay, _s) in agent_states
+                )
+                if all_demands_cleared and all_agents_home:
+                    break
+
+            if snapshot_only:
+                break
+
+            # 环境前进一步
+            # 让每个 agent 朝队首目标移动一步（与 train.py 一致）
+            actions: List[Tuple[int, int]] = []
+            assigned_targets: List[Tuple[int, int]] = []
+            depot_xy_loop = (int(obs["depot"][0]), int(obs["depot"][1]))
+            for i, (x, y, s) in enumerate(agent_states):
+                # 弹出已到达
+                while len(planning_state.current_plans[i]) > 0 and planning_state.current_plans[i][0] == (x, y):
+                    planning_state.current_plans[i].popleft()
+                if len(planning_state.current_plans[i]) == 0:
+                    actions.append((0, 0))
+                    assigned_targets.append(depot_xy_loop)
+                else:
+                    actions.append(controller.act((x, y), planning_state.current_plans[i]))
+                    assigned_targets.append(tuple(planning_state.current_plans[i][0]))
+            next_obs, reward, done, info = env.step(actions)
+            for idx, tgt_xy in enumerate(assigned_targets):
+                history_targets[idx].append((int(tgt_xy[0]), int(tgt_xy[1])))
+            for idx, (nx_pos, ny_pos, _ns) in enumerate(next_obs["agent_states"]):
+                history_positions[idx].append((int(nx_pos), int(ny_pos)))
+            obs = next_obs
+            prev_demands = list(demands)
+            step_id += 1
+
+    # 拆分 Train/Val
+    total = len(all_rows)
+    n_val = int(total * val_ratio)
+    val_rows = all_rows[:n_val]
+    trn_rows = all_rows[n_val:]
+
+    safe_prefix = prefix or "plans"
+    train_path = os.path.join(out_dir, f"{safe_prefix}_train_{cfg.width}_{cfg.num_agents}.pt")
+    val_path = os.path.join(out_dir, f"{safe_prefix}_val_{cfg.width}_{cfg.num_agents}.pt")
+    # 保存前进行类型规整，确保不包含 numpy 标量/数组、deque 或自定义对象
+    payload = {
+        "rows": trn_rows,
+        "meta": {
+            "total_rows": len(trn_rows),
+            "val_rows": len(val_rows),
+            "version": "v2",
+            "weights_only_compatible": True,
+        },
+    }
+    safe_train = _sanitize_for_torch_save(payload)
+    safe_val = _sanitize_for_torch_save({"rows": val_rows, "meta": payload["meta"]})
+
+    torch.save(safe_train, train_path)
+    torch.save(safe_val, val_path)
+    print(f"[DATA] saved train={train_path} ({len(trn_rows)}) val={val_path} ({len(val_rows)})")
+    return {"train": train_path, "val": val_path}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Generate supervised rows by running planner in env")
+    ap.add_argument("--episodes", type=int, default=200)
+    ap.add_argument("--planner", type=str, default="greedy", choices=["greedy", "fri", "rbso", "dcp"])
+    ap.add_argument("--map_wid", type=int, default=20)
+    ap.add_argument("--map_hei", type=int, default=20)
+    ap.add_argument("--agent_num", type=int, default=2)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--val_ratio", type=float, default=0.1)
+    ap.add_argument("--out_dir", type=str, default=None,
+                    help="Base path to write rows (defaults to data/static_rows or data/dynamicrows based on stage)")
+    ap.add_argument("--prefix", type=str, default="plans", help="Filename prefix for saved train/val tensors")
+    ap.add_argument("--replan_policy", type=str, default="always", choices=["always", "on_new_or_empty"])
+    ap.add_argument("--plan_horizon", type=int, default=6, help="每次 planner 调用的规划步数")
+    ap.add_argument("--history_window", type=int, default=16, help="每条样本保留的历史轨迹长度")
+    ap.add_argument("--target_k", type=int, default=None, help="限制每个 agent 标签序列的长度 (<=0 表示不限制)")
+    ap.add_argument("--mode", type=str, choices=["dynamic", "static"], default="dynamic",
+                    help="dynamic=在线生成需求; static=所有需求在 t=0 一次性放出")
+    ap.add_argument("--stage", type=str, choices=["static", "dynamic"], default="dynamic",
+                    help="stage=static 将强制 static 模式并默认采集整局；使用 --snapshot-only 只记录首个快照")
+    ap.add_argument("--snapshot-only", action="store_true", help="每个 episode 仅记录第一次规划快照（静态训练阶段使用）")
+    # static_full_episode now defaults to True when stage=static; snapshot-only flag handles single snapshot capture
+    args = ap.parse_args()
+
+    cfg = get_default_config()
+    cfg.width = args.map_wid
+    cfg.height = args.map_hei
+    cfg.num_agents = args.agent_num
+
+    stage = args.stage.lower()
+    mode = args.mode
+    snapshot_only = args.snapshot_only
+    static_full_episode = True if stage == "static" else False
+    if stage == "static":
+        mode = "static"
+        if snapshot_only:
+            static_full_episode = False
+
+    target_k = args.target_k if args.target_k is not None and args.target_k > 0 else None
+
+    if args.out_dir is None:
+        args.out_dir = "data/static_rows" if stage == "static" else "data/dynamicrows"
+
+    generate_dataset(
+        cfg=cfg,
+        episodes=args.episodes,
+        planner_type=args.planner,
+        seed=args.seed,
+        out_dir=args.out_dir,
+        val_ratio=args.val_ratio,
+        replan_policy=args.replan_policy,
+        plan_horizon=args.plan_horizon,
+        history_window=args.history_window,
+        mode=mode,
+        snapshot_only=snapshot_only,
+        static_full_episode=static_full_episode,
+        target_k=target_k,
+        prefix=args.prefix,
+    )
+
+
+if __name__ == "__main__":
+    main()

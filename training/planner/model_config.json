@@ -1,0 +1,7 @@
+{
+  "d_model": 128,
+  "nhead": 8,
+  "nlayers": 2,
+  "adapter_dim": 64,
+  "lateness_lambda": 0.0
+}
