@@ -1,4 +1,4 @@
-Problem_Name,Number_of_Vehicles,Total_Travel_Distance,Vehicle_Capacity
+problem_name,vehicle_number,total_travel_distance,vehicle_capacity
 C101,10,828.93664,200.0
 C102,10,828.93664,200.0
 C103,10,828.06464,200.0
