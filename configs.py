@@ -36,13 +36,13 @@ class Config:
     exploration_penalty_scale: float = 0.0  # 先关掉探索惩罚
 
     # Generator params
-    generator_type: str = "rule"  # "rule" | "net"
+    generator_type: str = "net"  # "rule" | "net"
     generator_params: Dict[str, Any] = field(default_factory=lambda: {
         "max_per_step": 2, # not used in rule-based generator
         "depot": "__depot__",  # placeholder to be replaced with Config.depot (accepts "__depot__" or "__DEPOT__")
         "max_time": "__MAX_TIME__",  # placeholder to be replaced with Config.max_time
         "total_demand":20,
-        "max_c": 5, # from 1 to 10
+        "max_c": 10, # from 1 to 10
         "min_lifetime": 40,
         "max_lifetime": 50,
         "min_service_time": 1,
@@ -54,7 +54,8 @@ class Config:
         "neighborhood_size": 3, # 3-15, the average radius of the concentrated generation areas
         "burst_prob": 0.1, # 0.0 - 1.0, probability of bursting demands among all demands
         # add checkpoint path for the network-based generator
-    "model_path": "checkpoints/rl_generator/greedy_20251115-171640/ckpt_ep_1000.pth",#"checkpoints/diffusion_model.pth",
+        "model_path": "checkpoints/rl_generator/greedy_20251126-120703/ckpt_ep_2300.pth",#"checkpoints/diffusion_model.pth",
+        # "model_path": "checkpoints/diffusion_model.pth",
     })
 
     # Planner params
