@@ -2,6 +2,7 @@ from __future__ import annotations
 import argparse
 import random
 import os
+import numpy as np
 from typing import List, Tuple
 from dataclasses import replace
 import copy
@@ -66,7 +67,9 @@ def build_env(cfg: Config, planner_type: str, *, static_demands: bool = False) -
 	max_end_time_cfg = getattr(cfg, "max_end_time", None)
 	max_end_time = int(max_end_time_cfg if max_end_time_cfg is not None else cfg.max_time * 2)
 	if static_demands:
-		gen = StaticDemandGenerator(gen, full_window_end_t=max_end_time)
+		from agent.generator.static_rule_gen import StaticDemandGen
+		gen = StaticDemandGen(cfg.width, cfg.height, **cfg.generator_params)
+		# gen = StaticDemandGenerator(gen, full_window_end_t=max_end_time)
 	env = GridEnvironment(
 		width=cfg.width,
 		height=cfg.height,
@@ -170,6 +173,18 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 	prev_demands = []
 	total_demand = 0
 
+	# helper: convert numpy scalars in targets to native Python types for clean printing
+	def _clean_for_print(obj):
+		if isinstance(obj, (list, tuple)):
+			return [
+				_clean_for_print(x) for x in obj
+			]
+		if isinstance(obj, dict):
+			return {k: _clean_for_print(v) for k, v in obj.items()}
+		if isinstance(obj, np.generic):
+			return obj.item()
+		return obj
+
 	if render:
 		renderer = PygameRenderer(cfg.width, cfg.height)
 		renderer.init()
@@ -205,7 +220,8 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 			serve_mark=planning_state.global_nodes.serve_mark,  # 新增：服务标记
 			unserved_count=planning_state.get_unserved_count(),  # 新增：未服务节点数量
 		)
-		print(f"[PLANNER] step={step} selections={{}}".format([list(target) for target in targets]))
+		cleaned_targets = _clean_for_print([list(target) for target in targets])
+		print(f"[PLANNER] step={step} selections={cleaned_targets}")
 
 		# 更新规划结果到状态管理器
 		planning_state.update_plans(targets)
@@ -328,6 +344,7 @@ def main() -> None:
 	if args.gmodel:
 		cfg.generator_type = "net"
 
+	print(f"static_demands: {args.static_demands}")
 	# Run
 	run_episode(cfg, seed=args.seed, render=args.render, fps=args.fps, planner=planner_choice, static_demands=args.static_demands)
 

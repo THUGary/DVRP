@@ -49,8 +49,8 @@ def get_benchmark_config(dataset_basepath: str, problem_type: str,instance_info:
 	
 	solution_summary_path = os.path.join(dataset_basepath, 'solution_summary.csv')
 	solution_summary=pd.read_csv(solution_summary_path)
-	solution_info=solution_summary[solution_summary['Problem_Name']==problem_name]
-	least_num_vehicles= solution_info['Number_of_Vehicles'].values[0]
+	solution_info=solution_summary[solution_summary['problem_name']==problem_name]
+	least_num_vehicles= solution_info['vehicle_number'].values[0]
 	print(f"Least number of vehicles used in known solution: {least_num_vehicles}")
 
 	env_map_size={
@@ -303,7 +303,7 @@ def main() -> None:
 	parser.add_argument("--cvrp-ckpt", type=str, default=None, help="Override path to the CVRP checkpoint (.pt)")
 	# parser.add_argument("--num-agents", type=int, default=2, help="Override number of agents for the episode (overrides config)")
 	parser.add_argument("--test-all", action="store_true", help="Run all instances in the specified dataset (not implemented yet)")
-	parser.add_argument("--instance", type=str, default="R104", help="Specify the problem instance name to run (default: R104)")
+	parser.add_argument("--instance", type=str, default="R101", help="Specify the problem instance name to run (default: R104)")
 	parser.add_argument("--least-vehs", action="store_true", help="Use the least number of vehicles used in known solution for the instance")
 	args = parser.parse_args()
 
