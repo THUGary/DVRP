@@ -1,6 +1,6 @@
 """RL-style adversarial training for the diffusion demand generator to MINIMIZE a chosen planner's reward.
 
-Goal: Learn demand distribution parameters via conditional diffusion so that a fixed planner (greedy or DVRPNet model planner)
+Goal: Learn demand distribution parameters via conditional diffusion so that a fixed planner (greedy or V2Planner)
 obtains the lowest possible environment reward. We treat the generator (diffusion model) as a stochastic policy producing a set
 of demands for an episode. Reward signal: negative of episode cumulative reward returned by `GridEnvironment`.
 
@@ -105,29 +105,25 @@ def _init_planner(planner_type: str, cfg, device: torch.device, ckpt_path: str |
     full_cap = cfg.capacity
     if planner_type == "greedy":
         return RuleBasedPlanner(full_capacity=full_cap)
-    elif planner_type == "model":
-        mp = ModelPlanner(
-            d_model=cfg.model_planner_params.get("d_model", 128),
-            nhead=cfg.model_planner_params.get("nhead", 8),
-            nlayers=cfg.model_planner_params.get("nlayers", 2),
-            time_plan=cfg.model_planner_params.get("time_plan", 3),
-            lateness_lambda=cfg.model_planner_params.get("lateness_lambda", 0.0),
+    elif planner_type in ("model", "dynamic", "static"):
+        # Use V2Planner (POMO-based architecture)
+        mode = "static" if planner_type == "static" else "dynamic"
+        static_ckpt = static_ckpt or "checkpoints/static_vrp_v2/best_n20.pt"
+        adapter_ckpt = adapter_ckpt or "checkpoints/dynamic_adapter_v2/best_adapter.pt"
+        planner = create_v2_planner(
+            mode=mode,
+            static_checkpoint=static_ckpt,
+            adapter_checkpoint=adapter_ckpt if mode == "dynamic" else None,
             device=str(device),
+            grid_width=cfg.width,
+            grid_height=cfg.height,
             full_capacity=full_cap,
-            coord_norm=cfg.model_planner_params.get("coord_norm", cfg.width),
-            capacity_norm=cfg.model_planner_params.get("capacity_norm", cfg.capacity),
-            time_norm=cfg.model_planner_params.get("time_norm", cfg.max_time),
-            adapter_dim=cfg.model_planner_params.get("adapter_dim", 0),
+            max_time=cfg.max_time,
         )
-        ckpt = ckpt_path or cfg.model_planner_params.get("ckpt")
-        if ckpt and os.path.exists(ckpt):
-            mp.load_from_ckpt(ckpt)
-            print(f"[Planner] Loaded model planner checkpoint: {ckpt}")
-        else:
-            print(f"[Planner] WARNING: checkpoint not found at {ckpt}; using random weights.")
-        return mp
+        print(f"[Planner] Created V2Planner ({mode} mode)")
+        return planner
     else:
-        raise ValueError(f"Unsupported planner type: {planner_type}")
+        raise ValueError(f"Unsupported planner type: {planner_type}. Use 'greedy', 'static', 'dynamic', or 'model'.")
 
 def _plan_episode(planner, env: GridEnvironment, demands: List[Tuple[int,int,int,int,int]], *, renderer: PygameRenderer | None = None, fps: int = 10, save_frames_dir: str = "", debug: bool = False) -> Tuple[float, float, float]:
     """Roll out episode and return rewards."""

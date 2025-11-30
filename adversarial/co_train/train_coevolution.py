@@ -2,7 +2,8 @@ from __future__ import annotations
 """Main co-evolution / co-training loop.
 
 This script-like module exposes `coevolution_loop` which alternates training
-between the planner model (DVRPNet) and the diffusion demand generator.
+between the planner model (V2Planner with POMO-based architecture) and the 
+diffusion demand generator.
 
 High-level algorithm (simplified pseudo-fictitious play):
   for cycle in range(num_cycles):
@@ -23,12 +24,17 @@ High-level algorithm (simplified pseudo-fictitious play):
 This scaffold calls existing builders and leaves concrete batch construction /
 loss computations to hooks you can pass in. Default hooks are NO-OP so you can
 gradually fill them in.
+
+Updated to support V2Planner (POMO-based static model + dynamic adapter).
 """
 from dataclasses import dataclass
 from typing import Callable, Optional, Dict, Any
 import torch, random, os
 
-from adversarial.builders import build_env, build_planner, build_diffusion
+from adversarial.builders import (
+    build_env, build_planner, build_diffusion,
+    get_planner_trainable_params, build_planner_optimizer, save_planner_checkpoint
+)
 from training.generator.adversarial_trainer import DiffusionAdversarialTrainer, AdvConfig
 from .version_registry import GeneratorVersionRegistry
 from .match_scheduler import PlannerTrainingScheduler
@@ -44,26 +50,35 @@ class CoevolutionConfig:
     device: str = "cuda"
     seed: int = 42
     save_dir: str = "checkpoints/coevolution"
-    # 在 planner phase 采样 generator 版本时，优先选择最新版本的概率
-    # (余下概率从历史版本中随机选择)。取值范围 [0,1]
+    # Probability to sample latest generator version during planner phase
     sample_latest_prob: float = 0.7
+    # Planner learning rate
+    planner_lr: float = 1e-4
+    # Planner weight decay
+    planner_weight_decay: float = 1e-6
 
 
 def coevolution_loop(
     cfg: CoevolutionConfig,
-    planner_type: str = "model",
-    planner_ckpt_init: Optional[str] = None,
+    planner_type: str = "dynamic",  # "dynamic", "static"
     diffusion_ckpt_init: Optional[str] = None,
     planner_update_hook: Optional[Callable[[Any, Dict[str, Any]], None]] = None,
     generator_metrics_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
+    static_ckpt: Optional[str] = None,
+    adapter_ckpt: Optional[str] = None,
 ) -> None:
     """Run co-training cycles.
 
-    planner_update_hook(planner, context) is invoked per planner epoch with:
-      context = {"env": env, "generator_version": gv, "rng": rng}
-    You can implement supervised dataset augmentation or an RL step there.
-
-    generator_metrics_hook(metrics) invoked when a new generator version is added.
+    Args:
+        cfg: CoevolutionConfig with training parameters
+        planner_type: Type of planner to use:
+            - "dynamic": V2Planner with adapter (trains adapter only)
+            - "static": V2Planner without adapter (trains full model)
+        diffusion_ckpt_init: Initial diffusion model checkpoint
+        planner_update_hook: Called per planner epoch with (planner, context)
+        generator_metrics_hook: Called when new generator version is added
+        static_ckpt: Path to static model checkpoint (for V2Planner)
+        adapter_ckpt: Path to adapter checkpoint (for V2Planner dynamic mode)
     """
     os.makedirs(cfg.save_dir, exist_ok=True)
     rng = random.Random(cfg.seed)
@@ -71,6 +86,16 @@ def coevolution_loop(
 
     # Build env & initial planner/generator
     env, base_cfg = build_env()
+    
+    # Override V2 planner params if custom checkpoints provided
+    if static_ckpt or adapter_ckpt:
+        if not hasattr(base_cfg, 'v2_planner_params'):
+            base_cfg.v2_planner_params = {}
+        if static_ckpt:
+            base_cfg.v2_planner_params['static_ckpt'] = static_ckpt
+        if adapter_ckpt:
+            base_cfg.v2_planner_params['adapter_ckpt'] = adapter_ckpt
+    
     planner = build_planner(planner_type, base_cfg, device, planner_ckpt_init)
     diffusion_model, condition = build_diffusion(base_cfg, device, diffusion_ckpt_init)
     adv_cfg = AdvConfig(randomize_depot=True, lr=1e-4, normalize_reward=False)
@@ -84,22 +109,18 @@ def coevolution_loop(
 
     scheduler = PlannerTrainingScheduler(registry, policy=cfg.scheduler_policy, latest_bias=cfg.latest_bias)
 
-    # Lazy imports for teacher and feature utils
-    from agent.planner.rule_planner import RuleBasedPlanner
-    from agent.controller import RuleBasedController
-    from models.planner_model.model import prepare_features
-
-    opt_planner = None
-    if hasattr(planner, "_model") and hasattr(planner._model, "parameters"):
-        opt_planner = torch.optim.AdamW(planner._model.parameters(), lr=1e-3, weight_decay=1e-6)
+    # Build planner optimizer using the new helper
+    opt_planner = build_planner_optimizer(
+        planner, lr=cfg.planner_lr, weight_decay=cfg.planner_weight_decay
+    )
+    if opt_planner is None:
+        print("[Warning] Planner has no trainable parameters, skipping planner updates")
 
     for cycle in range(1, cfg.num_cycles + 1):
         print(f"=== Cycle {cycle}/{cfg.num_cycles} ===")
         # ---- Planner phase ----
         for pe in range(1, cfg.planner_epochs_per_cycle + 1):
-            # Choose a generator version to generate training data.
-            # With probability cfg.sample_latest_prob pick the latest version,
-            # otherwise pick a random historical version (exclude latest).
+            # Choose a generator version to generate training data
             versions = registry.list()
             if not versions:
                 raise RuntimeError("No generator versions in registry")
@@ -115,10 +136,10 @@ def coevolution_loop(
             try:
                 diffusion_model.load_state_dict(state, strict=False)
             except Exception:
-                # Accept partial load (e.g., state might be wrapped)
                 if isinstance(state, dict) and "model" in state:
                     diffusion_model.load_state_dict(state["model"], strict=False)
             diffusion_model.eval()
+            
             # Hook for planner update (user implements training step)
             context = {
                 "env": env,
@@ -141,10 +162,9 @@ def coevolution_loop(
             if pe % max(1, cfg.planner_epochs_per_cycle // 2) == 0:
                 print(f"[PlannerPhase] cycle={cycle} epoch={pe} using gen_version={gv.version_id}")
 
+        # Save planner checkpoint using the new helper
         planner_ckpt_path = os.path.join(cfg.save_dir, f"planner_cycle_{cycle}.pt")
-        if hasattr(planner, "_model") and hasattr(planner._model, "state_dict"):
-            torch.save(planner._model.state_dict(), planner_ckpt_path)  # type: ignore[attr-defined]
-        print(f"[Save] Planner checkpoint => {planner_ckpt_path}")
+        save_planner_checkpoint(planner, planner_ckpt_path, epoch=cycle)
 
         # ---- Generator (adversarial) phase ----
         # Ensure we start evolution from the newest registered generator version
@@ -159,8 +179,7 @@ def coevolution_loop(
             diffusion_model.eval()
 
         for ge in range(1, cfg.generator_epochs_per_cycle + 1):
-            # Use current planner (could add evaluation vs older planners here)
-            # Evolve the (newest) diffusion model against the planner
+            # Evolve the diffusion model against the planner
             gen_trainer.train(planner, episodes=1, renderer=None, save_path=None, seed=cfg.seed + cycle * 100 + ge)
             if ge % max(1, cfg.generator_epochs_per_cycle // 2) == 0:
                 print(f"[GeneratorPhase] cycle={cycle} epoch={ge}")

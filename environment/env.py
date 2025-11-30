@@ -3,6 +3,8 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 from agent.planner.base import AgentState
 from agent.generator.base import BaseDemandGenerator, Demand
+from agent.generator.static_wrappers import StaticDemandGenerator
+from .rewards import compute_static_reward, compute_dynamic_reward
 import math
 
 
@@ -49,6 +51,7 @@ class GridEnvironment:
 		distance_penalty_min_dist: float = 1.0,
 		# per-step movement penalty encourages shorter, smoother paths
 		move_penalty_scale: float = 0.0,
+		depot_return_bonus_scale: float = 0.0,
 		# reward shaping for moving closer to nearby demands
 		approach_bonus_scale: float = 0.0,
 		approach_bonus_max_dist: float = 10.0,
@@ -56,12 +59,19 @@ class GridEnvironment:
 		# current time reaches max_end_time, the episode ends.
 		max_end_time: Optional[int] = None,
 		include_service_time: bool = False,
+		static_demands: bool = False,
 	) -> None:
 		self.width = width
 		self.height = height
 		self.max_time = max_time
 		self.depot = depot
 		self.capacity = capacity
+		resolved_max_end_time = int(max_time if max_end_time is None else max_end_time)
+		self.static_demands = bool(static_demands)
+		# Only wrap with StaticDemandGenerator if not already wrapped
+		if self.static_demands and generator is not None:
+			if not isinstance(generator, StaticDemandGenerator):
+				generator = StaticDemandGenerator(generator, max_end_time=resolved_max_end_time)
 		self._generator = generator
 		self.expiry_penalty_scale = expiry_penalty_scale
 		self.switch_penalty_scale = switch_penalty_scale
@@ -72,11 +82,12 @@ class GridEnvironment:
 		self.distance_penalty_base = float(distance_penalty_base)
 		self.distance_penalty_min_dist = float(distance_penalty_min_dist)
 		self.move_penalty_scale = float(move_penalty_scale)
+		self.depot_return_bonus_scale = float(depot_return_bonus_scale)
 		self.approach_bonus_scale = float(approach_bonus_scale)
 		self.approach_bonus_max_dist = float(max(0.0, approach_bonus_max_dist))
 		self.include_service_time = bool(include_service_time)
 		# If not specified, default to max_time to preserve previous behavior
-		self.max_end_time = int(max_time if max_end_time is None else max_end_time)
+		self.max_end_time = resolved_max_end_time
 		self._state: Optional[EnvState] = None
 
 		# cache for resolved full capacity to avoid repeated imports
@@ -117,7 +128,12 @@ class GridEnvironment:
 			num_agents = 1
 			self._num_agents = num_agents
 		agent_states = self._spawn_initial_agent_states(num_agents, seed)
-		self._state = EnvState(time=0, agent_states=agent_states, depot=self.depot, demands=[])
+		# Sample t=0 demands from generator (critical for static demand mode
+		# where all demands are released at t=0)
+		initial_demands = []
+		if self._generator:
+			initial_demands = self._generator.sample(0)
+		self._state = EnvState(time=0, agent_states=agent_states, depot=self.depot, demands=initial_demands)
 		# initialize episode-level statistics
 		self._episode_stats = {
 			"seen_demands_ids": set(),
@@ -133,6 +149,10 @@ class GridEnvironment:
 		}
 		self._episode_stats["switch_count"] = 0
 		self._episode_stats["switch_penalty"] = 0.0
+		self._episode_stats["service_bonus_term"] = 0.0
+		self._episode_stats["travel_cost_term"] = 0.0
+		self._episode_stats["waiting_penalty_term"] = 0.0
+		self._episode_stats["depot_return_bonus_term"] = 0.0
 		self._prev_actions = [(0, 0) for _ in agent_states]
 		self._active_services = {}
 		# maintain per-agent position history for exploration penalty
@@ -331,7 +351,10 @@ class GridEnvironment:
 				agent_idx = pos_to_agent_idx.get((demand.x, demand.y))
 				if agent_idx is not None and agent_idx not in new_active_services:
 					agent = updated_agents[agent_idx]
-					if agent.s >= demand.c:
+					# Only serve if agent is stationary (didn't move this step)
+					prev_pos = prev_positions[agent_idx]
+					agent_stayed = (prev_pos == (agent.x, agent.y))
+					if agent_stayed and agent.s >= demand.c:
 						service_time = int(getattr(demand, "service_time", 0))
 						if service_time > 0:
 							updated_agents[agent_idx] = AgentState(
@@ -369,8 +392,12 @@ class GridEnvironment:
 				if agent_idx is not None:
 					# agent on the demand cell
 					a = self._state.agent_states[agent_idx]
+					# Only serve if agent is stationary (didn't move this step)
+					# This prevents "accidental" service when agent passes through
+					prev_pos = prev_positions[agent_idx]
+					agent_stayed = (prev_pos == (a.x, a.y))
 					# Assumption: must have enough capacity to serve; otherwise skip
-					if a.s >= d.c:
+					if agent_stayed and a.s >= d.c:
 						# serve immediately
 						new_s = a.s - d.c
 						self._state.agent_states[agent_idx] = AgentState(
@@ -420,7 +447,7 @@ class GridEnvironment:
 									pairwise_penalty += gap * demand_density
 		pairwise_penalty_value = - self.distance_penalty_base * pairwise_penalty if pairwise_penalty > 0.0 else 0.0
 
-		# movement penalty discouraging zig-zag motion
+		# movement penalty discouraging zig-zag motion (interpreted as per-step travel cost)
 		move_penalty_value = - self.move_penalty_scale * movement_distance if self.move_penalty_scale > 0.0 else 0.0
 
 		# --- Exploration revisit penalty ---
@@ -448,28 +475,46 @@ class GridEnvironment:
 		# scale exploration penalty (negative contribution)
 		exploration_penalty_value = - self.exploration_penalty_scale * exploration_penalty if exploration_penalty > 0 else 0.0
 
+		# count agents that returned to depot after servicing
+		depot_return_count = 0
+		for prev_pos, agent_state in zip(prev_positions, self._state.agent_states):
+			if (prev_pos[0], prev_pos[1]) != self.depot and (agent_state.x, agent_state.y) == self.depot:
+				depot_return_count += 1
+		depot_return_bonus_term = self.depot_return_bonus_scale * float(depot_return_count)
+
 		# --- Reward aggregation ---
 		capacity_reward_term = float(self.capacity_reward_scale) * float(capacity_reward)
+		waiting_penalty_term = wait_penalty
+		travel_cost_term = move_penalty_value
 		switch_penalty_term = - float(self.switch_penalty_scale) * float(switch_count)
-		# Combine capacity reward with the per-step waiting penalty (negative)
-		# and the density-scaled pairwise proximity penalty.
-		reward = (
-			capacity_reward_term
-			+ wait_penalty
-			+ switch_penalty_term
-			# + pairwise_penalty_value
-			+ move_penalty_value
-			# + approach_bonus_value
-		)		#  + exploration_penalty_value
+		if self.static_demands:
+			# For static demands, we defer the reward to episode end (like CVRP/POMO):
+			# return 0 during the episode, then -total_distance when done.
+			# This makes the RL signal cleaner and directly optimizes route length.
+			reward = 0.0
+			reward_terms_step: RewardTerms = {"travel_cost": 0.0}
+		else:
+			reward, reward_terms_step = compute_dynamic_reward(
+				service_bonus=capacity_reward_term,
+				travel_cost=travel_cost_term,
+				waiting_penalty=waiting_penalty_term,
+				return_bonus=depot_return_bonus_term,
+				switch_penalty=switch_penalty_term,
+				approach_bonus=approach_bonus_value,
+				exploration_penalty=exploration_penalty_value,
+				crowding_penalty=pairwise_penalty_value,
+			)
 
 		# update episode-level stats
 		self._episode_stats["served_count"] += served_count
 		self._episode_stats["served_capacity"] += served_capacity
 		self._episode_stats["pairwise_penalty_value"] += pairwise_penalty_value
-		self._episode_stats.setdefault('capacity_reward_term', 0)
+		self._episode_stats.setdefault('capacity_reward_term', 0.0)
 		self._episode_stats["capacity_reward_term"] += capacity_reward_term
+		self._episode_stats["service_bonus_term"] += capacity_reward_term
 		self._episode_stats.setdefault("move_penalty_value", 0.0)
-		self._episode_stats["move_penalty_value"] += move_penalty_value
+		self._episode_stats["move_penalty_value"] += travel_cost_term
+		self._episode_stats["travel_cost_term"] += travel_cost_term
 		self._episode_stats.setdefault("approach_bonus_value", 0.0)
 		self._episode_stats["approach_bonus_value"] += approach_bonus_value
 		self._episode_stats["served_details"].extend(served_details)
@@ -497,7 +542,9 @@ class GridEnvironment:
 			self._episode_stats["exploration_penalty_value"] += exploration_penalty_value
 		# record per-step waiting penalty (negative or zero)
 		self._episode_stats.setdefault("wait_penalty_value", 0.0)
-		self._episode_stats["wait_penalty_value"] += wait_penalty
+		self._episode_stats["wait_penalty_value"] += waiting_penalty_term
+		self._episode_stats["waiting_penalty_term"] += waiting_penalty_term
+		self._episode_stats["depot_return_bonus_term"] += depot_return_bonus_term
 		self._prev_actions = list(effective_actions)
 		# update position histories AFTER computing penalty
 		for idx, a in enumerate(self._state.agent_states):
@@ -514,19 +561,36 @@ class GridEnvironment:
 		self._state.time += 1
 		# Termination logic:
 		# - If reached hard cap max_end_time -> done
+		# - For static demands: if no unserved demands AND all agents at depot -> done
 		# - Else if past last generation time (max_time) and there are no
 		#   unserved demands AND all agents are at depot -> done
 		# - Else -> continue
 		if self._state.time >= self.max_end_time:
 			done = True
+		elif self.static_demands:
+			# For static demands, can terminate early once all demands served
+			# and all agents returned to depot
+			no_unserved = (len(self._state.demands) == 0)
+			all_at_depot = all((a.x, a.y) == self.depot for a in self._state.agent_states)
+			done = bool(no_unserved and all_at_depot)
 		elif self._state.time > self.max_time:
 			no_unserved = (len(self._state.demands) == 0)
 			all_at_depot = all((a.x, a.y) == self.depot for a in self._state.agent_states)
 			done = bool(no_unserved and all_at_depot)
 		else:
 			done = False
+
+		# For static demands: override reward at episode end with -total_distance
+		# This mimics CVRP/POMO where reward = -route_length only at done.
+		if self.static_demands and done:
+			total_dist = self._episode_stats.get("total_distance", 0.0)
+			reward = -float(total_dist)
+			reward_terms_step = {"travel_cost": reward}
+			# Also update episode_reward to reflect final reward
+			self._episode_stats["episode_reward"] = reward
+
 		# on episode end, print aggregated statistics and return them in info
-		info: Dict = {}
+		info: Dict = {"reward_terms": reward_terms_step}
 		if collided_agents:
 			info["collisions"] = len(collided_agents)
 			self._episode_stats.setdefault("collision_count", 0)

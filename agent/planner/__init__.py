@@ -4,8 +4,8 @@ from .fri_planner import FastReactiveInserter
 from .rbso_planner import RepairBasedStabilityOptimizer
 from .dcp_planner import DistributedCooperativePlanner
 from .net_planner import NetPlanner
-from .model_planner import ModelPlanner
-from .cvrp_pomo_planner import CVRPPOMOPlanner
+from .v2_planner import V2Planner, create_v2_planner
+from .global_optimizer import GlobalOptimizationPlanner
 
 __all__ = [
 	"BasePlanner",
@@ -14,6 +14,7 @@ __all__ = [
 	"RepairBasedStabilityOptimizer",
 	"DistributedCooperativePlanner",
     "NetPlanner", 
-	"ModelPlanner",
-	"CVRPPOMOPlanner",
+	"V2Planner",
+	"create_v2_planner",
+	"GlobalOptimizationPlanner",
 ]

@@ -1,2 +1,2 @@
 # Models package placeholder
-# from .planner_model import DVRPNet, prepare_features
+# V2 models are in models_v2 subpackage

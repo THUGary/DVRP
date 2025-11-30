@@ -81,6 +81,7 @@ class TensorGridEnvironment:
         capacity_reward_scale: float = 10.0,
         wait_penalty_scale: float = 0.001,
         move_penalty_scale: float = 0.0,
+        depot_return_bonus_scale: float = 0.0,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -103,6 +104,7 @@ class TensorGridEnvironment:
         self.capacity_reward_scale = float(capacity_reward_scale)
         self.wait_penalty_scale = float(wait_penalty_scale)
         self.move_penalty_scale = float(move_penalty_scale)
+        self.depot_return_bonus_scale = float(depot_return_bonus_scale)
 
         self._generators = self._create_generators(generator, generator_factory)
         self._alloc_buffers()
@@ -172,26 +174,34 @@ class TensorGridEnvironment:
         self._apply_actions(action_tensor)
         movement = self._movement_distance(prev_pos)
         self._refill_capacity(prev_load)
+        depot_x, depot_y = self.depot_xy
+        prev_at_depot = torch.logical_and(prev_pos[..., 0] == depot_x, prev_pos[..., 1] == depot_y)
+        now_at_depot = torch.logical_and(self.agent_pos[..., 0] == depot_x, self.agent_pos[..., 1] == depot_y)
+        returned = torch.logical_and(~prev_at_depot, now_at_depot)
+        depot_returns = returned.sum(dim=1).to(torch.float32)
 
         served_from_visits = self._serve_demands()
         raw_capacity = served_from_completion + served_from_visits
         wait_penalty = self._compute_wait_penalty()
-        move_penalty = -self.move_penalty_scale * movement
+        travel_cost = -self.move_penalty_scale * movement
         switch_penalty = -self.switch_penalty_scale * switches
         capacity_term = self.capacity_reward_scale * raw_capacity
+        depot_bonus = self.depot_return_bonus_scale * depot_returns
 
-        reward = (
-            capacity_term
-            + wait_penalty
-            + move_penalty
-            + switch_penalty
-        )
+        reward_terms = {
+            "service_bonus": capacity_term,
+            "travel_cost": travel_cost,
+            "waiting_penalty": wait_penalty,
+            "depot_return_bonus": depot_bonus,
+        }
+        reward = capacity_term + wait_penalty + travel_cost + depot_bonus + switch_penalty
 
         self._update_stats(
             movement=movement,
             switches=switches,
             wait_penalty=wait_penalty,
-            move_penalty=move_penalty,
+            travel_cost=travel_cost,
+            depot_bonus=depot_bonus,
             switch_penalty=switch_penalty,
             capacity_term=capacity_term,
             served_capacity=raw_capacity,
@@ -202,7 +212,7 @@ class TensorGridEnvironment:
         self.time += 1
 
         done = self._compute_done()
-        info = self._build_info(done, verbose)
+        info = self._build_info(done, verbose, reward_terms)
         return self._obs(), reward, done, info
 
     # ------------------------------------------------------------------
@@ -262,6 +272,10 @@ class TensorGridEnvironment:
             "move_penalty": torch.zeros(batch, dtype=torch.float32, device=device),
             "switch_penalty": torch.zeros(batch, dtype=torch.float32, device=device),
             "capacity_reward_term": torch.zeros(batch, dtype=torch.float32, device=device),
+            "service_bonus_term": torch.zeros(batch, dtype=torch.float32, device=device),
+            "travel_cost_term": torch.zeros(batch, dtype=torch.float32, device=device),
+            "waiting_penalty_term": torch.zeros(batch, dtype=torch.float32, device=device),
+            "depot_return_bonus_term": torch.zeros(batch, dtype=torch.float32, device=device),
         }
 
     def _obs(self) -> TensorEnvObservation:
@@ -494,7 +508,7 @@ class TensorGridEnvironment:
         done = torch.logical_or(at_limit, torch.logical_and(beyond_gen, torch.logical_and(empty_demands, agents_at_depot)))
         return done
 
-    def _build_info(self, done: Tensor, verbose: bool) -> Dict[str, Tensor]:
+    def _build_info(self, done: Tensor, verbose: bool, reward_terms: Dict[str, Tensor]) -> Dict[str, Tensor]:
         if verbose:
             finished = torch.nonzero(done, as_tuple=False).flatten()
             for idx in finished.tolist():
@@ -502,6 +516,7 @@ class TensorGridEnvironment:
         info = {
             "episode_stats": {key: tensor.clone().detach() for key, tensor in self.stats.items()},
             "done_mask": done.clone(),
+            "reward_terms": {key: tensor.clone().detach() for key, tensor in reward_terms.items()},
         }
         return info
 
@@ -511,20 +526,25 @@ class TensorGridEnvironment:
         movement: Tensor,
         switches: Tensor,
         wait_penalty: Tensor,
-        move_penalty: Tensor,
+        travel_cost: Tensor,
+        depot_bonus: Tensor,
         switch_penalty: Tensor,
-            capacity_term: Tensor,
+        capacity_term: Tensor,
         served_capacity: Tensor,
         expired_capacity: Tensor,
     ) -> None:
         self.stats["total_distance"] += movement
         self.stats["switch_count"] += switches.to(torch.long)
         self.stats["wait_penalty"] += wait_penalty
-        self.stats["move_penalty"] += move_penalty
+        self.stats["move_penalty"] += travel_cost
+        self.stats["depot_return_bonus_term"] += depot_bonus
         self.stats["switch_penalty"] += switch_penalty
         self.stats["capacity_reward_term"] += capacity_term
+        self.stats["service_bonus_term"] += capacity_term
+        self.stats["travel_cost_term"] += travel_cost
+        self.stats["waiting_penalty_term"] += wait_penalty
         self.stats["served_capacity"] += served_capacity
         self.stats["expired_capacity"] += expired_capacity
         self.stats["episode_reward"] += (
-            capacity_term + wait_penalty + move_penalty + switch_penalty
+            capacity_term + wait_penalty + travel_cost + depot_bonus + switch_penalty
         )

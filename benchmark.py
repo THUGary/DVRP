@@ -17,8 +17,7 @@ from agent.planner import RuleBasedPlanner
 from agent.planner import FastReactiveInserter
 from agent.planner import RepairBasedStabilityOptimizer
 from agent.planner import DistributedCooperativePlanner
-from agent.planner import ModelPlanner
-from agent.planner import CVRPPOMOPlanner
+from agent.planner import V2Planner, create_v2_planner
 from agent.generator.benchmark_gen import BenchmarkGenerator
 
 def get_benchmark_config(dataset_basepath: str, problem_type: str,instance_info: dict, least_vehicles: bool) -> Config:
@@ -100,6 +99,7 @@ def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, BaseDema
 		exploration_history_n=int(getattr(cfg, "exploration_history_n", 0)),
 		exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
 		wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
+		depot_return_bonus_scale=float(getattr(cfg, "depot_return_bonus_scale", 0.0)),
 		max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2)),
 		include_service_time=bool(getattr(cfg, "include_service_time", False)),
 	)
@@ -116,41 +116,17 @@ def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, BaseDema
 	elif planner_type == "dcp":
 		# 使用 Distributed Cooperative Planner（带参数）
 		planner = DistributedCooperativePlanner(auction_rounds=5, bid_strategy='time_urgency')
-	elif planner_type == "model":
-		planner_params = dict(cfg.model_planner_params)
-		ckpt_path = planner_params.pop("ckpt", None)
-		planner = ModelPlanner(full_capacity=cfg.capacity, **planner_params)
-		if ckpt_path:
-			if hasattr(planner, "load_from_ckpt"):
-				planner.load_from_ckpt(ckpt_path)
-			else:
-				raise RuntimeError("Selected planner does not support checkpoint loading.")
-	elif planner_type == "cvrp_pomo":
-		cvrp_params = dict(cfg.cvrp_planner_params)
-		cvrp_params.pop("enabled", None)
-		pomo_root = cvrp_params.pop("pomo_root", None)
-		if not pomo_root:
-			raise ValueError("Config.cvrp_planner_params must define 'pomo_root' when using the CVRP planner.")
-		env_params = copy.deepcopy(cvrp_params.pop("env_params", {}))
-		model_params = copy.deepcopy(cvrp_params.pop("model_params", {}))
-		checkpoint = cvrp_params.pop("checkpoint", None)
-		device_override = cvrp_params.pop("device", "cpu")
-		max_nodes = cvrp_params.pop("max_nodes", env_params.get("problem_size", cfg.capacity))
-		coord_norm = cvrp_params.pop("coord_normalizer", None)
-		selection_policy = cvrp_params.pop("selection_policy", "earliest_due")
-		planner = CVRPPOMOPlanner(
-			pomo_root=pomo_root,
-			env_params=env_params,
-			model_params=model_params,
-			checkpoint=checkpoint,
-			device=device_override,
-			max_nodes=max_nodes,
-			coord_normalizer=coord_norm,
+	elif planner_type in ("model", "static", "dynamic"):
+		# Use V2Planner for model/static/dynamic
+		v2_params = dict(getattr(cfg, 'v2_planner_params', {}))
+		# Map "model" to "dynamic" mode
+		mode = "dynamic" if planner_type in ("model", "dynamic") else "static"
+		planner = create_v2_planner(
+			mode=mode,
 			grid_width=cfg.width,
 			grid_height=cfg.height,
-			capacity=cfg.capacity,
-			selection_policy=selection_policy,
-			**cvrp_params,
+			full_capacity=cfg.capacity,
+			**v2_params,
 		)
 	else:
 		raise ValueError(f"Unknown planner type: {planner_type}")
@@ -164,13 +140,13 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 	#print model used
 	print(f"Using planner: {planner}")
 	planner_type = planner
-	if planner_type == "model":
-		ckpt_info = cfg.model_planner_params.get("ckpt")
-		if ckpt_info:
-			print(f"Loading model checkpoint: {ckpt_info}")
-	elif planner_type == "cvrp_pomo":
-		params = cfg.cvrp_planner_params
-		print(f"CVRP-POMO root: {params.get('pomo_root')} | ckpt: {params.get('checkpoint')}")
+	if planner_type in ("model", "static", "dynamic"):
+		v2_params = getattr(cfg, 'v2_planner_params', {})
+		print(f"V2Planner mode: {'dynamic' if planner_type in ('model', 'dynamic') else 'static'}")
+		if v2_params.get("static_ckpt"):
+			print(f"Static checkpoint: {v2_params['static_ckpt']}")
+		if v2_params.get("adapter_ckpt"):
+			print(f"Adapter checkpoint: {v2_params['adapter_ckpt']}")
 	env, gen, planner_impl, controller = build_env(cfg, planner_type=planner_type)
 	obs = env.reset(seed)
 	total_reward = 0.0
@@ -201,13 +177,14 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 			agent_states=agent_states,
 			new_demands=new_demands,
 			obs_demands=current_demands,
+			depot=obs["depot"],  # 传入 depot 以便在清理时保留 depot 目标
 		)
 
 		# Plan targets using current observation with enhanced information
 		agents = [type("S", (), {"x": x, "y": y, "s": s}) for (x, y, s) in agent_states]
 		plan_horizon = 1
-		if planner_type == "model":
-			plan_horizon = max(1, int(cfg.model_planner_params.get("time_plan", 1)))
+		if planner_type in ("model", "dynamic"):
+			plan_horizon = max(1, int(getattr(cfg, 'v2_planner_params', {}).get("time_plan", 1)))
 		targets = planner_impl.plan(
 			observations=obs["demands"],  # [(x, y, t_arrival, c, t_due), ...]
 			agent_states=agents,
@@ -250,37 +227,23 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 
 
 def gen_plan_choice(args: argparse.Namespace, cfg)->str:
-	use_model_planner = args.pmodel is not None
-	if args.cvrp and use_model_planner:
-		raise ValueError("--cvrp and --pmodel are mutually exclusive")
-	if args.cvrp:
-		planner_choice = "cvrp_pomo"
-		cfg.planner_type = "cvrp_pomo"
-		if args.cvrp_root:
-			cfg.cvrp_planner_params["pomo_root"] = args.cvrp_root
-		if args.cvrp_ckpt:
-			cfg.cvrp_planner_params["checkpoint"] = args.cvrp_ckpt
-	else:
-		planner_choice = "model" if use_model_planner else "greedy"
-		if use_model_planner:
-			cfg.planner_type = "model"  # use defaults from cfg.model_planner_params
-			if isinstance(args.pmodel, str) and args.pmodel != "__DEFAULT__":
-				raw = os.path.expanduser(args.pmodel)
-				candidates = [
-					raw,
-					os.path.join("checkpoints", raw) if not os.path.isabs(raw) else raw,
-					os.path.join("checkpoints", "planner", os.path.basename(raw)),
-				]
-				ckpt_path = None
-				for p in candidates:
-					p_abs = os.path.abspath(p)
-					if os.path.isfile(p_abs):
-						ckpt_path = p_abs
-						break
-				if ckpt_path is None:
-					ckpt_path = os.path.abspath(raw)
-					print(f"WARNING: Planner checkpoint not found at {ckpt_path}. Will attempt to load; ensure path is correct.")
-				cfg.model_planner_params["ckpt"] = ckpt_path
+	"""Simplified planner selection for V2Planner architecture"""
+	planner_choice = getattr(args, 'planner', 'greedy')
+	
+	# Map "model" to "dynamic" for backwards compatibility  
+	if planner_choice == "model":
+		planner_choice = "dynamic"
+	
+	cfg.planner_type = planner_choice
+	
+	# Handle V2Planner checkpoint overrides
+	if planner_choice in ("static", "dynamic"):
+		if not hasattr(cfg, 'v2_planner_params'):
+			cfg.v2_planner_params = {}
+		if hasattr(args, 'static_ckpt') and args.static_ckpt:
+			cfg.v2_planner_params["static_ckpt"] = args.static_ckpt
+		if hasattr(args, 'adapter_ckpt') and args.adapter_ckpt and planner_choice == "dynamic":
+			cfg.v2_planner_params["adapter_ckpt"] = args.adapter_ckpt
 
 	if args.gmodel:
 		cfg.generator_type = "net"
@@ -288,23 +251,21 @@ def gen_plan_choice(args: argparse.Namespace, cfg)->str:
 
 def main() -> None:
 	# --------------------------------------------------------------
-	# Minimal CLI: keep only seed, render, fps, pmodel, gmodel
+	# Minimal CLI for benchmark evaluation with V2Planner
 	# --------------------------------------------------------------
-	parser = argparse.ArgumentParser(description="DVRP runner")
+	parser = argparse.ArgumentParser(description="DVRP benchmark runner")
 	parser.add_argument("--seed", type=int, default=2025, help="Random seed (default: 2025)")
 	parser.add_argument("--render", action="store_true", help="Use pygame to visualize")
 	parser.add_argument("--fps", type=int, default=10, help="Render FPS when --render (default: 10)")
-	# --pmodel optionally accepts a checkpoint path; if omitted, use default from cfg
-	parser.add_argument("--pmodel", nargs="?", const="__DEFAULT__", help="Use model planner; optionally pass checkpoint path (.pt/.pth). Example: --pmodel checkpoints/planner/planner_rl_best.pt")
+	parser.add_argument("--planner", choices=["greedy", "model", "static", "dynamic", "fri", "rbso", "dcp"], 
+						default="greedy", help="Planner type: greedy (rule-based), model/static/dynamic (V2Planner), fri, rbso, dcp")
 	parser.add_argument("--gmodel", action="store_true", help="Use neural net demand generator; otherwise rule")
 	parser.add_argument("--service-time", action="store_true", default=True, help="Enable service times for demands (vehicles must remain on-site before completion)")
-	parser.add_argument("--cvrp", action="store_true", help="Use the CVRP-POMO planner adapter instead of DVRP planners")
-	parser.add_argument("--cvrp-root", type=str, default=None, help="Override path to the CVRP/POMO folder (defaults to config)")
-	parser.add_argument("--cvrp-ckpt", type=str, default=None, help="Override path to the CVRP checkpoint (.pt)")
-	# parser.add_argument("--num-agents", type=int, default=2, help="Override number of agents for the episode (overrides config)")
 	parser.add_argument("--test-all", action="store_true", help="Run all instances in the specified dataset (not implemented yet)")
 	parser.add_argument("--instance", type=str, default="R101", help="Specify the problem instance name to run (default: R104)")
 	parser.add_argument("--least-vehs", action="store_true", help="Use the least number of vehicles used in known solution for the instance")
+	parser.add_argument("--static-ckpt", type=str, default=None, help="Override path to V2 static model checkpoint")
+	parser.add_argument("--adapter-ckpt", type=str, default=None, help="Override path to V2 dynamic adapter checkpoint")
 	args = parser.parse_args()
 
 	dataset_basepath = "./VrptwDataset/solomon_reformed"  # specify your dataset base path here
