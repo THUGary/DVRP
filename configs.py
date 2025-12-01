@@ -60,7 +60,7 @@ class Config:
     # Environment
     width: int = 20
     height: int = 20
-    num_agents: int = 5
+    num_agents: int = 2
     capacity: int = DEFAULT_CAPACITY  # Use centralized default (30)
     depot: Tuple[int, int] = (0, 0)
     max_time: int = 100 # the value has to be consistent with generator_params' max_time
@@ -92,7 +92,11 @@ class Config:
         "max_per_step": 2, # not used in rule-based generator
         "depot": "__depot__",  # placeholder to be replaced with Config.depot (accepts "__depot__" or "__DEPOT__")
         "max_time": "__MAX_TIME__",  # placeholder to be replaced with Config.max_time
-        "total_demand":20,
+        # Limiting modes (num_nodes takes priority if set):
+        # - num_nodes: limit by number of demand nodes (preferred)
+        # - total_demand: limit by sum of all demand capacities (legacy)
+        "num_nodes": 20,  # Number of demand nodes to generate
+        "total_demand": 60,  # Legacy: upper limit of sum of all demands (used if num_nodes not set)
         "max_c": 10, # from 1 to 10
         "min_lifetime": 40,
         "max_lifetime": 50,

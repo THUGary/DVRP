@@ -9,19 +9,21 @@ cd "$PROJECT_DIR"
 
 # Default parameters
 # Set STATIC_CKPT="" to use rule-based planner, or set a path to use model planner
-STATIC_CKPT="/home/user0/DVRP-11.23/checkpoints/static_vrp_v2/best_n80.pt"
+STATIC_CKPT="${STATIC_CKPT:-}"
 #
-NUM_AGENTS=10
+NUM_AGENTS=2
 SEED=2025
 RENDER="--render"
 STATIC_DEMANDS="--static-demands"
 RULE_MODE=""
 # By default enable saving run outputs; set to empty string to disable
 SAVE_RUN="--save-run"
-MAP_WIDTH=50
-MAP_HEIGHT=50
-# PROBLEM_SIZE = TOTAL_DEMAND = Number of customer nodes to visit
-PROBLEM_SIZE=${PROBLEM_SIZE:-${TOTAL_DEMAND:-100}}
+# MAP_SIZE: Side length of the square map (map is MAP_SIZE × MAP_SIZE)
+MAP_SIZE="${MAP_SIZE:-20}"
+# TOTAL_DEMAND: Upper limit of sum of all customer demands (NOT node count!)
+TOTAL_DEMAND="${TOTAL_DEMAND:-60}"
+# NUM_NODES: Number of demand nodes
+NUM_NODES="${NUM_NODES:-20}"
 # MAX_STEPS = Maximum episode steps (default: unlimited)
 MAX_STEPS=${MAX_STEPS:-}
 # STATIC_MAX_END = Max environment time for static demands (default: 2 * max_time = 200)
@@ -54,16 +56,16 @@ while [[ $# -gt 0 ]]; do
             RULE_MODE="$2"
             shift 2
             ;;
-        --map-wid)
-            MAP_WIDTH="$2"
+        --map-size)
+            MAP_SIZE="$2"
             shift 2
             ;;
-        --map-hei)
-            MAP_HEIGHT="$2"
+        --total-demand)
+            TOTAL_DEMAND="$2"
             shift 2
             ;;
-        --total-demand|--problem-size)
-            PROBLEM_SIZE="$2"
+        --num-nodes)
+            NUM_NODES="$2"
             shift 2
             ;;
         --save-run)
@@ -80,7 +82,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: bash scripts/run_dvrp.sh [--render] [--seed N] [--num-agents N] [--dynamic] [--ckpt PATH]"
+            echo "Usage: bash scripts/run_dvrp.sh [--render] [--seed N] [--num-agents N] [--dynamic] [--ckpt PATH] [--map-size N] [--total-demand N] [--num-nodes N]"
             exit 1
             ;;
     esac
@@ -93,8 +95,9 @@ echo "  Seed: $SEED"
 echo "  Render: ${RENDER:-disabled}"
 echo "  Mode: ${STATIC_DEMANDS:+static}${STATIC_DEMANDS:-dynamic}"
 echo "  Rule mode: ${RULE_MODE:-default}"
-echo "  Map size: ${MAP_WIDTH:-default}x${MAP_HEIGHT:-default}"
-echo "  Problem size: ${PROBLEM_SIZE:-default} nodes"
+echo "  Map size: ${MAP_SIZE}x${MAP_SIZE}"
+echo "  Num nodes: ${NUM_NODES}"
+echo "  Total demand: ${TOTAL_DEMAND}"
 echo "  Max steps: ${MAX_STEPS:-unlimited}"
 echo "  Static max end: ${STATIC_MAX_END:-default (2*max_time)}"
 
@@ -108,14 +111,14 @@ fi
 if [[ -n "$RULE_MODE" ]]; then
     PYTHON_ARGS+=(--rule-mode "$RULE_MODE")
 fi
-if [[ -n "$MAP_WIDTH" ]]; then
-    PYTHON_ARGS+=(--map-wid "$MAP_WIDTH")
+if [[ -n "$MAP_SIZE" ]]; then
+    PYTHON_ARGS+=(--map-size "$MAP_SIZE")
 fi
-if [[ -n "$MAP_HEIGHT" ]]; then
-    PYTHON_ARGS+=(--map-hei "$MAP_HEIGHT")
+if [[ -n "$TOTAL_DEMAND" ]]; then
+    PYTHON_ARGS+=(--total-demand "$TOTAL_DEMAND")
 fi
-if [[ -n "$PROBLEM_SIZE" ]]; then
-    PYTHON_ARGS+=(--total-demand "$PROBLEM_SIZE")
+if [[ -n "$NUM_NODES" ]]; then
+    PYTHON_ARGS+=(--num-nodes "$NUM_NODES")
 fi
 if [[ -n "$MAX_STEPS" ]]; then
     PYTHON_ARGS+=(--max-steps "$MAX_STEPS")

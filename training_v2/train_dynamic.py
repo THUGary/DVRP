@@ -8,10 +8,15 @@ Two training modes:
 The static model is frozen, only adapters are trained.
 
 NORMALIZATION (v2 - capacity-normalized):
-- Grid coordinates: [0, grid_size] => [0, 1] by dividing by COORD_NORM
+- Grid coordinates: [0, map_size] => [0, 1] by dividing by COORD_NORM
 - Demands: demand / DEMAND_NORM (where DEMAND_NORM = vehicle capacity = 30)
 - Loads: load / capacity
 - Time: time / max_time
+
+TERMINOLOGY:
+- map_size: Side length of the square map (NOT total_demand)
+- num_nodes: Actual number of demand nodes (for tensor shapes)
+- total_demand: Upper limit of sum of all demands (capacity constraint, NOT used here)
 """
 
 from __future__ import annotations
@@ -49,23 +54,27 @@ class SimpleDVRPEnv:
     
     Uses standardized normalization constants from configs.py:
     - capacity: DEMAND_NORM = 30 (vehicle capacity)
-    - grid_size: COORD_NORM (default 20)
+    - map_size: Side length of the square map
+    
+    TERMINOLOGY:
+    - total_demand: Upper limit of sum of all customer demands (NOT node count!)
+    - num_nodes: Actual number of demand nodes to generate
     """
     
     def __init__(
         self,
-        grid_size: int = int(COORD_NORM),
+        map_size: int = int(COORD_NORM),
         num_agents: int = 2,
         capacity: float = DEMAND_NORM,  # Use standardized constant (= 30)
         max_time: int = 100,
-        num_demands: int = 20,
+        num_nodes: int = 20,  # Number of demand nodes (NOT total_demand!)
         device: str = "cpu",
     ):
-        self.grid_size = grid_size
+        self.map_size = map_size
         self.num_agents = num_agents
         self.capacity = capacity
         self.max_time = max_time
-        self.num_demands = num_demands
+        self.num_nodes = num_nodes  # Actual number of demand nodes
         self.device = torch.device(device)
         
         # State
@@ -86,18 +95,18 @@ class SimpleDVRPEnv:
         self.time = 0
         
         # Random depot
-        self.depot = torch.randint(0, self.grid_size, (2,), device=self.device).float()
+        self.depot = torch.randint(0, self.map_size, (2,), device=self.device).float()
         
         # Generate all demands upfront (static-like for simplicity)
         self.demands = []
         total_cap = 0
         max_cap_per_demand = self.capacity // self.num_agents
         
-        for i in range(self.num_demands):
+        for i in range(self.num_nodes):
             demand = {
                 'id': i,
-                'x': torch.randint(0, self.grid_size, (1,), device=self.device).item(),
-                'y': torch.randint(0, self.grid_size, (1,), device=self.device).item(),
+                'x': torch.randint(0, self.map_size, (1,), device=self.device).item(),
+                'y': torch.randint(0, self.map_size, (1,), device=self.device).item(),
                 'capacity': min(np.random.randint(1, 10), max_cap_per_demand),
                 'release_time': 0,  # all at start for static
                 'deadline': self.max_time * 2,
@@ -208,13 +217,13 @@ class SimpleDVRPEnv:
         self.time += 1
         
         # Check termination
-        all_served = len(self.served) == self.num_demands
+        all_served = len(self.served) == self.num_nodes
         timeout = self.time >= self.max_time
         done = all_served or timeout
         
         if done and not all_served:
             # Penalty for unserved demands
-            reward -= (self.num_demands - len(self.served)) * 5.0
+            reward -= (self.num_nodes - len(self.served)) * 5.0
         
         return self._get_obs(), reward, done, info
     
@@ -315,11 +324,11 @@ def train_rl_epoch(
             mask = env.get_mask(obs)
             
             # Normalize inputs
-            depot_norm = obs['depot_xy'] / env.grid_size
-            node_norm = obs['node_xy'] / env.grid_size
+            depot_norm = obs['depot_xy'] / env.map_size
+            node_norm = obs['node_xy'] / env.map_size
             demand_norm = obs['node_demand'] / env.capacity
             agent_states = obs['agent_states'].clone()
-            agent_states[:, :, :2] /= env.grid_size
+            agent_states[:, :, :2] /= env.map_size
             agent_states[:, :, 2] /= env.capacity
             agent_states[:, :, 3] /= env.max_time
             
@@ -366,7 +375,7 @@ def train_rl_epoch(
                 node_positions = obs['node_xy'][0]  # (n_nodes, 2)
                 target_positions = torch.cat([
                     depot_pos.unsqueeze(0),  # (1, 2)
-                    node_positions * env.grid_size,  # (n_nodes, 2) - unnormalize
+                    node_positions * env.map_size,  # (n_nodes, 2) - unnormalize
                 ], dim=0)
                 
                 if use_balance_training and workload_tracker is not None:
@@ -486,11 +495,11 @@ def train_supervised_epoch(
             mask = env.get_mask(obs)
             
             # Normalize inputs
-            depot_norm = obs['depot_xy'] / env.grid_size
-            node_norm = obs['node_xy'] / env.grid_size
+            depot_norm = obs['depot_xy'] / env.map_size
+            node_norm = obs['node_xy'] / env.map_size
             demand_norm = obs['node_demand'] / env.capacity
             agent_states = obs['agent_states'].clone()
-            agent_states[:, :, :2] /= env.grid_size
+            agent_states[:, :, :2] /= env.map_size
             agent_states[:, :, 2] /= env.capacity
             agent_states[:, :, 3] /= env.max_time
             
@@ -505,7 +514,7 @@ def train_supervised_epoch(
                 for node_idx in range(n_nodes):
                     if mask[0, agent_idx, node_idx + 1] == 0:  # valid
                         node_pos = obs['node_xy'][0, node_idx]
-                        dist = torch.norm(agent_pos - node_pos * env.grid_size).item()
+                        dist = torch.norm(agent_pos - node_pos * env.map_size).item()
                         if dist < best_dist:
                             best_dist = dist
                             best_action = node_idx + 1
@@ -571,9 +580,9 @@ def train_supervised_epoch(
 def train_dynamic_model(
     static_checkpoint: str,
     mode: str = "rl",  # "rl" or "supervised"
-    grid_size: int = 20,
+    map_size: int = 20,
     num_agents: int = 2,
-    num_demands: int = 20,
+    num_nodes: int = 20,
     adapter_dim: int = 32,
     epochs: int = 100,
     episodes_per_epoch: int = 100,
@@ -589,9 +598,9 @@ def train_dynamic_model(
     Args:
         static_checkpoint: path to pretrained static model
         mode: training mode ("rl" or "supervised")
-        grid_size: environment grid size
+        map_size: Side length of the square map
         num_agents: number of agents
-        num_demands: number of demands per episode
+        num_nodes: Number of demand nodes (distinct from total_demand which is capacity upper limit)
         adapter_dim: adapter dimension
         epochs: number of epochs
         episodes_per_epoch: episodes per epoch
@@ -616,9 +625,9 @@ def train_dynamic_model(
     
     # Create environment
     env = SimpleDVRPEnv(
-        grid_size=grid_size,
+        map_size=map_size,
         num_agents=num_agents,
-        num_demands=num_demands,
+        num_nodes=num_nodes,
         device=device,
     )
     
@@ -679,9 +688,11 @@ def main():
     parser.add_argument("--static-checkpoint", type=str, required=True,
                         help="Path to pretrained static model")
     parser.add_argument("--mode", type=str, default="rl", choices=["rl", "supervised"])
-    parser.add_argument("--grid-size", type=int, default=20)
+    parser.add_argument("--map-size", type=int, default=20,
+                        help="Side length of the square map")
     parser.add_argument("--num-agents", type=int, default=2)
-    parser.add_argument("--num-demands", type=int, default=20)
+    parser.add_argument("--num-nodes", type=int, default=20,
+                        help="Number of demand nodes (NOT total_demand which is capacity upper limit)")
     parser.add_argument("--adapter-dim", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--episodes-per-epoch", type=int, default=100)
@@ -700,9 +711,9 @@ def main():
     train_dynamic_model(
         static_checkpoint=args.static_checkpoint,
         mode=args.mode,
-        grid_size=args.grid_size,
+        map_size=args.map_size,
         num_agents=args.num_agents,
-        num_demands=args.num_demands,
+        num_nodes=args.num_nodes,
         adapter_dim=args.adapter_dim,
         epochs=args.epochs,
         episodes_per_epoch=args.episodes_per_epoch,

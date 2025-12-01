@@ -411,9 +411,11 @@ def main() -> None:
 	parser.add_argument("--gmodel", action="store_true", help="Use neural net demand generator; otherwise rule")
 	parser.add_argument("--service-time", action="store_true", help="Enable service times for demands (vehicles must remain on-site before completion)")
 	parser.add_argument("--num-agents", type=int, default=2, help="Override number of agents for the episode (overrides config)")
-	parser.add_argument("--map-wid", type=int, default=None, help="Override map width")
-	parser.add_argument("--map-hei", type=int, default=None, help="Override map height")
-	parser.add_argument("--total-demand", type=int, default=None, help="Override total demand parameter for the generator")
+	parser.add_argument("--map-size", type=int, default=None, help="Override map size (square map: map_size × map_size)")
+	parser.add_argument("--map-wid", type=int, default=None, help="Override map width (deprecated, use --map-size)")
+	parser.add_argument("--map-hei", type=int, default=None, help="Override map height (deprecated, use --map-size)")
+	parser.add_argument("--total-demand", type=int, default=None, help="Override total demand capacity (upper limit of sum of all demands)")
+	parser.add_argument("--num-nodes", type=int, default=None, help="Override number of demand nodes")
 	parser.add_argument("--static-demands", action="store_true", help="Release all demands at time 0 to visualize static VRP instances")
 	parser.add_argument("--static-max-end", type=int, default=None, help="Max environment time for static demands (default: 2 * max_time)")
 	parser.add_argument("--max-steps", type=int, default=None, help="Maximum episode steps (default: no limit)")
@@ -426,12 +428,19 @@ def main() -> None:
 	# override number of agents if provided on CLI
 	if args.num_agents is not None and args.num_agents > 0:
 		cfg.num_agents = int(args.num_agents)
-	if args.map_wid is not None and args.map_wid > 0:
-		cfg.width = int(args.map_wid)
-	if args.map_hei is not None and args.map_hei > 0:
-		cfg.height = int(args.map_hei)
+	# Handle map size: prefer --map-size over --map-wid/--map-hei
+	if args.map_size is not None and args.map_size > 0:
+		cfg.width = int(args.map_size)
+		cfg.height = int(args.map_size)
+	else:
+		if args.map_wid is not None and args.map_wid > 0:
+			cfg.width = int(args.map_wid)
+		if args.map_hei is not None and args.map_hei > 0:
+			cfg.height = int(args.map_hei)
 	if args.total_demand is not None and args.total_demand > 0:
 		cfg.generator_params["total_demand"] = int(args.total_demand)
+	if args.num_nodes is not None and args.num_nodes > 0:
+		cfg.generator_params["num_nodes"] = int(args.num_nodes)
 
 	# Override max_end_time for static demands if specified
 	if args.static_max_end is not None and args.static_max_end > 0:

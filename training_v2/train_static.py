@@ -21,7 +21,10 @@ At inference time (V2Planner), we map from the environment space to model space:
 KEY DESIGN:
 - capacity=30 and max_demand=5 are FIXED
 - Map size (COORD_NORM) can be varied: 20, 30, 40, etc.
-- Total demand count can be varied: 20, 30, 50, etc.
+
+TERMINOLOGY:
+- num_nodes: Number of customer/demand nodes (for tensor shapes)
+- total_demand: Upper limit of sum of all customer demands (NOT node count!)
 """
 
 from __future__ import annotations
@@ -39,10 +42,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models_v2.static_model import StaticVRPModel, StaticVRPEnv, create_static_model
 
+# Default max demand per node (demands are 1 to MAX_DEMAND_PER_NODE)
+MAX_DEMAND_PER_NODE = 5
+AVG_DEMAND_PER_NODE = (1 + MAX_DEMAND_PER_NODE) / 2  # = 3.0
+
+# Default number of nodes
+DEFAULT_NUM_NODES = 50
+
 
 def generate_random_problems(
     batch_size: int,
-    problem_size: int,
+    num_nodes: int,
     device: torch.device,
     target_num_vehicles: int = 4,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -51,14 +61,14 @@ def generate_random_problems(
     
     Args:
         batch_size: number of instances
-        problem_size: number of customer nodes
+        num_nodes: number of customer nodes
         device: torch device
         target_num_vehicles: target number of vehicles needed (controls total demand)
         
     Returns:
         depot_xy: (batch, 1, 2)
-        node_xy: (batch, problem_size, 2)
-        node_demand: (batch, problem_size) - normalized so vehicle_capacity=1.0
+        node_xy: (batch, num_nodes, 2)
+        node_demand: (batch, num_nodes) - normalized so vehicle_capacity=1.0
         
     Note:
         Map size: [0,1] x [0,1] (unit square)
@@ -67,17 +77,17 @@ def generate_random_problems(
         Total demand is scaled to need ~target_num_vehicles trips
     """
     depot_xy = torch.rand(batch_size, 1, 2, device=device)
-    node_xy = torch.rand(batch_size, problem_size, 2, device=device)
+    node_xy = torch.rand(batch_size, num_nodes, 2, device=device)
     
-    # Generate raw demands [1, 5] (matching DEFAULT_MAX_DEMAND=5)
+    # Generate raw demands [1, 5] (matching MAX_DEMAND_PER_NODE=5)
     # mean = 3.0
-    raw_demand = torch.randint(1, 6, (batch_size, problem_size), device=device).float()
+    raw_demand = torch.randint(1, MAX_DEMAND_PER_NODE + 1, (batch_size, num_nodes), device=device).float()
     
     # Normalize: demand / 30 (matching DEMAND_NORM=30)
     # So demands are in [0.033, 0.167] range, vehicle_capacity = 1.0
     node_demand = raw_demand / 30.0
     
-    # Note: With problem_size=20, mean demand=3/30=0.1, total demand ≈ 20*0.1 = 2.0
+    # Note: With num_nodes=20, mean demand=3/30=0.1, total demand ≈ 20*0.1 = 2.0
     # This means we need ~2 vehicle trips on average for 20 nodes
     # This is reasonable for target_num_vehicles=2
     
@@ -89,7 +99,7 @@ def train_one_batch(
     env: StaticVRPEnv,
     optimizer: torch.optim.Optimizer,
     batch_size: int,
-    problem_size: int,
+    num_nodes: int,
     pomo_size: int,
     aug_factor: int,
     device: torch.device,
@@ -106,7 +116,7 @@ def train_one_batch(
     
     # Generate problems
     depot_xy, node_xy, node_demand = generate_random_problems(
-        batch_size, problem_size, device, target_num_vehicles
+        batch_size, num_nodes, device, target_num_vehicles
     )
     env.load_problems(depot_xy, node_xy, node_demand, aug_factor=aug_factor)
     
@@ -147,7 +157,7 @@ def train_one_batch(
 
 
 def train_static_model(
-    problem_size: int = 100,
+    num_nodes: int = DEFAULT_NUM_NODES,
     pomo_size: int = 100,
     aug_factor: int = 1,
     embedding_dim: int = 128,
@@ -168,7 +178,7 @@ def train_static_model(
     Train static VRP model.
     
     Args:
-        problem_size: number of customer nodes
+        num_nodes: Number of customer/demand nodes
         pomo_size: number of parallel rollouts
         embedding_dim: model dimension
         encoder_layers: number of encoder layers
@@ -182,6 +192,7 @@ def train_static_model(
         save_interval: save every N epochs
         device: cuda or cpu
         resume_from: checkpoint to resume from
+        target_num_vehicles: target number of vehicles
     """
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     print(f"Training on {device}")
@@ -193,8 +204,8 @@ def train_static_model(
         heads=heads,
     ).to(device)
     
-    # Create environment
-    env = StaticVRPEnv(problem_size=problem_size, pomo_size=pomo_size)
+    # Create environment (uses num_nodes as problem_size)
+    env = StaticVRPEnv(problem_size=num_nodes, pomo_size=pomo_size)
     
     # Optimizer
     optimizer = Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -217,7 +228,7 @@ def train_static_model(
     
     # Training loop
     print(f"\nTraining Static VRP Model")
-    print(f"  Problem size (nodes): {problem_size}")
+    print(f"  Num nodes: {num_nodes} (demand node count)")
     print(f"  Target vehicles: {target_num_vehicles}")
     print(f"  Map size: [0,1] x [0,1] (unit square)")
     print(f"  Vehicle capacity: 1.0")
@@ -237,7 +248,7 @@ def train_static_model(
         
         for batch_idx in range(n_batches):
             score, loss = train_one_batch(
-                model, env, optimizer, batch_size, problem_size, pomo_size, aug_factor, device,
+                model, env, optimizer, batch_size, num_nodes, pomo_size, aug_factor, device,
                 target_num_vehicles=target_num_vehicles
             )
             epoch_score += score
@@ -262,16 +273,17 @@ def train_static_model(
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'score': avg_score,
+            'num_nodes': num_nodes,
         }
         
         if avg_score < best_score:
             best_score = avg_score
-            torch.save(checkpoint, os.path.join(save_dir, f"best_n{problem_size}.pt"))
+            torch.save(checkpoint, os.path.join(save_dir, f"best_n{num_nodes}.pt"))
             print(f"  New best score: {best_score:.4f}")
         
         # Save final epoch checkpoint for resuming
         if epoch == epochs:
-            torch.save(checkpoint, os.path.join(save_dir, f"final_n{problem_size}_ep{epoch}.pt"))
+            torch.save(checkpoint, os.path.join(save_dir, f"final_n{num_nodes}_ep{epoch}.pt"))
             print(f"  Saved final checkpoint at epoch {epoch}")
     
     print(f"\nTraining complete. Best score: {best_score:.4f}")
@@ -280,8 +292,8 @@ def train_static_model(
 
 def main():
     parser = argparse.ArgumentParser(description="Train Static VRP Model")
-    parser.add_argument("--problem-size", type=int, default=20,
-                        help="Number of customer nodes")
+    parser.add_argument("--num-nodes", type=int, default=DEFAULT_NUM_NODES,
+                        help="Number of demand nodes")
     parser.add_argument("--target-vehicles", type=int, default=4,
                         help="Target number of vehicles (controls total demand)")
     parser.add_argument("--pomo-size", type=int, default=20)
@@ -301,7 +313,7 @@ def main():
     args = parser.parse_args()
     
     train_static_model(
-        problem_size=args.problem_size,
+        num_nodes=args.num_nodes,
         pomo_size=args.pomo_size,
         aug_factor=args.aug_factor,
         embedding_dim=args.embedding_dim,

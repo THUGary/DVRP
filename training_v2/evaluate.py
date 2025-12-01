@@ -1,5 +1,9 @@
 """
 Simple evaluation script for VRP models.
+
+TERMINOLOGY:
+- num_nodes: Actual number of customer/demand nodes (used for tensor shapes)
+- total_demand: Upper limit of sum of all demands (NOT used in this file)
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ from models_v2.static_model import StaticVRPModel, create_static_model
 
 def evaluate_static_model(
     checkpoint: str,
-    problem_size: int = 20,
+    num_nodes: int = 20,
     num_instances: int = 100,
     pomo_size: int = 20,
     num_vehicles: int = 2,
@@ -27,7 +31,7 @@ def evaluate_static_model(
     
     Args:
         checkpoint: path to model checkpoint
-        problem_size: number of customer nodes
+        num_nodes: Number of customer nodes (distinct from total_demand which is capacity upper limit)
         num_instances: number of test instances
         pomo_size: number of POMO rollouts
         num_vehicles: number of vehicles
@@ -52,7 +56,7 @@ def evaluate_static_model(
     
     # Generate test instances
     print(f"\nEvaluating on {num_instances} random instances...")
-    print(f"  Problem size: {problem_size}")
+    print(f"  Number of nodes: {num_nodes}")
     print(f"  POMO size: {pomo_size}")
     print(f"  Vehicles: {num_vehicles}")
     print(f"  Augmentation: {augment}")
@@ -62,16 +66,16 @@ def evaluate_static_model(
     for i in range(num_instances):
         # Generate random instance
         depot_xy = torch.rand(1, 1, 2, device=device)
-        node_xy = torch.rand(1, problem_size, 2, device=device)
+        node_xy = torch.rand(1, num_nodes, 2, device=device)
         
-        if problem_size == 20:
+        if num_nodes == 20:
             demand_scaler = 30
-        elif problem_size == 50:
+        elif num_nodes == 50:
             demand_scaler = 40
         else:
             demand_scaler = 50
         
-        node_demand = torch.randint(1, 10, (1, problem_size), device=device).float() / demand_scaler
+        node_demand = torch.randint(1, 10, (1, num_nodes), device=device).float() / demand_scaler
         
         # Solve
         distances, routes = model.solve(
@@ -97,7 +101,8 @@ def evaluate_static_model(
 def main():
     parser = argparse.ArgumentParser(description="Evaluate VRP Model")
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--problem-size", type=int, default=20)
+    parser.add_argument("--num-nodes", type=int, default=20,
+                        help="Number of customer nodes (NOT total_demand which is capacity upper limit)")
     parser.add_argument("--num-instances", type=int, default=100)
     parser.add_argument("--pomo-size", type=int, default=20)
     parser.add_argument("--num-vehicles", type=int, default=2)
@@ -108,7 +113,7 @@ def main():
     
     evaluate_static_model(
         checkpoint=args.checkpoint,
-        problem_size=args.problem_size,
+        num_nodes=args.num_nodes,
         num_instances=args.num_instances,
         pomo_size=args.pomo_size,
         num_vehicles=args.num_vehicles,

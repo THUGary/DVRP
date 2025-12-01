@@ -18,6 +18,27 @@ from agent.generator.distribution_sets import SUPPORTED_DEMAND_DISTRIBUTIONS
 DISTRIBUTIONS = list(SUPPORTED_DEMAND_DISTRIBUTIONS)
 
 
+def _cuda_warmup():
+    """
+    Perform CUDA initialization warmup.
+    
+    The first CUDA operation in a process incurs a ~1.5s initialization overhead.
+    By doing this warmup before any timing measurements, we ensure fair comparison
+    between all planners regardless of evaluation order.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            # Create a small tensor and do a simple operation to trigger CUDA init
+            device = torch.device("cuda")
+            x = torch.randn(100, 100, device=device)
+            _ = torch.matmul(x, x)
+            torch.cuda.synchronize()
+            del x
+    except ImportError:
+        pass  # torch not available, skip warmup
+
+
 def create_output_run_dir(base_dir: str, prefix: str) -> str:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     folder = os.path.join(base_dir, f"{prefix}_{ts}")
@@ -84,8 +105,15 @@ def evaluate_distributions(
     completed_evals = 0
     start_time = time_module.time()
 
-    # Warmup: run one episode for each model-based planner to initialize CUDA/PyTorch
-    # This eliminates the first-run overhead from timing measurements
+    # CUDA Warmup: Initialize CUDA/PyTorch once before any measurements
+    # This ensures the first-run CUDA initialization overhead (~1.5s) doesn't
+    # affect timing measurements for whichever planner happens to run first.
+    print("Performing CUDA warmup...")
+    _cuda_warmup()
+    print("  CUDA warmup complete")
+
+    # Warmup: run one episode for each model-based planner to initialize model weights
+    # This is separate from CUDA warmup - it ensures model weights are loaded
     for spec in planner_specs:
         if spec.planner_type in ("model", "static", "dynamic"):
             print(f"Warming up planner: {spec.label}...")
@@ -338,9 +366,12 @@ if __name__ == "__main__":
     parser.add_argument("--use-hungarian", action="store_true",
                         help="Use Hungarian algorithm for model planner's global assignment (instead of greedy decoding)")
     parser.add_argument("--total-demand", type=int, default=None,
-                        help="Override the total demand passed to the generator (positive integer)")
-    parser.add_argument("--map-wid", type=int, default=None, help="Override map width")
-    parser.add_argument("--map-hei", type=int, default=None, help="Override map height")
+                        help="Override total demand capacity (upper limit of sum of all demands)")
+    parser.add_argument("--num-nodes", type=int, default=None,
+                        help="Override number of demand nodes")
+    parser.add_argument("--map-size", type=int, default=None, help="Override map size (square map: map_size × map_size)")
+    parser.add_argument("--map-wid", type=int, default=None, help="Override map width (deprecated, use --map-size)")
+    parser.add_argument("--map-hei", type=int, default=None, help="Override map height (deprecated, use --map-size)")
     parser.add_argument("--num-agents", type=int, default=None, help="Override number of agents used for evaluation")
     parser.add_argument("--capacity", type=int, default=None,
                         help="Override vehicle capacity. For POMO model, use capacity~30 for 2 agents to match training normalization")
@@ -467,10 +498,15 @@ if __name__ == "__main__":
     if not planner_specs:
         planner_specs.append(PlannerSpec(label="model", planner_type="model"))
 
-    if args.map_wid is not None and args.map_wid > 0:
-        cfg.width = args.map_wid
-    if args.map_hei is not None and args.map_hei > 0:
-        cfg.height = args.map_hei
+    # Handle map size: prefer --map-size over --map-wid/--map-hei
+    if args.map_size is not None and args.map_size > 0:
+        cfg.width = args.map_size
+        cfg.height = args.map_size
+    else:
+        if args.map_wid is not None and args.map_wid > 0:
+            cfg.width = args.map_wid
+        if args.map_hei is not None and args.map_hei > 0:
+            cfg.height = args.map_hei
     if args.num_agents is not None and args.num_agents > 0:
         cfg.num_agents = int(args.num_agents)
     if args.capacity is not None and args.capacity > 0:
@@ -478,6 +514,9 @@ if __name__ == "__main__":
     if args.total_demand is not None and args.total_demand > 0:
         cfg.generator_params = dict(cfg.generator_params)
         cfg.generator_params["total_demand"] = args.total_demand
+    if args.num_nodes is not None and args.num_nodes > 0:
+        cfg.generator_params = dict(cfg.generator_params)
+        cfg.generator_params["num_nodes"] = args.num_nodes
     if args.max_c is not None and args.max_c > 0:
         cfg.generator_params = dict(cfg.generator_params)
         cfg.generator_params["max_c"] = args.max_c

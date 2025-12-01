@@ -109,6 +109,8 @@ class StaticVRPEnv:
             aug_factor: data augmentation factor (1 or 8)
         """
         self.batch_size = depot_xy.size(0)
+        # Update problem_size from actual data to handle variable-size problems
+        self.problem_size = node_xy.size(1)
         device = depot_xy.device
 
         if aug_factor == 8:

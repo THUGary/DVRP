@@ -2,22 +2,21 @@
 # Evaluate Different Planners on Various Distributions
 #
 # KEY PARAMETERS:
-#   - TOTAL_DEMAND: Total demand to distribute (sum of all node demands)
-#                   With max_c=5, expected nodes ≈ TOTAL_DEMAND / 3
-#                   Example: TOTAL_DEMAND=50 -> ~17 nodes, TOTAL_DEMAND=150 -> ~50 nodes
+#   - NUM_NODES: Number of demand nodes
+#   - TOTAL_DEMAND: Upper limit of total demand to distribute (sum of all node demands)
 #   - MAX_C: Max demand per node (default=5, range 1-5 per node)
-#   - MAP_WIDTH/MAP_HEIGHT: Map size (default 30x30)
+#   - MAP_SIZE: Side length of the square map (map is MAP_SIZE × MAP_SIZE)
 #   - NUM_AGENTS: Number of vehicles (default=2)
 #
 # FIXED PARAMETERS (match model training):
 #   - Vehicle capacity: 30 (normalized to 1.0 for model)
 #
 # Usage Examples:
-#   # Basic evaluation with 50 nodes (default)
+#   # Basic evaluation with default settings
 #   bash scripts/evaluate_distributions.sh
 #
-#   # Evaluate with 20 nodes on 40x40 map
-#   PROBLEM_SIZE=20 MAP_WIDTH=40 MAP_HEIGHT=40 bash scripts/evaluate_distributions.sh
+#   # Evaluate with more nodes on larger map
+#   NUM_NODES=50 MAP_SIZE=40 bash scripts/evaluate_distributions.sh
 #
 #   # Evaluate specific model checkpoint
 #   MODEL_CHECKPOINTS=checkpoints/static_vrp_v2/best_n50.pt bash scripts/evaluate_distributions.sh
@@ -28,12 +27,11 @@ cd "$SCRIPT_DIR/.."
 
 # === Configurable Parameters ===
 NUM_AGENTS="${NUM_AGENTS:-10}"             # Number of vehicles
-# TOTAL_DEMAND: Sum of all customer demands (NOT node count!)
-# Expected node count ≈ TOTAL_DEMAND / avg_demand ≈ TOTAL_DEMAND / 3 (when max_c=5)
-# For exact solver: TOTAL_DEMAND ≤ 50 uses exact DP (~17 nodes)
-TOTAL_DEMAND="${TOTAL_DEMAND:-${PROBLEM_SIZE:-80}}"  # Total demand (supports legacy PROBLEM_SIZE)
-MAP_WIDTH="${MAP_WIDTH:-50}"              # Map grid width
-MAP_HEIGHT="${MAP_HEIGHT:-50}"            # Map grid height
+# NUM_NODES: Number of demand nodes
+NUM_NODES="${NUM_NODES:-20}"
+# TOTAL_DEMAND: Upper limit of sum of all customer demands (NOT node count!)
+TOTAL_DEMAND="${TOTAL_DEMAND:-80}"         # Total demand upper limit
+MAP_SIZE="${MAP_SIZE:-50}"                 # Square map side length (map is MAP_SIZE × MAP_SIZE)
 
 # POMO inference parameters
 POMO_SIZE="${POMO_SIZE:-20}"              # Number of parallel rollouts
@@ -70,13 +68,14 @@ MAX_STEPS="${MAX_STEPS:-5000}"            # Max simulation steps
 echo "=== Evaluate Distributions Configuration ==="
 echo ""
 echo "  DEMAND SETTINGS:"
-echo "    Total demand:       $TOTAL_DEMAND (expected ~$((TOTAL_DEMAND / 3)) nodes)"
+echo "    Num nodes:          $NUM_NODES"
+echo "    Total demand:       $TOTAL_DEMAND"
 echo "    Max demand/node:    $MAX_C"
 echo "    Vehicle capacity:   $CAPACITY"
 echo ""
 echo "  ENVIRONMENT:"
 echo "    Num agents:         $NUM_AGENTS"
-echo "    Map size:           ${MAP_WIDTH}x${MAP_HEIGHT}"
+echo "    Map size:           ${MAP_SIZE}x${MAP_SIZE}"
 echo ""
 echo "  EVALUATION:"
 echo "    Num runs:           $NUM_RUNS"
@@ -122,9 +121,9 @@ cmd+=(
     python3 evaluate_distributions.py
     --num-runs "$NUM_RUNS"
     --num-agents "$NUM_AGENTS"
+    --num-nodes "$NUM_NODES"
     --total-demand "$TOTAL_DEMAND"
-    --map-wid "$MAP_WIDTH"
-    --map-hei "$MAP_HEIGHT"
+    --map-size "$MAP_SIZE"
     --out-dir "$OUT_DIR"
     --plot-metrics "$PLOT_METRICS"
     --pomo-size "$POMO_SIZE"

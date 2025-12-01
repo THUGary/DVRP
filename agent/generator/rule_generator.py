@@ -390,6 +390,11 @@ class Neighborhood:
 class RuleBasedGenerator(BaseDemandGenerator):
     """Generate demand points in rules."""
 
+    def __init__(self, width: int, height: int, **params) -> None:
+        super().__init__(width, height, **params)
+        # Initialize by calling reset
+        self.reset(params.get("rng_seed"))
+
     def reset(self, seed: Optional[int] = None) -> None:
         seed = seed if seed is not None else self.params.get("rng_seed")
         super().reset(seed)
@@ -400,18 +405,28 @@ class RuleBasedGenerator(BaseDemandGenerator):
         if seed is not None:
             np.random.seed(seed)
 
-        # Reset mutable counters (total_demand) from params BEFORE initializing
-        # neighborhoods, because _initialize_neighborhoods() uses self.total_demand
-        # to compute lambda_param for Poisson sampling.
-        try:
-            self.total_demand = int(self.params.get("total_demand", 1))
-        except Exception:
-            self.total_demand = int(getattr(self, "total_demand", 1))
+        # Reset mutable counters from params BEFORE initializing neighborhoods
+        # Support two limiting modes:
+        # 1. num_nodes: limit by number of demand nodes (preferred)
+        # 2. total_demand: limit by sum of all demand capacities (legacy)
+        
+        # num_nodes takes priority if provided
+        self.remaining_nodes = self.params.get("num_nodes", None)
+        if self.remaining_nodes is not None:
+            self.remaining_nodes = int(self.remaining_nodes)
+            self.limit_mode = "num_nodes"
+        else:
+            # Fallback to total_demand for backward compatibility
+            try:
+                self.total_demand = int(self.params.get("total_demand", 1))
+            except Exception:
+                self.total_demand = int(getattr(self, "total_demand", 1))
+            self.limit_mode = "total_demand"
 
         # Track occupied positions across all time steps (one demand per position)
         self._occupied_positions: set = set()
 
-        # Initialize concentrated generation areas (must come after total_demand reset)
+        # Initialize concentrated generation areas
         self.neighborhoods = self._initialize_neighborhoods()
         
     def _initialize_neighborhoods(self) -> List[Neighborhood]:
@@ -419,12 +434,20 @@ class RuleBasedGenerator(BaseDemandGenerator):
         num_centers = self.params.get("num_centers", 3)  # Number of center points
         
         neighborhoods = []
+        max_time = self.params.get("max_time", 100)  # Default max_time if not provided
         for _ in range(num_centers):
            # Sample center coordinates
             center_x = self._rng.uniform(0, self.width)
             center_y = self._rng.uniform(0, self.height)
-            local_max_c=self.params.get("max_c")
-            lambda_param=self.total_demand/num_centers/self.params.get("max_time")/(1+local_max_c/2)
+            local_max_c=self.params.get("max_c", 50)  # Default max_c if not provided
+            
+            # Compute lambda_param based on limit mode
+            if self.limit_mode == "num_nodes":
+                # Estimate demands per center based on num_nodes
+                lambda_param = self.remaining_nodes / num_centers / max_time
+            else:
+                # Legacy: use total_demand
+                lambda_param = self.total_demand / num_centers / max_time / (1 + local_max_c / 2)
             
             distribution=self.params.get("distribution")
             size=self.params.get("neighborhood_size",3)
@@ -457,6 +480,12 @@ class RuleBasedGenerator(BaseDemandGenerator):
                 "distribution": "implosion",
                 "scale_factor": size/5.0,
                 }
+            else:
+                # Default to uniform distribution
+                distribution_params = {
+                    "distribution": "uniform",
+                    "size": self._rng.uniform(0.25*size, 1.25*size),
+                }
 
             local_params={
                 "lambda_param":lambda_param,
@@ -487,11 +516,19 @@ class RuleBasedGenerator(BaseDemandGenerator):
         return neighborhoods
 
     def sample(self, t: int) -> List[Demand]:
-        """Sample all demand points at the current time step."""
-        # print(f"Remaining total_demand: {self.total_demand}")
-
-        if getattr(self, "total_demand", 0) <= 0:
-            return []
+        """Sample all demand points at the current time step.
+        
+        Supports two limiting modes:
+        - num_nodes mode: limit by total number of demand nodes
+        - total_demand mode: limit by sum of all demand capacities (legacy)
+        """
+        # Check if we've exhausted our quota
+        if self.limit_mode == "num_nodes":
+            if getattr(self, "remaining_nodes", 0) <= 0:
+                return []
+        else:
+            if getattr(self, "total_demand", 0) <= 0:
+                return []
         
         all_demands = []
 
@@ -541,19 +578,27 @@ class RuleBasedGenerator(BaseDemandGenerator):
         # Merge demands fallen into the same grid cell (should be rare now)
         merged_demands = self._merge_demands_by_grid(all_demands)
         
-        # After per-neighborhood resampling, merged_demands should no longer contain depot-overlapping points
+        # Apply limits based on mode
+        if self.limit_mode == "num_nodes":
+            # Limit by number of nodes
+            num_demands = len(merged_demands)
+            if num_demands > self.remaining_nodes:
+                # Randomly select which demands to keep
+                keep_indices = self._rng.sample(range(num_demands), self.remaining_nodes)
+                merged_demands = [merged_demands[i] for i in sorted(keep_indices)]
+            self.remaining_nodes -= len(merged_demands)
+        else:
+            # Legacy: limit by total demand capacity
+            total_c = sum(d.c for d in merged_demands)
+            remove_ids = []
+        
+            while total_c > self.total_demand:
+                id = self._rng.randint(0, len(merged_demands) - 1)
+                total_c -= merged_demands[id].c
+                remove_ids.append(id)
 
-        # strictly control total demand quantity
-        total_c = sum(d.c for d in merged_demands)
-        remove_ids=[]
-    
-        while total_c > self.total_demand:
-            id=self._rng.randint(0,len(merged_demands)-1)
-            total_c -= merged_demands[id].c
-            remove_ids.append(id)
-
-        self.total_demand -= total_c
-        merged_demands = [d for i, d in enumerate(merged_demands) if i not in remove_ids]
+            self.total_demand -= total_c
+            merged_demands = [d for i, d in enumerate(merged_demands) if i not in remove_ids]
 
         enriched_demands = [
             Demand(
