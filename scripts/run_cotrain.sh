@@ -26,6 +26,7 @@ MODE="static"                    # "static" or "dynamic"
 # --- Co-evolution Settings ---
 NUM_CYCLES=2             # Number of co-evolution cycles
 PLANNER_EPOCHS=1        # Planner training epochs per cycle
+FIRST_CYCLE_PLANNER_EPOCHS=150  # First cycle planner epochs (leave empty to use PLANNER_EPOCHS)
 GENERATOR_EPOCHS=1      # Generator training epochs per cycle
 
 # --- Batch Settings ---
@@ -61,7 +62,10 @@ SEED=42                  # Random seed
 
 # --- Checkpoints (optional, for loading pretrained models) ---
 PLANNER_CHECKPOINT=""    # Path to pretrained planner (leave empty if none)
-GENERATOR_CHECKPOINT=""  # Path to pretrained generator (leave empty if none)
+# Path to pretrained diffusion generator checkpoint
+# Recommended: use a supervised-trained model to avoid random initialization
+# Example: "checkpoints/diffusion_model.pth"
+GENERATOR_CHECKPOINT=""
 RESUME_FROM=""           # Resume from checkpoint directory (leave empty if none)
 
 # --- Output ---
@@ -81,6 +85,9 @@ echo ""
 echo "CO-EVOLUTION:"
 echo "  Cycles:           ${NUM_CYCLES}"
 echo "  Planner epochs:   ${PLANNER_EPOCHS}"
+if [[ -n "${FIRST_CYCLE_PLANNER_EPOCHS}" ]]; then
+    echo "  First cycle epochs: ${FIRST_CYCLE_PLANNER_EPOCHS}"
+fi
 echo "  Generator epochs: ${GENERATOR_EPOCHS}"
 echo ""
 echo "BATCH SETTINGS:"
@@ -148,6 +155,11 @@ CMD=(
     --seed "${SEED}"
     --save-dir "${SAVE_DIR}"
 )
+
+# Add first cycle planner epochs if specified
+if [[ -n "${FIRST_CYCLE_PLANNER_EPOCHS}" ]]; then
+    CMD+=(--first-cycle-planner-epochs "${FIRST_CYCLE_PLANNER_EPOCHS}")
+fi
 
 # Add optional flags
 if [[ "${RANDOMIZE_DEPOT}" == "true" ]]; then

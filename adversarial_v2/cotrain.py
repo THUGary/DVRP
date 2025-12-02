@@ -33,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Planner training epochs per cycle"
     )
     parser.add_argument(
+        "--first-cycle-planner-epochs", type=int, default=None,
+        help="Planner training epochs for the first cycle (overrides --planner-epochs for cycle 1). "
+             "Useful for longer initial training when starting from scratch."
+    )
+    parser.add_argument(
         "--generator-epochs", type=int, default=5,
         help="Generator training epochs per cycle"
     )
@@ -140,6 +145,7 @@ def main():
         num_cycles=args.num_cycles,
         planner_epochs_per_cycle=args.planner_epochs,
         generator_epochs_per_cycle=args.generator_epochs,
+        first_cycle_planner_epochs=args.first_cycle_planner_epochs,
         batch_size=args.batch_size,
         pomo_size=args.pomo_size,
         episodes_per_epoch=args.episodes_per_epoch,

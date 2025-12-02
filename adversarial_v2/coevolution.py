@@ -38,6 +38,8 @@ def coevolution_loop(
     print(f"Mode: {config.mode}")
     print(f"Cycles: {config.num_cycles}")
     print(f"Planner epochs/cycle: {config.planner_epochs_per_cycle}")
+    if config.first_cycle_planner_epochs is not None:
+        print(f"First cycle planner epochs: {config.first_cycle_planner_epochs}")
     print(f"Generator epochs/cycle: {config.generator_epochs_per_cycle}")
     print(f"Version sampling policy: {config.version_sample_policy}")
     print(f"Map: {config.env.map_size}x{config.env.map_size}, Agents: {config.env.num_agents}")
@@ -113,8 +115,15 @@ def coevolution_loop(
         # ============================================
         print(f"\n[Phase 1] Training Planner (using {registry.num_versions()} generator versions)")
         
-        for epoch in range(1, config.planner_epochs_per_cycle + 1):
-            print(f"\n  Planner Epoch {epoch}/{config.planner_epochs_per_cycle}")
+        # Use first_cycle_planner_epochs for cycle 1 if specified
+        if cycle == 1 and config.first_cycle_planner_epochs is not None:
+            planner_epochs = config.first_cycle_planner_epochs
+            print(f"  Using first cycle epochs: {planner_epochs}")
+        else:
+            planner_epochs = config.planner_epochs_per_cycle
+        
+        for epoch in range(1, planner_epochs + 1):
+            print(f"\n  Planner Epoch {epoch}/{planner_epochs}")
             
             metrics = planner_trainer.train_epoch()
             
