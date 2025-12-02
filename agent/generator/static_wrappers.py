@@ -9,19 +9,19 @@ from .base import BaseDemandGenerator, Demand
 
 
 class StaticDemandGenerator(BaseDemandGenerator):
-    """Wraps a generator so every demand releases at t=0 and lives for the full horizon."""
+    """Wraps a generator so every demand releases at t=0 and lives forever (no expiry)."""
+
+    # Very large number to ensure demands never expire in static VRP
+    INFINITE_END_TIME = 999999
 
     def __init__(self, base_generator: BaseDemandGenerator, *, max_end_time: Optional[int] = None) -> None:
         super().__init__(base_generator.width, base_generator.height, **getattr(base_generator, "params", {}))
         self._base = base_generator
         self._snapshot: List[Demand] = []
         self._released = False
-        base_max_time = int(getattr(base_generator, "max_time", self.params.get("max_time", 1)))
-        base_max_time = max(1, base_max_time)
-        if max_end_time is not None:
-            self._extended_end_t = int(max_end_time)
-        else:
-            self._extended_end_t = max(base_max_time * 2, base_max_time + 100)
+        # For static VRP, demands should never expire - use a very large end_t
+        # Ignore max_end_time parameter as it's not relevant for static VRP
+        self._extended_end_t = self.INFINITE_END_TIME
 
     def reset(self, seed: Optional[int] = None) -> None:
         # IMPORTANT: Set global random states before generating demands.

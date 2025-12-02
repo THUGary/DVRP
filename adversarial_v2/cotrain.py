@@ -67,9 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--map-size", type=int, default=20,
         help="Side length of the square map (map is map_size × map_size)"
     )
-    parser.add_argument("--num-agents", type=int, default=2, help="Number of vehicles")
+    parser.add_argument("--num-agents", type=int, default=5, help="Number of vehicles")
     parser.add_argument("--capacity", type=int, default=30, help="Vehicle capacity (fixed at 30 = DEMAND_NORM)")
     parser.add_argument("--max-time", type=int, default=100, help="Max simulation time")
+    parser.add_argument("--max-end-time", type=int, default=200, help="Max end time for demands (deadline)")
     parser.add_argument(
         "--num-nodes", type=int, default=50,
         help="Number of demand nodes (actual count for tensor shapes). "
@@ -124,6 +125,7 @@ def main():
         num_agents=args.num_agents,
         capacity=args.capacity,
         max_time=args.max_time,
+        max_end_time=args.max_end_time,
         num_nodes=args.num_nodes,
         total_demand=args.total_demand,
         max_c=args.max_c,

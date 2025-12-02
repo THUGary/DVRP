@@ -112,28 +112,34 @@ def evaluate_distributions(
     _cuda_warmup()
     print("  CUDA warmup complete")
 
-    # Warmup: run one episode for each model-based planner to initialize model weights
-    # This is separate from CUDA warmup - it ensures model weights are loaded
-    for spec in planner_specs:
-        if spec.planner_type in ("model", "static", "dynamic"):
-            print(f"Warming up planner: {spec.label}...")
+    # Note: Model weights are loaded lazily on first use within each planner.
+    # The first episode for each model planner will include model loading time,
+    # but this is acceptable since we're measuring inference_time separately
+    # and the loading overhead is amortized across many runs.
+
+    for spec_idx, spec in enumerate(planner_specs):
+        print(f"\n=== Evaluating planner: {spec.label} ({spec.planner_type}) [{spec_idx+1}/{len(planner_specs)}] ===")
+        planner_results: dict[str, dict[str, dict[str, float]]] = {}
+        
+        # For model-based planners, run one warmup episode to load model weights
+        # This ensures model loading time doesn't affect inference_time measurements
+        is_model_planner = spec.planner_type in ("model", "static", "dynamic")
+        if is_model_planner:
+            print(f"  [Warmup] Running warmup episode for {spec.label}...")
             warmup_cfg = copy.deepcopy(cfg)
-            warmup_cfg.generator_params["distribution"] = "uniform"
+            warmup_cfg.generator_params["distribution"] = DISTRIBUTIONS[0]
             warmup_cfg = sanitize_cfg(warmup_cfg)
+            warmup_cfg.seed = 9999  # Use a different seed for warmup
             if spec.ckpt_model:
                 if not hasattr(warmup_cfg, 'v2_planner_params'):
                     warmup_cfg.v2_planner_params = {}
                 warmup_cfg.v2_planner_params["static_checkpoint"] = spec.ckpt_model
             _ = run_episode_return_metrics(
-                warmup_cfg, seed=0, render=False, fps=0,
+                warmup_cfg, seed=9999, render=False, fps=0,
                 planner=spec.planner_type, static_demands=static_demands,
                 planner_kwargs=spec.planner_kwargs, max_steps=max_steps,
             )
-            print(f"  Warmup complete for {spec.label}")
-
-    for spec_idx, spec in enumerate(planner_specs):
-        print(f"\n=== Evaluating planner: {spec.label} ({spec.planner_type}) [{spec_idx+1}/{len(planner_specs)}] ===")
-        planner_results: dict[str, dict[str, dict[str, float]]] = {}
+            print(f"  [Warmup] Complete")
 
         for dist_idx, dist in enumerate(DISTRIBUTIONS):
             dist_start = time_module.time()

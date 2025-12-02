@@ -15,16 +15,16 @@ cd "$SCRIPT_DIR/.."
 # =============================================================================
 
 # --- Agent Settings ---
-NUM_AGENTS=10              # Number of vehicles
+NUM_AGENTS=5              # Number of vehicles
 
 # --- Demand Settings ---
 NUM_NODES=20               # Number of demand nodes
-TOTAL_DEMAND=80            # Upper limit of sum of all customer demands (NOT node count!)
+TOTAL_DEMAND=60            # Upper limit of sum of all customer demands (NOT node count!)
 MAX_C=5                    # Max demand per node (demands 1 to max_c)
 CAPACITY=30                # Vehicle capacity (fixed for model)
 
 # --- Environment Settings ---
-MAP_SIZE=50                # Square map side length (map is MAP_SIZE × MAP_SIZE)
+MAP_SIZE=40                # Square map side length (map is MAP_SIZE × MAP_SIZE)
 
 # --- Evaluation Settings ---
 NUM_RUNS=50                # Number of evaluation runs per distribution
@@ -44,7 +44,7 @@ RULE_MODES="optimize,greedy,heuristic"
 GLOBAL_OPT_MODES=""
 
 # Model checkpoints (comma-separated, or "label=path" format)
-MODEL_CHECKPOINTS="checkpoints/static_vrp_v2/best_n80.pt"
+MODEL_CHECKPOINTS="checkpoints/cotrain/static_20251202_034046/planner_cycle_2.pt"
 
 # --- Output Settings ---
 OUT_DIR="outputs/eval"

@@ -97,6 +97,7 @@ def build_env(
 		depot_return_bonus_scale=float(getattr(cfg, "depot_return_bonus_scale", 0.0)),
 		max_end_time=max_end_time,
 		include_service_time=bool(getattr(cfg, "include_service_time", False)),
+		static_demands=static_demands,  # Pass static_demands flag to environment
 	)
 	env.num_agents = cfg.num_agents
 	planner_kwargs = planner_kwargs or {}

@@ -15,7 +15,7 @@ cd "$PROJECT_DIR"
 # =============================================================================
 
 # Model checkpoint path (set to "" to use rule-based planner)
-STATIC_CKPT="checkpoints/cotrain/static_20251201_181908/planner_cycle_1.pt"
+STATIC_CKPT="checkpoints/cotrain/static_20251202_034046/planner_cycle_1.pt"
 
 # Number of agents/vehicles
 NUM_AGENTS=5
@@ -40,18 +40,17 @@ SAVE_RUN="--save-run"
 MAP_SIZE=40
 
 # TOTAL_DEMAND: Upper limit of sum of all customer demands (NOT node count!)
-TOTAL_DEMAND=60
+TOTAL_DEMAND=150
 
 # NUM_NODES: Number of demand nodes
-NUM_NODES=20
+NUM_NODES=30
 
 # MAX_STEPS: Maximum episode steps (leave empty for unlimited)
 MAX_STEPS=""
 
-# STATIC_MAX_END: Deadline for static demands (when nodes expire)
-# Should be > max_time (100) to ensure nodes don't disappear before being served
-# Default: 200 (2 * max_time)
-STATIC_MAX_END=200
+# NOTE: For static VRP, time limits are not used - episode ends when all
+# demands are served and all agents return to depot.
+# STATIC_MAX_END is kept for backward compatibility but ignored in static mode.
 
 # =============================================================================
 # END OF CONFIGURATION

@@ -24,12 +24,12 @@ echo "Working directory: $(pwd)"
 MODE="static"                    # "static" or "dynamic"
 
 # --- Co-evolution Settings ---
-NUM_CYCLES=5             # Number of co-evolution cycles
-PLANNER_EPOCHS=20        # Planner training epochs per cycle
-GENERATOR_EPOCHS=10      # Generator training epochs per cycle
+NUM_CYCLES=2             # Number of co-evolution cycles
+PLANNER_EPOCHS=1        # Planner training epochs per cycle
+GENERATOR_EPOCHS=1      # Generator training epochs per cycle
 
 # --- Batch Settings ---
-BATCH_SIZE=64            # Batch size for training
+BATCH_SIZE=32            # Batch size for training
 POMO_SIZE=100            # POMO parallel rollouts
 EPISODES_PER_EPOCH=100   # Episodes per epoch
 

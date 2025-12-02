@@ -13,6 +13,7 @@ import torch
 
 from .config import CoevolutionConfig
 from .utils.registry import GeneratorRegistry
+from .utils.training_visualizer import TrainingVisualizer
 from .train_planner import PlannerTrainer
 from .train_generator import GeneratorTrainer
 
@@ -53,9 +54,13 @@ def coevolution_loop(
     # Initialize registry
     registry = GeneratorRegistry(save_dir=config.save_dir)
     
-    # Try to load existing registry
+    # Initialize training visualizer
+    visualizer = TrainingVisualizer(save_dir=config.save_dir)
+    
+    # Try to load existing registry and metrics
     if resume_from:
         registry.load()
+        visualizer.load_metrics()
         print(f"Loaded registry with {registry.num_versions()} versions")
     
     # Initialize planner trainer (pass config object)
@@ -117,6 +122,9 @@ def coevolution_loop(
             if metrics.get("version_counts"):
                 print(f"  -> Version usage: {metrics['version_counts']}")
             
+            # Record to visualizer
+            visualizer.add_planner_epoch(metrics["loss"], metrics["score"])
+            
             history["planner_scores"].append(metrics["score"])
             history["planner_losses"].append(metrics["loss"])
         
@@ -141,6 +149,13 @@ def coevolution_loop(
                   f"Gen reward: {metrics['gen_reward']:.2f}, "
                   f"Loss: {metrics['loss']:.4f}")
             
+            # Record to visualizer
+            visualizer.add_generator_epoch(
+                metrics["loss"], 
+                metrics["gen_reward"], 
+                metrics["planner_reward"]
+            )
+            
             history["generator_rewards"].append(metrics["gen_reward"])
             history["generator_losses"].append(metrics["loss"])
         
@@ -155,6 +170,10 @@ def coevolution_loop(
             "gen_reward": metrics["gen_reward"],
         })
         registry.save()
+        
+        # Update visualizer and save plots
+        visualizer.end_cycle(cycle)
+        visualizer.save_metrics()
         
         print(f"\n{registry.summary()}")
         

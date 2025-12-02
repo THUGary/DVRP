@@ -36,6 +36,9 @@ from adversarial.builders import (
     get_planner_trainable_params, build_planner_optimizer, save_planner_checkpoint
 )
 from training.generator.adversarial_trainer import DiffusionAdversarialTrainer, AdvConfig
+from training.generator.adversarial_trainer import _generate_demands, rollout_episode
+import matplotlib.pyplot as plt
+import numpy as np
 from .version_registry import GeneratorVersionRegistry
 from .match_scheduler import PlannerTrainingScheduler
 
@@ -62,6 +65,7 @@ def coevolution_loop(
     cfg: CoevolutionConfig,
     planner_type: str = "dynamic",  # "dynamic", "static"
     diffusion_ckpt_init: Optional[str] = None,
+    planner_ckpt_init: Optional[str] = None,
     planner_update_hook: Optional[Callable[[Any, Dict[str, Any]], None]] = None,
     generator_metrics_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
     static_ckpt: Optional[str] = None,
@@ -118,6 +122,13 @@ def coevolution_loop(
 
     for cycle in range(1, cfg.num_cycles + 1):
         print(f"=== Cycle {cycle}/{cfg.num_cycles} ===")
+        # --- prepare per-cycle metric containers (persist across cycles) ---
+        if cycle == 1:
+            cycles = []
+            planner_eval_scores = []
+            gen_mean_rewards = []
+            gen_mean_diff_losses = []
+            gen_mean_adv = []
         # ---- Planner phase ----
         for pe in range(1, cfg.planner_epochs_per_cycle + 1):
             # Choose a generator version to generate training data
@@ -191,5 +202,109 @@ def coevolution_loop(
             generator_metrics_hook({"cycle": cycle, "ckpt": gen_ckpt_path})
         print(f"[Save] Generator checkpoint => {gen_ckpt_path}")
         print(registry.summary())
+
+        # --- collect generator metrics from trainer history ---
+        # gen_trainer.history contains per-episode dicts appended during training
+        hist = getattr(gen_trainer, 'history', [])
+        # take last generator_epochs_per_cycle entries
+        if hist:
+            recent = hist[-cfg.generator_epochs_per_cycle:]
+            gen_rewards = [h.get('gen_reward', 0.0) for h in recent]
+            diff_losses = [h.get('diff_loss', 0.0) for h in recent]
+            advs = [h.get('adv', 0.0) for h in recent]
+            mean_gen_reward = float(np.mean(gen_rewards)) if gen_rewards else 0.0
+            mean_diff_loss = float(np.mean(diff_losses)) if diff_losses else 0.0
+            mean_adv = float(np.mean(advs)) if advs else 0.0
+        else:
+            mean_gen_reward = 0.0
+            mean_diff_loss = 0.0
+            mean_adv = 0.0
+
+        # --- evaluate planner performance against latest generator ---
+        def evaluate_planner_avg_reward(n_eval: int = 10) -> float:
+            # Use latest registered generator
+            latest = registry.latest()
+            if latest is None:
+                return 0.0
+            state = latest.load(device)
+            try:
+                diffusion_model.load_state_dict(state, strict=False)
+            except Exception:
+                if isinstance(state, dict) and "model" in state:
+                    diffusion_model.load_state_dict(state["model"], strict=False)
+            diffusion_model.eval()
+            rewards = []
+            eval_params = {
+                'width': base_cfg.map_size,
+                'height': base_cfg.map_size,
+                'max_time': base_cfg.max_time,
+                'max_c': base_cfg.max_c,
+                'min_lifetime': base_cfg.min_lifetime,
+                'max_lifetime': base_cfg.max_lifetime,
+                'total_demand': base_cfg.total_demand,
+            }
+            for _ in range(n_eval):
+                demands = _generate_demands(diffusion_model, condition, eval_params)
+                r = rollout_episode(planner, env, demands, renderer=None)
+                rewards.append(r)
+            return float(np.mean(rewards)) if rewards else 0.0
+
+        planner_score = evaluate_planner_avg_reward(n_eval=8)
+
+        # --- append to running lists and plot ---
+        cycles.append(cycle)
+        planner_eval_scores.append(planner_score)
+        gen_mean_rewards.append(mean_gen_reward)
+        gen_mean_diff_losses.append(mean_diff_loss)
+        gen_mean_adv.append(mean_adv)
+
+        # plotting helpers
+        def save_plot_loss(x, gen_losses, planner_vals, out_path):
+            plt.figure(figsize=(8,4))
+            plt.plot(x, gen_losses, marker='o', label='Generator diff_loss')
+            if planner_vals is not None:
+                plt.plot(x, planner_vals, marker='x', label='Planner value (eval)')
+            plt.xlabel('Cycle')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(out_path)
+            plt.close()
+
+        def save_plot_reward(x, planner_rewards, gen_rewards, out_path):
+            plt.figure(figsize=(8,4))
+            plt.plot(x, planner_rewards, marker='o', label='Planner eval reward (higher better)')
+            # gen_reward is negative of env_reward by design; show adversarial strength as -gen_reward
+            gen_adversarial = [-g for g in gen_rewards]
+            plt.plot(x, gen_adversarial, marker='x', label='Generator adversariality (-gen_reward)')
+            plt.xlabel('Cycle')
+            plt.ylabel('Reward / Strength')
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(out_path)
+            plt.close()
+
+        def save_plot_score(x, planner_rewards, gen_advs, out_path):
+            plt.figure(figsize=(8,4))
+            plt.plot(x, planner_rewards, marker='o', label='Planner eval reward')
+            plt.plot(x, gen_advs, marker='x', label='Generator mean advantage')
+            plt.xlabel('Cycle')
+            plt.ylabel('Score')
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(out_path)
+            plt.close()
+
+        # save PNGs into save_dir, replacing previous files
+        loss_path = os.path.join(cfg.save_dir, 'co_train_loss.png')
+        reward_path = os.path.join(cfg.save_dir, 'co_train_reward.png')
+        score_path = os.path.join(cfg.save_dir, 'co_train_score.png')
+
+        save_plot_loss(cycles, gen_mean_diff_losses, None, loss_path)
+        save_plot_reward(cycles, planner_eval_scores, gen_mean_rewards, reward_path)
+        save_plot_score(cycles, planner_eval_scores, gen_mean_adv, score_path)
 
     print("=== Coevolution complete ===")
