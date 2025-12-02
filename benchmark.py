@@ -74,6 +74,7 @@ def get_benchmark_config(dataset_basepath: str, problem_type: str,instance_info:
 		"generator_type":"benchmark",
 		"generator_params":{
 			"instance_data": df,
+			"max_time": instance_info.get("duration")+100,
 		}
 	}
 	
@@ -82,8 +83,12 @@ def get_benchmark_config(dataset_basepath: str, problem_type: str,instance_info:
 	return Config(**config_params)
 
 
-def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, BaseDemandGenerator, BasePlanner, RuleBasedController]:
+def build_env(cfg: Config, planner_type: str, static_demands: bool) -> Tuple[GridEnvironment, BaseDemandGenerator, BasePlanner, RuleBasedController]:
 	# choose the BenchmarkGenerator
+	if static_demands:
+		from agent.generator.static_benchmark_gen import BenchmarkGenerator
+	else:
+		from agent.generator.benchmark_gen import BenchmarkGenerator
 	gen = BenchmarkGenerator(cfg.width, cfg.height, **cfg.generator_params)
 	
 	env = GridEnvironment(
@@ -158,7 +163,7 @@ def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, BaseDema
 	return env, gen, planner, controller
 
 
-def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10, planner: str = "greedy") -> None:
+def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10, planner: str = "greedy", static_demands: bool = False) -> None:
 	print(f"depot: {cfg.depot}, num_agents: {cfg.num_agents}, capacity: {cfg.capacity}, max_time: {cfg.max_time}")
 	
 	#print model used
@@ -171,7 +176,7 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 	elif planner_type == "cvrp_pomo":
 		params = cfg.cvrp_planner_params
 		print(f"CVRP-POMO root: {params.get('pomo_root')} | ckpt: {params.get('checkpoint')}")
-	env, gen, planner_impl, controller = build_env(cfg, planner_type=planner_type)
+	env, gen, planner_impl, controller = build_env(cfg, planner_type=planner_type,static_demands=static_demands)
 	obs = env.reset(seed)
 	total_reward = 0.0
 	done = False
@@ -305,6 +310,7 @@ def main() -> None:
 	parser.add_argument("--test-all", action="store_true", help="Run all instances in the specified dataset (not implemented yet)")
 	parser.add_argument("--instance", type=str, default="R101", help="Specify the problem instance name to run (default: R104)")
 	parser.add_argument("--least-vehs", action="store_true", help="Use the least number of vehicles used in known solution for the instance")
+	parser.add_argument("--static-demands", action="store_true", help="Use static demands (all appear at t=0)")
 	args = parser.parse_args()
 
 	dataset_basepath = "./VrptwDataset/solomon_reformed"  # specify your dataset base path here
@@ -313,6 +319,7 @@ def main() -> None:
 	problem_index=pd.read_csv(problem_index_path)
 
 	least_vehicles = args.least_vehs
+	static_demands = args.static_demands
 	
 	if args.test_all:
 		problem_names=problem_index['problem_name'].tolist()
@@ -325,7 +332,7 @@ def main() -> None:
 			cfg, planner_choice = gen_plan_choice(args, cfg)
 			# Run, here the seed does need to be set
 			run_episode(cfg, seed=args.seed, render=args.render, 
-			   fps=args.fps, planner=planner_choice)
+			   fps=args.fps, planner=planner_choice, static_demands=static_demands)
 	else:
 		problem_name = args.instance  # specify your problem instance name in the arguments first
 		print(f"Running instance: {problem_name}")
@@ -339,7 +346,7 @@ def main() -> None:
 		cfg.include_service_time = bool(args.service_time)
 		cfg, planner_choice = gen_plan_choice(args, cfg)
 		run_episode(cfg, seed=args.seed, render=args.render, 
-			   fps=args.fps, planner=planner_choice)
+			   fps=args.fps, planner=planner_choice, static_demands=static_demands)
 	
 
 

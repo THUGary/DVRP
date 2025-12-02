@@ -57,19 +57,26 @@ from agent.planner import CVRPPOMOPlanner
 
 def build_env(cfg: Config, planner_type: str, *, static_demands: bool = False) -> Tuple[GridEnvironment, BaseDemandGenerator, BasePlanner, RuleBasedController]:
 	# choose generator class by config
-	if cfg.generator_type == "net":
-		# lazy import to avoid unnecessary dependencies when not used
-		from agent.generator.net_generator import NetDemandGenerator as GenClass
-	else:
-		from agent.generator import RuleBasedGenerator as GenClass
+	if not static_demands:
+		if cfg.generator_type == "net":
+			# lazy import to avoid unnecessary dependencies when not used
+			from agent.generator.net_generator import NetDemandGenerator as GenClass
+		else:
+			from agent.generator import RuleBasedGenerator as GenClass
 
-	gen = GenClass(cfg.width, cfg.height, **cfg.generator_params)
+		gen = GenClass(cfg.width, cfg.height, **cfg.generator_params)
+	else:
+		if cfg.generator_type =="rule":
+			from agent.generator.static_rule_gen import StaticDemandGen
+			gen = StaticDemandGen(cfg.width, cfg.height, **cfg.generator_params)
+		else:
+			raise ValueError("Static demands only supported with 'rule' generator type.")
+
 	max_end_time_cfg = getattr(cfg, "max_end_time", None)
 	max_end_time = int(max_end_time_cfg if max_end_time_cfg is not None else cfg.max_time * 2)
-	if static_demands:
-		from agent.generator.static_rule_gen import StaticDemandGen
-		gen = StaticDemandGen(cfg.width, cfg.height, **cfg.generator_params)
-		# gen = StaticDemandGenerator(gen, full_window_end_t=max_end_time)
+	# if static_demands:
+	# 	gen = StaticDemandGenerator(gen, full_window_end_t=max_end_time)
+
 	env = GridEnvironment(
 		width=cfg.width,
 		height=cfg.height,
@@ -186,7 +193,7 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 		return obj
 
 	if render:
-		renderer = PygameRenderer(cfg.width, cfg.height)
+		renderer = PygameRenderer(cfg.width, cfg.height, cell_size=20)
 		renderer.init()
 
 	while not done:
