@@ -23,8 +23,21 @@ class AdvConfig:
 def _generate_demands(model, condition, params: Dict[str, Any]):
     model.eval()
     with torch.no_grad():
-        gen = model.sample(condition=condition, num_demands=int(params["total_demand"]), grid_size=(params["width"], params["height"]))
-    width = params["width"]; height = params["height"]; max_time = params["max_time"]; max_c = params["max_c"]
+        # Support both 'map_size' (new) and 'width'/'height' (legacy)
+        if 'map_size' in params:
+            grid_size = (params["map_size"], params["map_size"])
+        else:
+            grid_size = (params["width"], params["height"])
+        gen = model.sample(condition=condition, num_demands=int(params["total_demand"]), grid_size=grid_size)
+    
+    # Get map dimensions
+    if 'map_size' in params:
+        width = height = params["map_size"]
+    else:
+        width = params["width"]
+        height = params["height"]
+    
+    max_time = params["max_time"]; max_c = params["max_c"]
     min_lifetime = params["min_lifetime"]; max_lifetime = params["max_lifetime"]
     demands: List[Tuple[int,int,int,int,int]] = []
     for row in gen.cpu().numpy():
@@ -44,7 +57,7 @@ def _generate_demands(model, condition, params: Dict[str, Any]):
     return demands
 
 
-def rollout_episode(planner, env: GridEnvironment, demands: List[Tuple[int, ...]], *, renderer: PygameRenderer|None=None, fps: int=10) -> float:
+def rollout_episode(planner, env: GridEnvironment, demands: List[Tuple[int, ...]], *, renderer: PygameRenderer|None=None, fps: int=10, verbose: bool=False) -> float:
     obs = env.reset()
     if hasattr(env, "_state") and env._state is not None:
         env._state.demands.extend([
@@ -90,7 +103,7 @@ def rollout_episode(planner, env: GridEnvironment, demands: List[Tuple[int, ...]
                 done = True
             if clock is not None and fps > 0:
                 clock.tick(fps)
-        obs, reward, done, _ = env.step(actions)
+        obs, reward, done, _ = env.step(actions, verbose=verbose)
         total_reward += reward
     return total_reward
 

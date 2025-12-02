@@ -390,32 +390,64 @@ class Neighborhood:
 class RuleBasedGenerator(BaseDemandGenerator):
     """Generate demand points in rules."""
 
+    def __init__(self, width: int, height: int, **params) -> None:
+        super().__init__(width, height, **params)
+        # Initialize by calling reset
+        self.reset(params.get("rng_seed"))
+
     def reset(self, seed: Optional[int] = None) -> None:
         seed = seed if seed is not None else self.params.get("rng_seed")
         super().reset(seed)
         self._rng = random.Random(seed)
+        
+        # IMPORTANT: Also seed numpy's global random state for reproducibility.
+        # Neighborhoods use np.random for Poisson sampling and other operations.
+        if seed is not None:
+            np.random.seed(seed)
+
+        # Reset mutable counters from params BEFORE initializing neighborhoods
+        # Support two limiting modes:
+        # 1. num_nodes: limit by number of demand nodes (preferred)
+        # 2. total_demand: limit by sum of all demand capacities (legacy)
+        
+        # num_nodes takes priority if provided
+        self.remaining_nodes = self.params.get("num_nodes", None)
+        if self.remaining_nodes is not None:
+            self.remaining_nodes = int(self.remaining_nodes)
+            self.limit_mode = "num_nodes"
+        else:
+            # Fallback to total_demand for backward compatibility
+            try:
+                self.total_demand = int(self.params.get("total_demand", 1))
+            except Exception:
+                self.total_demand = int(getattr(self, "total_demand", 1))
+            self.limit_mode = "total_demand"
+
+        # Track occupied positions across all time steps (one demand per position)
+        self._occupied_positions: set = set()
 
         # Initialize concentrated generation areas
         self.neighborhoods = self._initialize_neighborhoods()
-        # Reset mutable counters (total_demand) from params so repeated calls to
-        # reset produce fresh episodes rather than depleting the budget across
-        # multiple episodes.
-        try:
-            self.total_demand = int(self.params.get("total_demand", 1))
-        except Exception:
-            self.total_demand = int(getattr(self, "total_demand", 1))
         
     def _initialize_neighborhoods(self) -> List[Neighborhood]:
         """Initialize concentrated generation areas"""
         num_centers = self.params.get("num_centers", 3)  # Number of center points
         
         neighborhoods = []
+        max_time = self.params.get("max_time", 100)  # Default max_time if not provided
         for _ in range(num_centers):
            # Sample center coordinates
             center_x = self._rng.uniform(0, self.width)
             center_y = self._rng.uniform(0, self.height)
-            local_max_c=self.params.get("max_c")
-            lambda_param=self.total_demand/num_centers/self.params.get("max_time")/(1+local_max_c/2)
+            local_max_c=self.params.get("max_c", 50)  # Default max_c if not provided
+            
+            # Compute lambda_param based on limit mode
+            if self.limit_mode == "num_nodes":
+                # Estimate demands per center based on num_nodes
+                lambda_param = self.remaining_nodes / num_centers / max_time
+            else:
+                # Legacy: use total_demand
+                lambda_param = self.total_demand / num_centers / max_time / (1 + local_max_c / 2)
             
             distribution=self.params.get("distribution")
             size=self.params.get("neighborhood_size",3)
@@ -424,13 +456,13 @@ class RuleBasedGenerator(BaseDemandGenerator):
             if distribution=="uniform":
                 distribution_params={
                     "distribution":"uniform",
-                    "size":random.uniform(0.25*size,1.25*size),
+                    "size":self._rng.uniform(0.25*size,1.25*size),
                     }
             elif distribution=="gaussian":
                 distribution_params={
                     "distribution":"gaussian",
-                    "sigma1":random.uniform(0.5*size/3,1.5*size/3),
-                    "sigma2":random.uniform(0.5*size/3,1.5*size/3),
+                    "sigma1":self._rng.uniform(0.5*size/3,1.5*size/3),
+                    "sigma2":self._rng.uniform(0.5*size/3,1.5*size/3),
                     "rho":0.0,
                     }
             elif distribution=="cluster":
@@ -447,6 +479,12 @@ class RuleBasedGenerator(BaseDemandGenerator):
                 distribution_params = {
                 "distribution": "implosion",
                 "scale_factor": size/5.0,
+                }
+            else:
+                # Default to uniform distribution
+                distribution_params = {
+                    "distribution": "uniform",
+                    "size": self._rng.uniform(0.25*size, 1.25*size),
                 }
 
             local_params={
@@ -478,63 +516,89 @@ class RuleBasedGenerator(BaseDemandGenerator):
         return neighborhoods
 
     def sample(self, t: int) -> List[Demand]:
-        """Sample all demand points at the current time step."""
-        # print(f"Remaining total_demand: {self.total_demand}")
-
-        if getattr(self, "total_demand", 0) <= 0:
-            return []
+        """Sample all demand points at the current time step.
+        
+        Supports two limiting modes:
+        - num_nodes mode: limit by total number of demand nodes
+        - total_demand mode: limit by sum of all demand capacities (legacy)
+        """
+        # Check if we've exhausted our quota
+        if self.limit_mode == "num_nodes":
+            if getattr(self, "remaining_nodes", 0) <= 0:
+                return []
+        else:
+            if getattr(self, "total_demand", 0) <= 0:
+                return []
         
         all_demands = []
 
         # Sample demand points from all concentrated generation areas
-        # and resample those coinciding with depot (with attempt limit)
+        # and resample those coinciding with depot or already-occupied positions
         max_tries = int(self.params.get("resample_depot_overlap_max_tries", 8))
         depot_xy = tuple(self.depot) if getattr(self, "depot", None) is not None else None
+        occupied = getattr(self, "_occupied_positions", set())
+        
         for neighborhood in self.neighborhoods:
             demands = neighborhood.sample(t)
-            # print(f"Sampled {len(demands)} demands from neighborhood centered at ({neighborhood.center_x}, {neighborhood.center_y}) at time {t}.")
-            if depot_xy is None or len(demands) == 0:
-                all_demands.extend(demands)
+            if len(demands) == 0:
                 continue
 
-            dx, dy = depot_xy
+            dx, dy = depot_xy if depot_xy else (-1, -1)
             for d in demands:
-                if d.x == dx and d.y == dy:
+                pos = (d.x, d.y)
+                # Check if position is depot or already occupied
+                needs_resample = (pos == (dx, dy)) or (pos in occupied)
+                
+                if needs_resample:
                     # resample location up to max_tries
-                    new_xy = (d.x, d.y)
+                    new_xy = pos
                     ok = False
                     for _ in range(max_tries):
                         sx, sy = neighborhood.sample_one_xy()
-                        if sx == dx and sy == dy:
+                        candidate = (sx, sy)
+                        if candidate == (dx, dy) or candidate in occupied:
                             continue
-                        new_xy = (sx, sy)
+                        new_xy = candidate
                         ok = True
                         break
                     if ok:
+                        occupied.add(new_xy)
                         all_demands.append(Demand(x=int(new_xy[0]), y=int(new_xy[1]), t=d.t, c=d.c, end_t=d.end_t))
                     else:
                         # give up: drop this demand (rare)
-                        print(f"Dropped depot-overlapping demand at ({d.x}, {d.y}) after {max_tries} resample attempts.")
+                        # print(f"Dropped overlapping demand at ({d.x}, {d.y}) after {max_tries} resample attempts.")
                         continue
                 else:
+                    occupied.add(pos)
                     all_demands.append(d)
 
-        # Merge demands fallen into the same grid cell
+        # Update occupied positions
+        self._occupied_positions = occupied
+
+        # Merge demands fallen into the same grid cell (should be rare now)
         merged_demands = self._merge_demands_by_grid(all_demands)
         
-        # After per-neighborhood resampling, merged_demands should no longer contain depot-overlapping points
+        # Apply limits based on mode
+        if self.limit_mode == "num_nodes":
+            # Limit by number of nodes
+            num_demands = len(merged_demands)
+            if num_demands > self.remaining_nodes:
+                # Randomly select which demands to keep
+                keep_indices = self._rng.sample(range(num_demands), self.remaining_nodes)
+                merged_demands = [merged_demands[i] for i in sorted(keep_indices)]
+            self.remaining_nodes -= len(merged_demands)
+        else:
+            # Legacy: limit by total demand capacity
+            total_c = sum(d.c for d in merged_demands)
+            remove_ids = []
+        
+            while total_c > self.total_demand:
+                id = self._rng.randint(0, len(merged_demands) - 1)
+                total_c -= merged_demands[id].c
+                remove_ids.append(id)
 
-        # strictly control total demand quantity
-        total_c = sum(d.c for d in merged_demands)
-        remove_ids=[]
-    
-        while total_c > self.total_demand:
-            id=random.randint(0,len(merged_demands)-1)
-            total_c -= merged_demands[id].c
-            remove_ids.append(id)
-
-        self.total_demand -= total_c
-        merged_demands = [d for i, d in enumerate(merged_demands) if i not in remove_ids]
+            self.total_demand -= total_c
+            merged_demands = [d for i, d in enumerate(merged_demands) if i not in remove_ids]
 
         enriched_demands = [
             Demand(
@@ -551,25 +615,28 @@ class RuleBasedGenerator(BaseDemandGenerator):
         return enriched_demands
     
     def _merge_demands_by_grid(self, demands: List[Demand]) -> List[Demand]:
-        """Merge demands fallen into the same grid cell."""
+        """Merge demands at the same grid position (x, y) regardless of time.
+        This ensures only one demand exists per position.
+        """
        
-        merged_demands: Dict[Tuple[int, int, int], Demand] = {}
+        merged_demands: Dict[Tuple[int, int], Demand] = {}
         max_c = self.params.get("max_c")
         
         for demand in demands:
-            key = (demand.x, demand.y, demand.t)
+            key = (demand.x, demand.y)  # Merge by position only, not time
             if key not in merged_demands:
                 merged_demands[key] = demand
             else:
                 existing_demand = merged_demands[key]
+                # Keep earliest arrival time, merge capacity, extend deadline
+                new_t = min(existing_demand.t, demand.t)
                 new_c = min(existing_demand.c + demand.c, max_c)
                 new_end_t = max(existing_demand.end_t, demand.end_t)
                 
-                # Create a new Demand object instead of modifying the old one
                 merged_demands[key] = Demand(
                     x=demand.x,
                     y=demand.y,
-                    t=demand.t,
+                    t=new_t,
                     c=new_c,
                     end_t=new_end_t
                 )

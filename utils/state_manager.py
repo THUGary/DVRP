@@ -55,8 +55,12 @@ class PlanningState:
         self.global_nodes.reset()
     
     def update_plans(self, new_plans: List[Deque[Tuple[int, int]]]) -> None:
-        """更新规划结果"""
-        self.current_plans = [deque(plan) for plan in new_plans]
+        """更新规划结果
+        
+        Note: We store the deque references directly (not copies) so that
+        controller's popleft() operations persist across steps.
+        """
+        self.current_plans = list(new_plans)
     
     def get_unserved_count(self) -> int:
         """获取未服务节点数量"""
@@ -68,6 +72,7 @@ def update_planning_state(
     agent_states: List[Tuple[int, int, int]],  # [(x, y, s), ...]
     new_demands: List[Tuple[int, int, int, int, int]],  # 本时间步新增的需求 [(x, y, t, c, end_t), ...]
     obs_demands: List[Tuple[int, int, int, int, int]],  # 当前观测到的所有需求 [(x, y, t, c, end_t), ...]
+    depot: Tuple[int, int] = None,  # depot 坐标，用于在清理时保留 depot 目标
 ) -> None:
     """
     更新规划状态：
@@ -80,6 +85,7 @@ def update_planning_state(
         agent_states: 当前所有agent的状态
         new_demands: 本时间步新生成的需求，格式 [(x, y, t_arrival, c, t_due), ...]
         obs_demands: 当前环境中观测到的所有需求，格式 [(x, y, t_arrival, c, t_due), ...]
+        depot: depot 坐标 (x, y)，用于在清理计划时保留 depot 目标
     """
     # 1. 添加新需求到全局节点列表
     for (x, y, t, c, end_t) in new_demands:
@@ -96,21 +102,10 @@ def update_planning_state(
             if (nx, ny) not in current_demand_positions:
                 planning_state.global_nodes.serve_mark[i] = 1
     
-    # 3. 更新每个agent的未来路径，删除已服务的节点
-    for agent_idx, (ax, ay, _) in enumerate(agent_states):
-        if agent_idx < len(planning_state.current_plans):
-            plan = planning_state.current_plans[agent_idx]
-            # 如果agent到达了计划中的第一个目标点，弹出该目标
-            if plan and len(plan) > 0:
-                target_x, target_y = plan[0]
-                if ax == target_x and ay == target_y:
-                    plan.popleft()
-                    # 标记该节点为已服务
-                    planning_state.global_nodes.mark_served(ax, ay)
-            
-            # 清理计划中已经不存在于当前需求的目标点
-            cleaned_plan = deque()
-            for (tx, ty) in plan:
-                if (tx, ty) in current_demand_positions:
-                    cleaned_plan.append((tx, ty))
-            planning_state.current_plans[agent_idx] = cleaned_plan
+    # NOTE: We do NOT modify current_plans here anymore.
+    # The controller is responsible for popping targets from plans when agent arrives.
+    # Modifying plans here would interfere with the controller's stay-to-serve logic.
+    # 
+    # The cleaned_plan logic was removing targets that were already served,
+    # but this also caused the plan deque to be replaced, breaking the reference
+    # that the controller uses.
