@@ -75,7 +75,10 @@ def build_env(
 	max_end_time = int(max_end_time_cfg if max_end_time_cfg is not None else cfg.max_time * 2)
 	if static_demands:
 		from agent.generator.static_rule_gen import StaticDemandGen
-		gen = StaticDemandGen(cfg.width, cfg.height, **cfg.generator_params)
+		# Pass max_end_time to static generator so demands don't expire early
+		gen_params = dict(cfg.generator_params)
+		gen_params["max_end_time"] = max_end_time
+		gen = StaticDemandGen(cfg.width, cfg.height, **gen_params)
 		# gen = StaticDemandGenerator(gen, full_window_end_t=max_end_time)
 	env = GridEnvironment(
 		width=cfg.width,

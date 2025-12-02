@@ -1,71 +1,73 @@
 #!/usr/bin/env bash
+# =============================================================================
 # Evaluate Different Planners on Various Distributions
+# Usage: bash scripts/evaluate_distributions.sh
 #
-# KEY PARAMETERS:
-#   - NUM_NODES: Number of demand nodes
-#   - TOTAL_DEMAND: Upper limit of total demand to distribute (sum of all node demands)
-#   - MAX_C: Max demand per node (default=5, range 1-5 per node)
-#   - MAP_SIZE: Side length of the square map (map is MAP_SIZE × MAP_SIZE)
-#   - NUM_AGENTS: Number of vehicles (default=2)
-#
-# FIXED PARAMETERS (match model training):
-#   - Vehicle capacity: 30 (normalized to 1.0 for model)
-#
-# Usage Examples:
-#   # Basic evaluation with default settings
-#   bash scripts/evaluate_distributions.sh
-#
-#   # Evaluate with more nodes on larger map
-#   NUM_NODES=50 MAP_SIZE=40 bash scripts/evaluate_distributions.sh
-#
-#   # Evaluate specific model checkpoint
-#   MODEL_CHECKPOINTS=checkpoints/static_vrp_v2/best_n50.pt bash scripts/evaluate_distributions.sh
+# Edit the configuration variables below to change settings.
+# =============================================================================
 
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR/.."
 
-# === Configurable Parameters ===
-NUM_AGENTS="${NUM_AGENTS:-10}"             # Number of vehicles
-# NUM_NODES: Number of demand nodes
-NUM_NODES="${NUM_NODES:-20}"
-# TOTAL_DEMAND: Upper limit of sum of all customer demands (NOT node count!)
-TOTAL_DEMAND="${TOTAL_DEMAND:-80}"         # Total demand upper limit
-MAP_SIZE="${MAP_SIZE:-50}"                 # Square map side length (map is MAP_SIZE × MAP_SIZE)
+# =============================================================================
+# CONFIGURATION - Edit these variables to change settings
+# =============================================================================
 
-# POMO inference parameters
-POMO_SIZE="${POMO_SIZE:-20}"              # Number of parallel rollouts
-AUG_FACTOR="${AUG_FACTOR:-8}"             # Data augmentation factor
+# --- Agent Settings ---
+NUM_AGENTS=10              # Number of vehicles
 
-# Evaluation specific
-RULE_MODES="${RULE_MODES:-optimize,greedy,heuristic}"
-#optimize,greedy,exact,heuristic
+# --- Demand Settings ---
+NUM_NODES=20               # Number of demand nodes
+TOTAL_DEMAND=80            # Upper limit of sum of all customer demands (NOT node count!)
+MAX_C=5                    # Max demand per node (demands 1 to max_c)
+CAPACITY=30                # Vehicle capacity (fixed for model)
+
+# --- Environment Settings ---
+MAP_SIZE=50                # Square map side length (map is MAP_SIZE × MAP_SIZE)
+
+# --- Evaluation Settings ---
+NUM_RUNS=50                # Number of evaluation runs per distribution
+STATIC_DEMANDS="true"      # Use static demands mode ("true" or "false")
+STATIC_MAX_END=5000        # Time limit for static VRP
+MAX_STEPS=5000             # Max simulation steps
+
+# --- POMO Inference Parameters ---
+POMO_SIZE=20               # Number of parallel rollouts
+AUG_FACTOR=8               # Data augmentation factor
+
+# --- Planners to Evaluate ---
+# Rule-based modes (comma-separated): optimize, greedy, exact, heuristic
+RULE_MODES="optimize,greedy,heuristic"
+
+# Global optimization modes (comma-separated, leave empty to skip)
+GLOBAL_OPT_MODES=""
+
+# Model checkpoints (comma-separated, or "label=path" format)
+MODEL_CHECKPOINTS="checkpoints/static_vrp_v2/best_n80.pt"
+
+# --- Output Settings ---
+OUT_DIR="outputs/eval"
+# Metrics to plot (comma-separated)
+PLOT_METRICS="failure_rate,total_distance,inference_time_total"
+
+# =============================================================================
+# END OF CONFIGURATION
+# =============================================================================
+
+# Process comma-separated values
 RULE_MODES="${RULE_MODES//,/ }"
 RULE_MODES="$(echo "$RULE_MODES" | xargs)"
 
-GLOBAL_OPT_MODES="${GLOBAL_OPT_MODES:-}"
 GLOBAL_OPT_MODES="${GLOBAL_OPT_MODES//,/ }"
 GLOBAL_OPT_MODES="$(echo "$GLOBAL_OPT_MODES" | xargs)"
 
-# Model checkpoints
-MODEL_CHECKPOINTS="${MODEL_CHECKPOINTS:-checkpoints/static_vrp_v2/best_n80.pt}"
 MODEL_CHECKPOINTS="${MODEL_CHECKPOINTS//,/ }"
 MODEL_CHECKPOINTS="$(echo "$MODEL_CHECKPOINTS" | xargs)"
 
-STATIC_DEMANDS="${STATIC_DEMANDS:-true}"
-# Capacity and max demand per node (match model training)
-CAPACITY="${CAPACITY:-30}"               # Vehicle capacity (fixed for model)
-MAX_C="${MAX_C:-5}"                       # Max demand per node (1 to max_c)
-OUT_DIR="${OUT_DIR:-outputs/eval}"
-NUM_RUNS="${NUM_RUNS:-50}"
-# Use inference_time_total for fair comparison (greedy/optimize call plan() many times,
-# model calls once but should still compare total computation time)
-PLOT_METRICS="${PLOT_METRICS:-failure_rate,total_distance,inference_time_total}"
-# Increased limits to prevent cluster distribution failures
-STATIC_MAX_END="${STATIC_MAX_END:-5000}"  # Time limit for static VRP
-MAX_STEPS="${MAX_STEPS:-5000}"            # Max simulation steps
-
-echo "=== Evaluate Distributions Configuration ==="
+echo "=========================================="
+echo "Evaluate Distributions Configuration"
+echo "=========================================="
 echo ""
 echo "  DEMAND SETTINGS:"
 echo "    Num nodes:          $NUM_NODES"
@@ -159,7 +161,5 @@ fi
 if [[ -n "$MAX_STEPS" ]]; then
     cmd+=(--max-steps "$MAX_STEPS")
 fi
-
-cmd+=("$@")
 
 "${cmd[@]}"

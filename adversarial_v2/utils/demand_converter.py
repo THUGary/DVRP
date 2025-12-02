@@ -3,7 +3,7 @@ Demand Converter
 
 Convert diffusion model output to static or dynamic VRP demands.
 
-Static mode: All demands appear at t=0, deadline=max_time
+Static mode: All demands appear at t=0, deadline=max_end_time (ensures nodes exist throughout episode)
 Dynamic mode: Demands appear at different times with varying deadlines
 """
 from __future__ import annotations
@@ -38,12 +38,14 @@ class DemandConverter:
         self,
         map_size: int = 20,
         max_time: int = 100,
+        max_end_time: int = 200,  # For static mode: ensure nodes exist throughout episode
         max_c: int = 5,
         min_lifetime: int = 10,
         max_lifetime: int = 50,
     ):
         self.map_size = map_size
         self.max_time = max_time
+        self.max_end_time = max_end_time  # Used for static mode deadline
         self.max_c = max_c
         self.min_lifetime = min_lifetime
         self.max_lifetime = max_lifetime
@@ -55,7 +57,8 @@ class DemandConverter:
         """
         Convert diffusion output to static VRP demands.
         
-        All demands appear at t=0 and have deadline=max_time.
+        All demands appear at t=0 and have deadline=max_end_time.
+        This ensures nodes exist throughout the entire episode.
         Only x, y, c are used from the diffusion output.
         
         Args:
@@ -80,8 +83,10 @@ class DemandConverter:
             y = max(0, min(self.map_size - 1, y))
             c = max(1, min(self.max_c, c))
             
-            # Static: t=0, end_t=max_time
-            demands.append(DemandTuple(x=x, y=y, t=0, c=c, end_t=self.max_time))
+            # Static: t=0, end_t=max_end_time (ensures nodes exist throughout episode)
+            demands.append(DemandTuple(x=x, y=y, t=0, c=c, end_t=self.max_end_time))
+        
+        return demands
         
         return demands
     
@@ -170,8 +175,9 @@ class DemandConverter:
         node_demand = torch.tensor([[d.c / DEMAND_NORM for d in demands]], 
                                    dtype=torch.float32, device=device)
         
-        # Deadlines (normalized by max_time)
-        node_deadline = torch.tensor([[d.end_t / self.max_time for d in demands]], 
+        # Deadlines (normalized by max_end_time for consistency)
+        # For static mode, all deadlines are max_end_time, so normalized value is 1.0
+        node_deadline = torch.tensor([[d.end_t / self.max_end_time for d in demands]], 
                                      dtype=torch.float32, device=device)
         
         return {
