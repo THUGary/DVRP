@@ -4,7 +4,7 @@
 
 # Choose condition, condtion=0 for a single instance test,
 # condtion=1 for full benchmark (on solomon)
-condition=1
+condition=0
 
 # Another arguments
 FPS=${FPS:-10}

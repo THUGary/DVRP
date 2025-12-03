@@ -66,7 +66,7 @@ class Config:
     max_time: int = 100 # the value has to be consistent with generator_params' max_time
     # Hard cap on episode after last generation time; if None, will be set in __post_init__
     max_end_time: Optional[int] = None
-    include_service_time: bool = False
+    include_service_time: bool = False #Attention:  Overwritten in run.py and benchmark.py
     # Reward scales
     # Reward scale tweaks tuned for smaller agent counts (e.g., 2 vehicles)
     capacity_reward_scale: float = 0.25
@@ -114,7 +114,7 @@ class Config:
     })
 
     # Planner params
-    planner_type: str = "rule"  # "rule" | "net"
+    planner_type: str = "rule"  # "rule" | "net" (ATTENTION: this is overwritten in run.py based on args)
     planner_params: Dict[str, Any] = field(default_factory=dict)
     
     # V2Planner params (POMO-based architecture)

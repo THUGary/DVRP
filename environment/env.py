@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from agent.planner.base import AgentState
 from agent.generator.base import BaseDemandGenerator, Demand
 from agent.generator.static_wrappers import StaticDemandGenerator
-from .rewards import compute_static_reward, compute_dynamic_reward
+from .rewards import compute_static_reward, compute_dynamic_reward, RewardTerms
 import math
 
 
@@ -416,6 +416,7 @@ class GridEnvironment:
 				remaining.append(d)
 			self._state.demands = remaining
 			self._active_services = {}
+			
 		# compute route distance (Euclidean) this step
 		movement_distance = 0.0
 		agent_distances: List[float] = []
@@ -572,7 +573,7 @@ class GridEnvironment:
 			no_unserved = (len(self._state.demands) == 0)
 			all_at_depot = all((a.x, a.y) == self.depot for a in self._state.agent_states)
 			done = bool(no_unserved and all_at_depot)
-		elif self._state.time >= self.max_end_time:
+		elif self._state.time > self.max_end_time: #TODO: should it be >=?
 			done = True
 		elif self._state.time > self.max_time:
 			no_unserved = (len(self._state.demands) == 0)

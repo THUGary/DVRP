@@ -102,6 +102,8 @@ def build_env(cfg: Config, planner_type: str, static_demands: bool) -> Tuple[Gri
 		depot=cfg.depot,
 		generator=gen,
 		max_time=cfg.max_time,
+		max_end_time=max_end_time,
+		include_service_time=bool(getattr(cfg, "include_service_time", False)),
 		expiry_penalty_scale=float(getattr(cfg, "expiry_penalty_scale", 5.0)),
 		switch_penalty_scale=float(getattr(cfg, "switch_penalty_scale", 0.01)),
 		capacity_reward_scale=float(getattr(cfg, "capacity_reward_scale", 10.0)),
@@ -109,8 +111,6 @@ def build_env(cfg: Config, planner_type: str, static_demands: bool) -> Tuple[Gri
 		exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
 		wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
 		depot_return_bonus_scale=float(getattr(cfg, "depot_return_bonus_scale", 0.0)),
-		max_end_time=max_end_time,
-		include_service_time=bool(getattr(cfg, "include_service_time", False)),
 	)
 	env.num_agents = cfg.num_agents
 	if planner_type == "greedy":

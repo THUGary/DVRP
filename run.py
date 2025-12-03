@@ -7,38 +7,6 @@ from typing import List, Tuple, Dict, Any, Optional
 from dataclasses import replace
 import copy
 
-
-class StaticDemandGenerator:
-	"""Wrap any BaseDemandGenerator so every demand appears at t=0 (static scenario)."""
-
-	def __init__(self, base_generator, *, full_window_end_t: int | None = None):
-		self._base = base_generator
-		self.width = base_generator.width
-		self.height = base_generator.height
-		self.params = getattr(base_generator, "params", {})
-		self.max_time = getattr(base_generator, "max_time", self.params.get("max_time", 1))
-		self._snapshot = []
-		self._released = False
-		self._full_window_end_t = full_window_end_t
-
-	def reset(self, seed: int | None = None):
-		self._base.reset(seed)
-		self._snapshot.clear()
-		self._released = False
-		max_time = int(getattr(self._base, "max_time", self.params.get("max_time", 1)))
-		max_time = max(1, max_time)
-		full_window_end_t = self._full_window_end_t if self._full_window_end_t is not None else max_time
-		for t in range(max_time):
-			for demand in self._base.sample(t):
-				static_demand = replace(demand, t=0, end_t=full_window_end_t)
-				self._snapshot.append(static_demand)
-
-	def sample(self, t: int):
-		if t == 0 and not self._released:
-			self._released = True
-			return list(self._snapshot)
-		return []
-
 from configs import get_default_config, Config
 from environment.env import GridEnvironment
 from agent.controller import RuleBasedController
@@ -66,7 +34,6 @@ def build_env(
 	# choose generator class by config
 	if not static_demands:
 		if cfg.generator_type == "net":
-			# lazy import to avoid unnecessary dependencies when not used
 			from agent.generator.net_generator import NetDemandGenerator as GenClass
 		else:
 			from agent.generator import RuleBasedGenerator as GenClass
@@ -90,6 +57,9 @@ def build_env(
 		depot=cfg.depot,
 		generator=gen,
 		max_time=cfg.max_time,
+		max_end_time=max_end_time,
+		include_service_time=bool(getattr(cfg, "include_service_time", False)),
+		static_demands=static_demands,  # Pass static_demands flag to environment
 		expiry_penalty_scale=float(getattr(cfg, "expiry_penalty_scale", 5.0)),
 		switch_penalty_scale=float(getattr(cfg, "switch_penalty_scale", 0.01)),
 		capacity_reward_scale=float(getattr(cfg, "capacity_reward_scale", 10.0)),
@@ -97,10 +67,8 @@ def build_env(
 		exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
 		wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
 		depot_return_bonus_scale=float(getattr(cfg, "depot_return_bonus_scale", 0.0)),
-		max_end_time=max_end_time,
-		include_service_time=bool(getattr(cfg, "include_service_time", False)),
-		static_demands=static_demands,  # Pass static_demands flag to environment
 	)
+	
 	env.num_agents = cfg.num_agents
 	planner_kwargs = planner_kwargs or {}
 	if planner_type in ("greedy", "rule", "optimize"):
@@ -162,7 +130,7 @@ def run_episode(
 	seed: int = 0,
 	render: bool = False,
 	fps: int = 10,
-	planner: str = "greedy",
+	planner_type: str = "greedy",
 	*,
 	static_demands: bool = False,
 	planner_kwargs: Optional[Dict[str, Any]] = None,
@@ -174,9 +142,9 @@ def run_episode(
 	depot = (rng.randint(0, cfg.width - 1), rng.randint(0, cfg.height - 1))
 	cfg.depot = depot
 	cfg.generator_params = {**cfg.generator_params, "depot": depot}
-	#print model used
-	print(f"Using planner: {planner}")
-	planner_type = planner
+	#print planner type
+	print(f"Using planner: {planner_type}")
+
 	if planner_type in ("model", "dynamic"):
 		v2_params = cfg.v2_planner_params if hasattr(cfg, 'v2_planner_params') else {}
 		print(f"V2Planner (dynamic mode): static={v2_params.get('static_ckpt', 'default')} adapter={v2_params.get('adapter_ckpt', 'default')}")
@@ -425,7 +393,7 @@ def main() -> None:
 	parser.add_argument("--static-demands", action="store_true", help="Release all demands at time 0 to visualize static VRP instances")
 	parser.add_argument("--static-max-end", type=int, default=None, help="Max environment time for static demands (default: 2 * max_time)")
 	parser.add_argument("--max-steps", type=int, default=None, help="Maximum episode steps (default: no limit)")
-	parser.add_argument("--static-ckpt", type=str, default=None, help="Path to V2 static model checkpoint (enables model planner)")
+	parser.add_argument("--static-ckpt", type=str, default="./DVRP/checkpoints/static_vrp_v2/best_n50.pt", help="Path to V2 static model checkpoint (enables model planner)")
 	parser.add_argument("--adapter-ckpt", type=str, default=None, help="Path to V2 dynamic adapter checkpoint (enables dynamic mode)")
 	args = parser.parse_args()
 
@@ -495,7 +463,7 @@ def main() -> None:
 		seed=args.seed,
 		render=args.render,
 		fps=args.fps,
-		planner=planner_choice,
+		planner_type=planner_choice,
 		static_demands=args.static_demands,
 		planner_kwargs=planner_kwargs,
 		save_run=bool(getattr(args, 'save_run', False)),
