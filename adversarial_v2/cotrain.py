@@ -42,6 +42,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generator training epochs per cycle"
     )
     
+    # Planner early stopping
+    parser.add_argument(
+        "--planner-early-stop-patience", type=int, default=3,
+        help="Stop planner training if score doesn't improve for this many epochs (0 to disable)"
+    )
+    parser.add_argument(
+        "--planner-early-stop-threshold", type=float, default=0.01,
+        help="Minimum score improvement threshold for early stopping"
+    )
+    
     # Version sampling
     parser.add_argument(
         "--version-policy", type=str, default="latest_biased",
@@ -146,6 +156,8 @@ def main():
         planner_epochs_per_cycle=args.planner_epochs,
         generator_epochs_per_cycle=args.generator_epochs,
         first_cycle_planner_epochs=args.first_cycle_planner_epochs,
+        planner_early_stop_patience=args.planner_early_stop_patience,
+        planner_early_stop_threshold=args.planner_early_stop_threshold,
         batch_size=args.batch_size,
         pomo_size=args.pomo_size,
         episodes_per_epoch=args.episodes_per_epoch,

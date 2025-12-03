@@ -24,15 +24,21 @@ echo "Working directory: $(pwd)"
 MODE="static"                    # "static" or "dynamic"
 
 # --- Co-evolution Settings ---
-NUM_CYCLES=2             # Number of co-evolution cycles
+NUM_CYCLES=5             # Number of co-evolution cycles
 PLANNER_EPOCHS=1        # Planner training epochs per cycle
-FIRST_CYCLE_PLANNER_EPOCHS=150  # First cycle planner epochs (leave empty to use PLANNER_EPOCHS)
+FIRST_CYCLE_PLANNER_EPOCHS=1  # First cycle planner epochs (leave empty to use PLANNER_EPOCHS)
 GENERATOR_EPOCHS=1      # Generator training epochs per cycle
+
+# --- Planner Early Stopping (within each cycle) ---
+# Stop planner training early if score doesn't improve for PATIENCE epochs
+# Set to 0 or empty to disable early stopping
+PLANNER_EARLY_STOP_PATIENCE=10    # Number of epochs without improvement to trigger early stop
+PLANNER_EARLY_STOP_THRESHOLD=0.01  # Minimum improvement threshold
 
 # --- Batch Settings ---
 BATCH_SIZE=32            # Batch size for training
 POMO_SIZE=100            # POMO parallel rollouts
-EPISODES_PER_EPOCH=100   # Episodes per epoch
+EPISODES_PER_EPOCH=128   # Episodes per epoch
 
 # --- Version Sampling (to prevent policy cycling) ---
 VERSION_POLICY="latest_biased"  # "uniform", "latest_biased", "all"
@@ -159,6 +165,14 @@ CMD=(
 # Add first cycle planner epochs if specified
 if [[ -n "${FIRST_CYCLE_PLANNER_EPOCHS}" ]]; then
     CMD+=(--first-cycle-planner-epochs "${FIRST_CYCLE_PLANNER_EPOCHS}")
+fi
+
+# Add planner early stopping if specified
+if [[ -n "${PLANNER_EARLY_STOP_PATIENCE}" ]] && [[ "${PLANNER_EARLY_STOP_PATIENCE}" != "0" ]]; then
+    CMD+=(--planner-early-stop-patience "${PLANNER_EARLY_STOP_PATIENCE}")
+fi
+if [[ -n "${PLANNER_EARLY_STOP_THRESHOLD}" ]]; then
+    CMD+=(--planner-early-stop-threshold "${PLANNER_EARLY_STOP_THRESHOLD}")
 fi
 
 # Add optional flags
