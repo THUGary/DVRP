@@ -35,7 +35,7 @@ def load_saved_dataset(customers_csv_path: str):
     
     return df
 
-class BenchmarkGenerator(BaseDemandGenerator):
+class StaticBenchmarkGenerator(BaseDemandGenerator):
     def __init__(self, width: int, height: int, **params) -> None:
         super().__init__(width, height, **params)
         self.max_time=params.get("max_time")

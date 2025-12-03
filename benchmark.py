@@ -69,11 +69,11 @@ def get_benchmark_config(dataset_basepath: str, problem_type: str,instance_info:
 		"num_agents":least_num_vehicles if least_vehicles else instance_info.get("vehicle_number"),
 		"capacity":instance_info.get("vehicle_capacity"),
 		"depot":(instance_info.get("depot_x"), instance_info.get("depot_y")),
-		"max_time":instance_info.get("duration")+100,  # extra time buffer
+		"max_time":instance_info.get("duration")+500,  # extra time buffer
 		"generator_type":"benchmark",
 		"generator_params":{
 			"instance_data": df,
-			"max_time": instance_info.get("duration")+100,
+			"max_time": instance_info.get("duration")+500,
 		}
 	}
 	
@@ -85,11 +85,15 @@ def get_benchmark_config(dataset_basepath: str, problem_type: str,instance_info:
 def build_env(cfg: Config, planner_type: str, static_demands: bool) -> Tuple[GridEnvironment, BaseDemandGenerator, BasePlanner, RuleBasedController]:
 	# choose the BenchmarkGenerator
 	if static_demands:
-		from agent.generator.static_benchmark_gen import BenchmarkGenerator
+		from agent.generator.static_benchmark_gen import StaticBenchmarkGenerator
+		gen = StaticBenchmarkGenerator(cfg.width, cfg.height, **cfg.generator_params)
+		max_end_time = cfg.max_time
 	else:
 		from agent.generator.benchmark_gen import BenchmarkGenerator
-	gen = BenchmarkGenerator(cfg.width, cfg.height, **cfg.generator_params)
+		gen = BenchmarkGenerator(cfg.width, cfg.height, **cfg.generator_params)
+		max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2))
 	
+	print(f"Vehicle number for planner: {cfg.num_agents}")
 	env = GridEnvironment(
 		width=cfg.width,
 		height=cfg.height,
@@ -105,7 +109,7 @@ def build_env(cfg: Config, planner_type: str, static_demands: bool) -> Tuple[Gri
 		exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
 		wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
 		depot_return_bonus_scale=float(getattr(cfg, "depot_return_bonus_scale", 0.0)),
-		max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2)),
+		max_end_time=max_end_time,
 		include_service_time=bool(getattr(cfg, "include_service_time", False)),
 	)
 	env.num_agents = cfg.num_agents
@@ -152,7 +156,7 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 			print(f"Static checkpoint: {v2_params['static_ckpt']}")
 		if v2_params.get("adapter_ckpt"):
 			print(f"Adapter checkpoint: {v2_params['adapter_ckpt']}")
-	env, gen, planner_impl, controller = build_env(cfg, planner_type=planner_type)
+	env, gen, planner_impl, controller = build_env(cfg, planner_type=planner_type,static_demands=static_demands)
 	obs = env.reset(seed)
 	total_reward = 0.0
 	done = False
@@ -271,6 +275,7 @@ def main() -> None:
 	parser.add_argument("--least-vehs", action="store_true", help="Use the least number of vehicles used in known solution for the instance")
 	parser.add_argument("--static-ckpt", type=str, default=None, help="Override path to V2 static model checkpoint")
 	parser.add_argument("--adapter-ckpt", type=str, default=None, help="Override path to V2 dynamic adapter checkpoint")
+	parser.add_argument("--static-demands", action="store_true", help="Use static demands for the benchmark instance")
 	args = parser.parse_args()
 
 	dataset_basepath = "./VrptwDataset/solomon_reformed"  # specify your dataset base path here
