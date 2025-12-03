@@ -69,10 +69,11 @@ def get_benchmark_config(dataset_basepath: str, problem_type: str,instance_info:
 		"num_agents":least_num_vehicles if least_vehicles else instance_info.get("vehicle_number"),
 		"capacity":instance_info.get("vehicle_capacity"),
 		"depot":(instance_info.get("depot_x"), instance_info.get("depot_y")),
-		"max_time":instance_info.get("duration")+100,  # extra time buffer
+		"max_time":instance_info.get("duration")+500,  # extra time buffer
 		"generator_type":"benchmark",
 		"generator_params":{
 			"instance_data": df,
+			"max_time": instance_info.get("duration")+500,
 		}
 	}
 	
@@ -81,10 +82,18 @@ def get_benchmark_config(dataset_basepath: str, problem_type: str,instance_info:
 	return Config(**config_params)
 
 
-def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, BaseDemandGenerator, BasePlanner, RuleBasedController]:
+def build_env(cfg: Config, planner_type: str, static_demands: bool) -> Tuple[GridEnvironment, BaseDemandGenerator, BasePlanner, RuleBasedController]:
 	# choose the BenchmarkGenerator
-	gen = BenchmarkGenerator(cfg.width, cfg.height, **cfg.generator_params)
+	if static_demands:
+		from agent.generator.static_benchmark_gen import StaticBenchmarkGenerator
+		gen = StaticBenchmarkGenerator(cfg.width, cfg.height, **cfg.generator_params)
+		max_end_time = cfg.max_time
+	else:
+		from agent.generator.benchmark_gen import BenchmarkGenerator
+		gen = BenchmarkGenerator(cfg.width, cfg.height, **cfg.generator_params)
+		max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2))
 	
+	print(f"Vehicle number for planner: {cfg.num_agents}")
 	env = GridEnvironment(
 		width=cfg.width,
 		height=cfg.height,
@@ -100,7 +109,7 @@ def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, BaseDema
 		exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
 		wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
 		depot_return_bonus_scale=float(getattr(cfg, "depot_return_bonus_scale", 0.0)),
-		max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2)),
+		max_end_time=max_end_time,
 		include_service_time=bool(getattr(cfg, "include_service_time", False)),
 	)
 	env.num_agents = cfg.num_agents
@@ -134,7 +143,7 @@ def build_env(cfg: Config, planner_type: str) -> Tuple[GridEnvironment, BaseDema
 	return env, gen, planner, controller
 
 
-def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10, planner: str = "greedy") -> None:
+def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10, planner: str = "greedy", static_demands: bool = False) -> None:
 	print(f"depot: {cfg.depot}, num_agents: {cfg.num_agents}, capacity: {cfg.capacity}, max_time: {cfg.max_time}")
 	
 	#print model used
@@ -147,7 +156,7 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 			print(f"Static checkpoint: {v2_params['static_ckpt']}")
 		if v2_params.get("adapter_ckpt"):
 			print(f"Adapter checkpoint: {v2_params['adapter_ckpt']}")
-	env, gen, planner_impl, controller = build_env(cfg, planner_type=planner_type)
+	env, gen, planner_impl, controller = build_env(cfg, planner_type=planner_type,static_demands=static_demands)
 	obs = env.reset(seed)
 	total_reward = 0.0
 	done = False
@@ -266,6 +275,7 @@ def main() -> None:
 	parser.add_argument("--least-vehs", action="store_true", help="Use the least number of vehicles used in known solution for the instance")
 	parser.add_argument("--static-ckpt", type=str, default=None, help="Override path to V2 static model checkpoint")
 	parser.add_argument("--adapter-ckpt", type=str, default=None, help="Override path to V2 dynamic adapter checkpoint")
+	parser.add_argument("--static-demands", action="store_true", help="Use static demands for the benchmark instance")
 	args = parser.parse_args()
 
 	dataset_basepath = "./VrptwDataset/solomon_reformed"  # specify your dataset base path here
@@ -274,6 +284,7 @@ def main() -> None:
 	problem_index=pd.read_csv(problem_index_path)
 
 	least_vehicles = args.least_vehs
+	static_demands = args.static_demands
 	
 	if args.test_all:
 		problem_names=problem_index['problem_name'].tolist()
@@ -286,7 +297,7 @@ def main() -> None:
 			cfg, planner_choice = gen_plan_choice(args, cfg)
 			# Run, here the seed does need to be set
 			run_episode(cfg, seed=args.seed, render=args.render, 
-			   fps=args.fps, planner=planner_choice)
+			   fps=args.fps, planner=planner_choice, static_demands=static_demands)
 	else:
 		problem_name = args.instance  # specify your problem instance name in the arguments first
 		print(f"Running instance: {problem_name}")
@@ -300,7 +311,7 @@ def main() -> None:
 		cfg.include_service_time = bool(args.service_time)
 		cfg, planner_choice = gen_plan_choice(args, cfg)
 		run_episode(cfg, seed=args.seed, render=args.render, 
-			   fps=args.fps, planner=planner_choice)
+			   fps=args.fps, planner=planner_choice, static_demands=static_demands)
 	
 
 

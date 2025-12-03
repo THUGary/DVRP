@@ -106,8 +106,8 @@ class Config:
         "service_time_per_unit": 0.0,
 
         "num_centers": 6,
-        "distribution": "uniform",  # "uniform" | "gaussian" | "cluster"
-        "neighborhood_size": 3, # 3-15, the average radius of the concentrated generation areas
+        "distribution": "gaussian",  # "uniform" | "gaussian" | "cluster"
+        "neighborhood_size": 5, # 3-15, the average radius of the concentrated generation areas
         "burst_prob": 0.1, # 0.0 - 1.0, probability of bursting demands among all demands
         # Checkpoint path for the network-based generator (only used when generator_type="net")
         "model_path": "checkpoints/diffusion_model.pth",
