@@ -6,9 +6,12 @@ Main training loop that alternates between:
 2. Generator training: Adversarial training to find planner weaknesses
 """
 from __future__ import annotations
+from dataclasses import asdict
 from typing import Optional, Dict, Any
+import json
 import os
 import random
+import time
 import torch
 
 from .config import CoevolutionConfig
@@ -49,6 +52,9 @@ def coevolution_loop(
     
     # Setup
     os.makedirs(config.save_dir, exist_ok=True)
+    config_record_path = os.path.join(config.save_dir, "config_summary.json")
+    with open(config_record_path, "w", encoding="utf-8") as cfg_file:
+        json.dump(asdict(config), cfg_file, indent=2)
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -124,13 +130,16 @@ def coevolution_loop(
         
         for epoch in range(1, planner_epochs + 1):
             print(f"\n  Planner Epoch {epoch}/{planner_epochs}")
+            epoch_start = time.time()
             
             metrics = planner_trainer.train_epoch()
+            epoch_duration = time.time() - epoch_start
             
             print(f"  -> Score: {metrics['score']:.4f}, Loss: {metrics['loss']:.4f}")
             if metrics.get("version_counts"):
                 print(f"  -> Version usage: {metrics['version_counts']}")
             
+            print(f"  -> Epoch duration: {epoch_duration:.2f}s")
             # Record to visualizer
             visualizer.add_planner_epoch(metrics["loss"], metrics["score"])
             
@@ -151,12 +160,15 @@ def coevolution_loop(
         
         for epoch in range(1, config.generator_epochs_per_cycle + 1):
             print(f"\n  Generator Epoch {epoch}/{config.generator_epochs_per_cycle}")
+            epoch_start = time.time()
             
             metrics = generator_trainer.train_epoch()
+            epoch_duration = time.time() - epoch_start
             
             print(f"  -> Planner reward: {metrics['planner_reward']:.2f}, "
                   f"Gen reward: {metrics['gen_reward']:.2f}, "
                   f"Loss: {metrics['loss']:.4f}")
+            print(f"  -> Epoch duration: {epoch_duration:.2f}s")
             
             # Record to visualizer
             visualizer.add_generator_epoch(
