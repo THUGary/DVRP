@@ -87,7 +87,8 @@ class Config:
     exploration_penalty_scale: float = 0.0  # 先关掉探索惩罚
 
     # Generator params
-    generator_type: str = "net"  # "rule" | "net"
+    # Use "rule" for static VRP evaluation, "net" for dynamic with diffusion model
+    generator_type: str = "rule"  # "rule" | "net"
     generator_params: Dict[str, Any] = field(default_factory=lambda: {
         "max_per_step": 2, # not used in rule-based generator
         "depot": "__depot__",  # placeholder to be replaced with Config.depot (accepts "__depot__" or "__DEPOT__")
@@ -108,9 +109,8 @@ class Config:
         "distribution": "gaussian",  # "uniform" | "gaussian" | "cluster"
         "neighborhood_size": 5, # 3-15, the average radius of the concentrated generation areas
         "burst_prob": 0.1, # 0.0 - 1.0, probability of bursting demands among all demands
-        # add checkpoint path for the network-based generator
-        "model_path": "checkpoints/rl_generator/greedy_20251126-120703/ckpt_ep_2300.pth",#"checkpoints/diffusion_model.pth",
-        # "model_path": "checkpoints/diffusion_model.pth",
+        # Checkpoint path for the network-based generator (only used when generator_type="net")
+        "model_path": "checkpoints/diffusion_model.pth",
     })
 
     # Planner params

@@ -1,65 +1,64 @@
 #!/usr/bin/env bash
+# =============================================================================
 # Train Static VRP Model (POMO-style)
+# Usage: bash scripts/train_static.sh
 #
-# FIXED PARAMETERS (DO NOT CHANGE):
+# Edit the configuration variables below to change settings.
+#
+# FIXED PARAMETERS (DO NOT CHANGE - model training assumptions):
 #   - Vehicle capacity: 30 (model sees capacity/30 = 1.0)
 #   - Max demand per node: 5 (model sees demand/30 ∈ [0.033, 0.167])
-#
-# CONFIGURABLE PARAMETERS:
-#   - NUM_NODES: Number of demand nodes
-#   - TOTAL_DEMAND: Upper limit of sum of all customer demands (capacity constraint)
-#   - MAP_SIZE: Side length of the square map (map is MAP_SIZE × MAP_SIZE)
-#   - NUM_AGENTS: Number of vehicles (2, 3, 5, etc.)
-#
-# Usage Examples:
-#   # Basic training with default settings
-#   bash scripts/train_static.sh
-#
-#   # Train with more nodes on larger map
-#   NUM_NODES=50 MAP_SIZE=40 bash scripts/train_static.sh
-#
-#   # Train with more epochs
-#   EPOCHS=1000 NUM_NODES=30 bash scripts/train_static.sh
-#
-#   # Resume from checkpoint
-#   RESUME_FROM=checkpoints/static_vrp_v2/checkpoint_n20_ep100.pt bash scripts/train_static.sh
+# =============================================================================
 
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR/.."
 
-# === Configurable Parameters ===
-NUM_AGENTS="${NUM_AGENTS:-10}"             # Number of vehicles
+# =============================================================================
+# CONFIGURATION - Edit these variables to change settings
+# =============================================================================
 
-# NUM_NODES: Number of demand nodes
-NUM_NODES="${NUM_NODES:-20}"
-# TOTAL_DEMAND: Upper limit of sum of all customer demands (capacity constraint)
-TOTAL_DEMAND="${TOTAL_DEMAND:-80}"
-MAP_SIZE="${MAP_SIZE:-50}"                 # Square map side length (map is MAP_SIZE × MAP_SIZE)
+# --- Agent Settings ---
+NUM_AGENTS=10              # Number of vehicles
 
-# Static VRP training specific
-TARGET_VEHICLES="${TARGET_VEHICLES:-$NUM_AGENTS}"  # Use NUM_AGENTS by default
+# --- Demand Settings ---
+NUM_NODES=20               # Number of demand nodes
+TOTAL_DEMAND=80            # Upper limit of sum of all customer demands (capacity constraint)
 
-# Training params
-POMO_SIZE="${POMO_SIZE:-100}"             # Parallel rollouts (50-100 recommended)
-AUG_FACTOR="${AUG_FACTOR:-1}"             # Data augmentation (1 or 8)
-EPOCHS="${EPOCHS:-500}"                   # Training epochs (500-2000 for good results)
-EPISODES_PER_EPOCH="${EPISODES_PER_EPOCH:-10000}"
-BATCH_SIZE="${BATCH_SIZE:-64}"
-LR="${LR:-1e-4}"
-SAVE_DIR="${SAVE_DIR:-checkpoints/static_vrp_v2}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
-DEVICE="${DEVICE:-cuda}"
+# --- Environment Settings ---
+MAP_SIZE=50                # Square map side length (map is MAP_SIZE × MAP_SIZE)
+TARGET_VEHICLES=10         # Target number of vehicles (usually same as NUM_AGENTS)
 
-# Resume training (optional)
-RESUME_FROM="${RESUME_FROM:-}"
+# --- Training Parameters ---
+EPOCHS=500                 # Training epochs (500-2000 for good results)
+EPISODES_PER_EPOCH=10000   # Episodes per epoch
+BATCH_SIZE=64              # Batch size
+LR="1e-4"                  # Learning rate
+POMO_SIZE=100              # Parallel rollouts (50-100 recommended)
+AUG_FACTOR=1               # Data augmentation (1 or 8)
 
-# Model architecture
-EMBEDDING_DIM="${EMBEDDING_DIM:-128}"
-ENCODER_LAYERS="${ENCODER_LAYERS:-6}"
-HEADS="${HEADS:-8}"
+# --- Model Architecture ---
+EMBEDDING_DIM=128
+ENCODER_LAYERS=6
+HEADS=8
 
-echo "=== Static VRP Training Configuration ==="
+# --- Hardware ---
+DEVICE="cuda"              # "cuda" or "cpu"
+
+# --- Output Settings ---
+SAVE_DIR="checkpoints/static_vrp_v2"
+SAVE_INTERVAL=10           # Save checkpoint every N epochs
+
+# --- Resume Training (leave empty to train from scratch) ---
+RESUME_FROM=""
+
+# =============================================================================
+# END OF CONFIGURATION
+# =============================================================================
+
+echo "=========================================="
+echo "Static VRP Training Configuration"
+echo "=========================================="
 echo ""
 echo "  FIXED (do not change):"
 echo "    Vehicle capacity:   30"
@@ -111,8 +110,5 @@ cmd=(
 if [[ -n "$RESUME_FROM" ]]; then
     cmd+=(--resume "$RESUME_FROM")
 fi
-
-# Pass any additional arguments
-cmd+=("$@")
 
 "${cmd[@]}"

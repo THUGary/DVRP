@@ -81,8 +81,6 @@ def build_env(
 
 	max_end_time_cfg = getattr(cfg, "max_end_time", None)
 	max_end_time = int(max_end_time_cfg if max_end_time_cfg is not None else cfg.max_time * 2)
-	# if static_demands:
-	# 	gen = StaticDemandGenerator(gen, full_window_end_t=max_end_time)
 
 	env = GridEnvironment(
 		width=cfg.width,
@@ -101,6 +99,7 @@ def build_env(
 		depot_return_bonus_scale=float(getattr(cfg, "depot_return_bonus_scale", 0.0)),
 		max_end_time=max_end_time,
 		include_service_time=bool(getattr(cfg, "include_service_time", False)),
+		static_demands=static_demands,  # Pass static_demands flag to environment
 	)
 	env.num_agents = cfg.num_agents
 	planner_kwargs = planner_kwargs or {}

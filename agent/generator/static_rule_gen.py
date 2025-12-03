@@ -428,11 +428,14 @@ class StaticDemandGen(BaseDemandGenerator):
                 "max_lifetime":self.params.get("max_lifetime",25),
                 **distribution_params,
             }
+            # For static demands, use max_end_time (or 2*max_time) as the deadline
+            # This ensures nodes don't expire before the episode ends
+            max_end_time = self.params.get("max_end_time", self.max_time * 2)
             env_params={
                 "width":self.width,
                 "height":self.height,
                 "depot":self.depot,
-                "max_time":self.max_time,
+                "max_time":max_end_time,  # Use max_end_time for static demands
             }
             burst_params={
                 "burst_mode": True if self.params.get("burst_prob", 0.0) > 0.0 else False,

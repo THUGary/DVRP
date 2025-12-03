@@ -118,6 +118,9 @@ class DiffusionAdversarialTrainer:
         self.adv_cfg = adv_cfg
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=adv_cfg.lr)
         self.baseline = None
+        # History of training episodes (list of dicts)
+        # Each entry: {ep, env_reward, gen_reward, adv, diff_loss, loss}
+        self.history: list[dict] = []
 
     def train(self, planner, episodes: int, renderer: PygameRenderer|None=None, save_path: str|None=None, seed: int = 1) -> None:
         import random
@@ -170,6 +173,16 @@ class DiffusionAdversarialTrainer:
             diff_loss = F.mse_loss(predicted_noise, noise)
             loss = diff_loss * adv_scaled
             self.opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0); self.opt.step()
+            # Record metrics to history for later analysis
+            entry = {
+                "ep": ep,
+                "env_reward": float(env_reward),
+                "gen_reward": float(gen_reward),
+                "adv": float(adv),
+                "diff_loss": float(diff_loss.item()),
+                "loss": float(loss.item()),
+            }
+            self.history.append(entry)
             print(f"[EP {ep:03d}] env={env_reward:.2f} gen={gen_reward:.2f} adv={adv:.2f} diff={diff_loss.item():.4f} loss={loss.item():.4f}")
             if save_path and (ep % self.adv_cfg.save_every == 0 or ep == episodes):
                 import os

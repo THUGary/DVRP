@@ -560,19 +560,20 @@ class GridEnvironment:
 		# 4) time update
 		self._state.time += 1
 		# Termination logic:
-		# - If reached hard cap max_end_time -> done
 		# - For static demands: if no unserved demands AND all agents at depot -> done
+		#   (no time limit for static VRP - episode ends when all demands served)
+		# - If reached hard cap max_end_time -> done (only for dynamic VRP or as safety)
 		# - Else if past last generation time (max_time) and there are no
 		#   unserved demands AND all agents are at depot -> done
 		# - Else -> continue
-		if self._state.time >= self.max_end_time:
-			done = True
-		elif self.static_demands:
-			# For static demands, can terminate early once all demands served
-			# and all agents returned to depot
+		if self.static_demands:
+			# For static demands, terminate when all demands served
+			# and all agents returned to depot (no time limit)
 			no_unserved = (len(self._state.demands) == 0)
 			all_at_depot = all((a.x, a.y) == self.depot for a in self._state.agent_states)
 			done = bool(no_unserved and all_at_depot)
+		elif self._state.time >= self.max_end_time:
+			done = True
 		elif self._state.time > self.max_time:
 			no_unserved = (len(self._state.demands) == 0)
 			all_at_depot = all((a.x, a.y) == self.depot for a in self._state.agent_states)
