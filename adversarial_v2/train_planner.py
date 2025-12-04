@@ -14,6 +14,7 @@ import torch.nn as nn
 from .config import CoevolutionConfig
 from .utils.registry import GeneratorRegistry, GeneratorVersion
 from .utils.demand_converter import DemandConverter, DemandTuple
+from .utils.problem_cache import ProblemCacheManager
 
 # Project imports
 from configs import COORD_NORM, DEMAND_NORM
@@ -37,6 +38,11 @@ DEFAULT_MAX_GRAD_NORM = 1.0
 DEFAULT_POMO_SIZE = 100
 DEFAULT_AUG_FACTOR = 1
 
+# Problem cache defaults
+DEFAULT_CACHE_REUSE_RATIO = 0.8  # 80% from cache, 20% fresh
+DEFAULT_MAX_PROBLEMS_PER_VERSION = 1000
+DEFAULT_MIN_CACHE_SIZE_FOR_REUSE = 100
+
 
 class PlannerTrainer:
     """
@@ -47,6 +53,7 @@ class PlannerTrainer:
     2. Supports both static (POMO) and dynamic (step-by-step) training
     3. REINFORCE with self-competitive baseline
     4. Reuses existing training functions from training_v2
+    5. Problem caching to avoid repeated diffusion sampling
     
     Model config uses defaults from training_v2/train_static.py.
     """
@@ -56,6 +63,9 @@ class PlannerTrainer:
         config: CoevolutionConfig,
         registry: GeneratorRegistry,
         device: torch.device,
+        cache_reuse_ratio: Optional[float] = None,
+        max_problems_per_version: Optional[int] = None,
+        min_cache_size_for_reuse: Optional[int] = None,
     ):
         """
         Initialize planner trainer.
@@ -64,6 +74,13 @@ class PlannerTrainer:
             config: CoevolutionConfig object containing all settings
             registry: GeneratorRegistry for version sampling
             device: torch device for training
+            cache_reuse_ratio: Probability of using cached problems vs fresh generation
+                              (0.0 = always generate, 1.0 = always use cache)
+                              If None, uses config.cache_reuse_ratio
+            max_problems_per_version: Max problems to cache per generator version
+                              If None, uses config.max_problems_per_version
+            min_cache_size_for_reuse: Minimum cache size before enabling reuse
+                              If None, uses config.min_cache_size_for_reuse
         """
         self.config = config
         self.registry = registry
@@ -74,6 +91,27 @@ class PlannerTrainer:
         self._init_planner()
         self._init_diffusion()
         self._init_optimizer()
+        
+        # Get cache settings from config or use defaults
+        _cache_reuse_ratio = cache_reuse_ratio if cache_reuse_ratio is not None \
+            else getattr(config, 'cache_reuse_ratio', DEFAULT_CACHE_REUSE_RATIO)
+        _max_problems = max_problems_per_version if max_problems_per_version is not None \
+            else getattr(config, 'max_problems_per_version', DEFAULT_MAX_PROBLEMS_PER_VERSION)
+        _min_cache_size = min_cache_size_for_reuse if min_cache_size_for_reuse is not None \
+            else getattr(config, 'min_cache_size_for_reuse', DEFAULT_MIN_CACHE_SIZE_FOR_REUSE)
+        
+        # Initialize problem cache
+        self.problem_cache = ProblemCacheManager(
+            cache_dir=os.path.join(config.save_dir, "problem_cache"),
+            max_problems_per_version=_max_problems,
+            cache_reuse_ratio=_cache_reuse_ratio,
+            min_cache_size_for_reuse=_min_cache_size,
+        )
+        
+        print(f"[PlannerTrainer] Problem cache initialized: "
+              f"reuse_ratio={_cache_reuse_ratio:.1%}, "
+              f"max_per_version={_max_problems}, "
+              f"min_for_reuse={_min_cache_size}")
         
         # Demand converter
         self.converter = DemandConverter(
@@ -241,26 +279,83 @@ class PlannerTrainer:
         
         return depot_xy, node_xy, node_demand
     
+    def get_problems_with_cache(
+        self,
+        batch_size: int,
+        version: GeneratorVersion,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, int]]:
+        """
+        Get problems using cache + fresh generation mix.
+        
+        Decision logic:
+        1. If cache has enough problems AND random < cache_reuse_ratio: use cache
+        2. Otherwise: generate fresh problems and add to cache
+        
+        Args:
+            batch_size: Number of problems needed
+            version: Generator version to use
+        
+        Returns:
+            depot_xy, node_xy, node_demand, stats dict with cache/fresh counts
+        """
+        version_id = version.version_id
+        stats = {"from_cache": 0, "freshly_generated": 0}
+        
+        # Check if we should use cache for this version
+        if self.problem_cache.should_use_cache(version_id, self.rng):
+            # Sample from cache
+            result = self.problem_cache.sample_from_cache(
+                version_id, batch_size, self.rng, self.device
+            )
+            if result is not None:
+                stats["from_cache"] = batch_size
+                return result[0], result[1], result[2], stats
+        
+        # Generate fresh problems
+        depot_xy, node_xy, node_demand = self.generate_problems_from_diffusion(
+            batch_size, version
+        )
+        stats["freshly_generated"] = batch_size
+        
+        # Add to cache
+        self.problem_cache.add_problems(version_id, depot_xy, node_xy, node_demand)
+        
+        return depot_xy, node_xy, node_demand, stats
+    
     def train_static_batch_with_diffusion(
         self,
         version: Optional[GeneratorVersion] = None,
-    ) -> Tuple[float, float]:
+        use_cache: bool = True,
+    ) -> Tuple[float, float, Dict[str, int]]:
         """
         Train one batch using POMO-style training with diffusion-generated problems.
         
         This reuses the logic from training_v2/train_static.py but with
         problems generated by the diffusion model instead of random.
         
+        Args:
+            version: Generator version to use (loads into diffusion model)
+            use_cache: Whether to use problem cache (default True)
+        
         Returns:
             avg_score: average tour length (lower is better)
             loss: policy gradient loss
+            cache_stats: dict with cache usage statistics
         """
         cfg = self.config
+        cache_stats = {"from_cache": 0, "freshly_generated": 0}
         
-        # Generate problems from diffusion model
-        depot_xy, node_xy, node_demand = self.generate_problems_from_diffusion(
-            cfg.batch_size, version
-        )
+        # Get problems (with cache if enabled and version provided)
+        if use_cache and version is not None:
+            depot_xy, node_xy, node_demand, cache_stats = self.get_problems_with_cache(
+                cfg.batch_size, version
+            )
+        else:
+            # Generate problems directly (no cache)
+            depot_xy, node_xy, node_demand = self.generate_problems_from_diffusion(
+                cfg.batch_size, version
+            )
+            cache_stats["freshly_generated"] = cfg.batch_size
         
         # Use the existing train_one_batch logic
         self.model.train()
@@ -303,7 +398,7 @@ class PlannerTrainer:
         best_reward, _ = reward.max(dim=1)
         avg_score = -best_reward.mean().item()
         
-        return avg_score, loss.item()
+        return avg_score, loss.item(), cache_stats
     
     def train_static_batch_random(self) -> Tuple[float, float]:
         """
@@ -343,6 +438,8 @@ class PlannerTrainer:
         total_score = 0.0
         total_loss = 0.0
         version_counts = {}
+        total_from_cache = 0
+        total_freshly_generated = 0
         
         for batch_idx in range(n_batches):
             if use_diffusion and not self.registry.is_empty():
@@ -359,8 +456,10 @@ class PlannerTrainer:
                 version_id = version.version_id
                 version_counts[version_id] = version_counts.get(version_id, 0) + 1
                 
-                # Train with diffusion-generated problems
-                score, loss = self.train_static_batch_with_diffusion(version)
+                # Train with diffusion-generated problems (with caching)
+                score, loss, cache_stats = self.train_static_batch_with_diffusion(version)
+                total_from_cache += cache_stats.get("from_cache", 0)
+                total_freshly_generated += cache_stats.get("freshly_generated", 0)
             else:
                 # Train with random problems (reuse train_static.py)
                 version_id = 0
@@ -370,15 +469,26 @@ class PlannerTrainer:
             total_loss += loss
             
             if (batch_idx + 1) % 10 == 0:
-                print(f"  Batch {batch_idx+1}/{n_batches}: score={score:.4f}, loss={loss:.4f}, gen_v{version_id}")
+                cache_rate = total_from_cache / max(1, total_from_cache + total_freshly_generated) * 100
+                print(f"  Batch {batch_idx+1}/{n_batches}: score={score:.4f}, loss={loss:.4f}, "
+                      f"gen_v{version_id}, cache_rate={cache_rate:.0f}%")
         
         avg_score = total_score / n_batches
         avg_loss = total_loss / n_batches
+        
+        # Log cache statistics
+        cache_stats_summary = self.problem_cache.get_cache_stats()
         
         return {
             "score": avg_score,
             "loss": avg_loss,
             "version_counts": version_counts,
+            "cache_stats": {
+                "from_cache": total_from_cache,
+                "freshly_generated": total_freshly_generated,
+                "cache_hit_rate": total_from_cache / max(1, total_from_cache + total_freshly_generated),
+                "total_cached_problems": cache_stats_summary["total_problems"],
+            },
         }
     
     def save_checkpoint(self, path: str, epoch: int, extra_state: Optional[Dict] = None):
@@ -402,6 +512,9 @@ class PlannerTrainer:
         
         torch.save(state, path)
         print(f"[PlannerTrainer] Saved checkpoint to {path}")
+        
+        # Also save problem cache to disk
+        self.problem_cache.save_all()
     
     def load_checkpoint(self, path: str):
         """Load planner checkpoint."""
@@ -416,3 +529,37 @@ class PlannerTrainer:
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         
         return ckpt.get("epoch", 0)
+    
+    def populate_cache_for_version(
+        self,
+        version: GeneratorVersion,
+        num_problems: int,
+        batch_size: int = 32,
+    ):
+        """
+        Pre-populate cache for a specific generator version.
+        
+        Useful for warming up the cache before training.
+        
+        Args:
+            version: Generator version to generate problems from
+            num_problems: Number of problems to generate and cache
+            batch_size: Batch size for generation
+        """
+        print(f"[PlannerTrainer] Populating cache for v{version.version_id} "
+              f"with {num_problems} problems...")
+        
+        self.load_generator_version(version)
+        
+        generated = 0
+        while generated < num_problems:
+            n = min(batch_size, num_problems - generated)
+            depot_xy, node_xy, node_demand = self.generate_problems_from_diffusion(n, version)
+            self.problem_cache.add_problems(version.version_id, depot_xy, node_xy, node_demand)
+            generated += n
+            if generated % 100 == 0:
+                print(f"  Generated {generated}/{num_problems}")
+        
+        # Save to disk
+        self.problem_cache.save_all()
+        print(f"[PlannerTrainer] Cache populated: {self.problem_cache.get_cache_stats()}")

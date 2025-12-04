@@ -92,6 +92,13 @@ class CoevolutionConfig:
     version_sample_policy: str = "latest_biased"
     latest_bias: float = 0.7  # P(sample latest) when latest_biased
     
+    # Problem cache settings
+    # Caching diffusion-generated problems speeds up training significantly
+    # since diffusion sampling is slow (~540ms/sample)
+    cache_reuse_ratio: float = 0.8  # Probability of using cached problems
+    max_problems_per_version: int = 1000  # Max problems to cache per generator version
+    min_cache_size_for_reuse: int = 100  # Min cache size before enabling reuse
+    
     # Hardware
     device: str = "cuda"
     seed: int = 42
@@ -114,3 +121,6 @@ class CoevolutionConfig:
             f"Invalid version_sample_policy: {self.version_sample_policy}"
         # Ensure capacity matches DEMAND_NORM (fixed at 30)
         assert self.env.capacity == 30, f"Vehicle capacity must be 30 (DEMAND_NORM), got {self.env.capacity}"
+        # Validate cache settings
+        assert 0.0 <= self.cache_reuse_ratio <= 1.0, \
+            f"cache_reuse_ratio must be in [0, 1], got {self.cache_reuse_ratio}"

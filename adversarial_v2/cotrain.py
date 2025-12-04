@@ -87,6 +87,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Episodes per training epoch"
     )
     
+    # Problem cache settings (to speed up planner training)
+    parser.add_argument(
+        "--cache-reuse-ratio", type=float, default=0.8,
+        help="Probability of reusing cached problems vs generating new (0.0=always generate, 1.0=always cache)"
+    )
+    parser.add_argument(
+        "--max-problems-per-version", type=int, default=1000,
+        help="Max problems to cache per generator version"
+    )
+    parser.add_argument(
+        "--min-cache-size-for-reuse", type=int, default=100,
+        help="Minimum cache size before enabling reuse"
+    )
+    
     # Environment settings
     parser.add_argument(
         "--map-size", type=int, default=20,
@@ -175,6 +189,10 @@ def main():
         episodes_per_epoch=args.episodes_per_epoch,
         version_sample_policy=args.version_policy,
         latest_bias=args.latest_bias,
+        # Problem cache settings
+        cache_reuse_ratio=args.cache_reuse_ratio,
+        max_problems_per_version=args.max_problems_per_version,
+        min_cache_size_for_reuse=args.min_cache_size_for_reuse,
         device=args.device,
         seed=args.seed,
         save_dir=args.save_dir,

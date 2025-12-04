@@ -8,10 +8,6 @@
 
 set -e
 
-# Activate conda environment
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate dvrp
-
 # Go to project root
 cd "$(dirname "$0")/.."
 echo "Working directory: $(pwd)"
@@ -46,9 +42,17 @@ BATCH_SIZE=32            # Batch size for training
 POMO_SIZE=100            # POMO parallel rollouts
 EPISODES_PER_EPOCH=128   # Episodes per epoch
 
+# --- Problem Cache Settings ---
+# Caching diffusion-generated problems speeds up training significantly
+# since diffusion sampling is slow (~540ms/sample)
+# Memory usage: ~0.6 MB per 1000 problems per version (num_nodes=50)
+CACHE_REUSE_RATIO=0.6        # Probability of using cached problems (0.0=always generate, 1.0=always cache)
+MAX_PROBLEMS_PER_VERSION=10000 # Max problems to cache per generator version
+MIN_CACHE_SIZE_FOR_REUSE=100  # Minimum cache size before enabling reuse
+
 # --- Version Sampling (to prevent policy cycling) ---
 VERSION_POLICY="latest_biased"  # "uniform", "latest_biased", "all"
-LATEST_BIAS=0.5          # P(sample latest) when latest_biased
+LATEST_BIAS=0.3          # P(sample latest) when latest_biased
 
 # --- Environment Settings ---
 # map_size: Side length of the square map (map is map_size × map_size)
@@ -109,6 +113,11 @@ echo "  POMO size:        ${POMO_SIZE}"
 echo "  Episodes/epoch:   ${EPISODES_PER_EPOCH}"
 echo "  Version policy:   ${VERSION_POLICY}"
 echo ""
+echo "PROBLEM CACHE:"
+echo "  Reuse ratio:      ${CACHE_REUSE_RATIO} (${CACHE_REUSE_RATIO}=80% from cache)"
+echo "  Max per version:  ${MAX_PROBLEMS_PER_VERSION}"
+echo "  Min for reuse:    ${MIN_CACHE_SIZE_FOR_REUSE}"
+echo ""
 echo "ENVIRONMENT:"
 echo "  Map size:         ${MAP_SIZE}x${MAP_SIZE}"
 echo "  Num agents:       ${NUM_AGENTS}"
@@ -156,6 +165,9 @@ CMD=(
     --episodes-per-epoch "${EPISODES_PER_EPOCH}"
     --version-policy "${VERSION_POLICY}"
     --latest-bias "${LATEST_BIAS}"
+    --cache-reuse-ratio "${CACHE_REUSE_RATIO}"
+    --max-problems-per-version "${MAX_PROBLEMS_PER_VERSION}"
+    --min-cache-size-for-reuse "${MIN_CACHE_SIZE_FOR_REUSE}"
     --map-size "${MAP_SIZE}"
     --num-agents "${NUM_AGENTS}"
     --capacity "${CAPACITY}"
