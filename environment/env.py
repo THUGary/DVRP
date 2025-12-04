@@ -165,7 +165,7 @@ class GridEnvironment:
 		assert self._state is not None, "Call reset() first"
 		t = self._state.time
 		# 1) new demands appear
-		if self._generator and t>0: #TODO: 确认这里t>0是否需要
+		if self._generator and t>0: #TODO: 确认这里t>0是否需要，动态使防止在reset和step重复采样
 			new_demands = self._generator.sample(t)
 			self._state.demands.extend(new_demands)
 		else:
