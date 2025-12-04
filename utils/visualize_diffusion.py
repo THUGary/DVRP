@@ -108,15 +108,22 @@ def normalize_samples(demands: np.ndarray, max_time: float = 100.0, max_c: float
     value_range = np.abs(demands).max()
     
     if value_range > 2.0:
-        # Model outputs are not normalized - use min-max normalization per column
+        # Model outputs are not normalized - the model may not be well-trained
+        # Use a fixed mapping assuming outputs are roughly centered around 0
+        # and have some spread. We'll use percentile-based normalization
+        # to handle outliers better.
         print(f"Warning: Model outputs not in [-1,1] range (max={value_range:.2f}), applying robust normalization")
+        
         for col in range(demands.shape[1]):
-            col_min, col_max = demands[:, col].min(), demands[:, col].max()
-            if col_max > col_min:
-                # Normalize to [0, 1] first
-                demands[:, col] = (demands[:, col] - col_min) / (col_max - col_min)
+            # Use percentile-based normalization to handle outliers
+            p_low, p_high = np.percentile(demands[:, col], [2, 98])
+            if p_high > p_low:
+                # Map [p_low, p_high] to [0, 1]
+                demands[:, col] = (demands[:, col] - p_low) / (p_high - p_low)
             else:
                 demands[:, col] = 0.5
+            # Clip to [0, 1]
+            demands[:, col] = np.clip(demands[:, col], 0, 1)
         
         # Now map to proper ranges
         # t: [0, max_time], x/y: already [0,1], c: [1, max_c], lifetime: [0, max_time]

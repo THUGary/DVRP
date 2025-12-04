@@ -35,6 +35,12 @@ GENERATOR_EPOCHS=4      # Generator training epochs per cycle
 PLANNER_EARLY_STOP_PATIENCE=15    # Number of epochs without improvement to trigger early stop
 PLANNER_EARLY_STOP_THRESHOLD=0.01  # Minimum improvement threshold
 
+# --- Generator Early Stopping (within each cycle) ---
+# Stop generator training early if gen_reward doesn't improve for PATIENCE epochs
+# Set to 0 or empty to disable early stopping
+GENERATOR_EARLY_STOP_PATIENCE=10   # Number of epochs without improvement to trigger early stop (0 = disabled)
+GENERATOR_EARLY_STOP_THRESHOLD=0.1  # Minimum improvement threshold for gen_reward
+
 # --- Batch Settings ---
 BATCH_SIZE=32            # Batch size for training
 POMO_SIZE=100            # POMO parallel rollouts
@@ -176,6 +182,14 @@ if [[ -n "${PLANNER_EARLY_STOP_PATIENCE}" ]] && [[ "${PLANNER_EARLY_STOP_PATIENC
 fi
 if [[ -n "${PLANNER_EARLY_STOP_THRESHOLD}" ]]; then
     CMD+=(--planner-early-stop-threshold "${PLANNER_EARLY_STOP_THRESHOLD}")
+fi
+
+# Add generator early stopping if specified
+if [[ -n "${GENERATOR_EARLY_STOP_PATIENCE}" ]] && [[ "${GENERATOR_EARLY_STOP_PATIENCE}" != "0" ]]; then
+    CMD+=(--generator-early-stop-patience "${GENERATOR_EARLY_STOP_PATIENCE}")
+fi
+if [[ -n "${GENERATOR_EARLY_STOP_THRESHOLD}" ]]; then
+    CMD+=(--generator-early-stop-threshold "${GENERATOR_EARLY_STOP_THRESHOLD}")
 fi
 
 # Add optional flags

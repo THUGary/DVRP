@@ -71,6 +71,13 @@ class CoevolutionConfig:
     # Minimum improvement threshold (score must decrease by at least this much)
     planner_early_stop_threshold: float = 0.01
     
+    # Generator early stopping within each cycle
+    # Stop if gen_reward doesn't improve for this many consecutive epochs
+    # Set to None or 0 to disable early stopping
+    generator_early_stop_patience: Optional[int] = None
+    # Minimum improvement threshold for generator reward
+    generator_early_stop_threshold: float = 0.1
+    
     # Batch settings (shared)
     # Memory usage ≈ batch_size × pomo_size × num_nodes^2 × embedding_dim × 4 bytes
     batch_size: int = 64  # Reduce for limited GPU memory

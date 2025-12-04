@@ -46,6 +46,8 @@ def coevolution_loop(
     if config.planner_early_stop_patience:
         print(f"Planner early stop: patience={config.planner_early_stop_patience}, threshold={config.planner_early_stop_threshold}")
     print(f"Generator epochs/cycle: {config.generator_epochs_per_cycle}")
+    if config.generator_early_stop_patience:
+        print(f"Generator early stop: patience={config.generator_early_stop_patience}, threshold={config.generator_early_stop_threshold}")
     print(f"Version sampling policy: {config.version_sample_policy}")
     print(f"Map: {config.env.map_size}x{config.env.map_size}, Agents: {config.env.num_agents}")
     print(f"Num nodes: {config.env.num_nodes}, Total demand: {config.env.total_demand}")
@@ -185,6 +187,12 @@ def coevolution_loop(
         # Update generator's planner reference
         generator_trainer.update_planner(planner_trainer.model)
         
+        # Generator early stopping state for this cycle
+        best_gen_reward_in_cycle = -float('inf')
+        gen_epochs_without_improvement = 0
+        gen_early_stop_patience = config.generator_early_stop_patience or 0
+        gen_early_stop_threshold = config.generator_early_stop_threshold
+        
         for epoch in range(1, config.generator_epochs_per_cycle + 1):
             print(f"\n  Generator Epoch {epoch}/{config.generator_epochs_per_cycle}")
             epoch_start = time.time()
@@ -192,8 +200,9 @@ def coevolution_loop(
             metrics = generator_trainer.train_epoch()
             epoch_duration = time.time() - epoch_start
             
+            current_gen_reward = metrics['gen_reward']
             print(f"  -> Planner reward: {metrics['planner_reward']:.2f}, "
-                  f"Gen reward: {metrics['gen_reward']:.2f}, "
+                  f"Gen reward: {current_gen_reward:.2f}, "
                   f"Loss: {metrics['loss']:.4f}")
             print(f"  -> Epoch duration: {epoch_duration:.2f}s")
             
@@ -206,6 +215,26 @@ def coevolution_loop(
             
             history["generator_rewards"].append(metrics["gen_reward"])
             history["generator_losses"].append(metrics["loss"])
+            
+            # Generator early stopping check (gen_reward is higher = better)
+            if gen_early_stop_patience > 0:
+                improvement = current_gen_reward - best_gen_reward_in_cycle
+                if improvement > gen_early_stop_threshold:
+                    # Improved
+                    best_gen_reward_in_cycle = current_gen_reward
+                    gen_epochs_without_improvement = 0
+                    print(f"  -> [Early Stop] New best gen_reward: {best_gen_reward_in_cycle:.4f}")
+                    # Save best generator for this cycle
+                    best_gen_path = os.path.join(config.save_dir, f"generator_cycle_{cycle}_best.pth")
+                    generator_trainer.save_checkpoint(best_gen_path, epoch=cycle)
+                else:
+                    # No significant improvement
+                    gen_epochs_without_improvement += 1
+                    print(f"  -> [Early Stop] No improvement for {gen_epochs_without_improvement}/{gen_early_stop_patience} epochs")
+                    
+                    if gen_epochs_without_improvement >= gen_early_stop_patience:
+                        print(f"  -> [Early Stop] Stopping generator training early at epoch {epoch}/{config.generator_epochs_per_cycle}")
+                        break
         
         # Save generator checkpoint
         gen_ckpt_path = os.path.join(config.save_dir, f"generator_cycle_{cycle}.pth")
