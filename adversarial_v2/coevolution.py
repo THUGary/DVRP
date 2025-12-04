@@ -6,9 +6,12 @@ Main training loop that alternates between:
 2. Generator training: Adversarial training to find planner weaknesses
 """
 from __future__ import annotations
+from dataclasses import asdict
 from typing import Optional, Dict, Any
+import json
 import os
 import random
+import time
 import torch
 
 from .config import CoevolutionConfig
@@ -38,6 +41,10 @@ def coevolution_loop(
     print(f"Mode: {config.mode}")
     print(f"Cycles: {config.num_cycles}")
     print(f"Planner epochs/cycle: {config.planner_epochs_per_cycle}")
+    if config.first_cycle_planner_epochs is not None:
+        print(f"First cycle planner epochs: {config.first_cycle_planner_epochs}")
+    if config.planner_early_stop_patience:
+        print(f"Planner early stop: patience={config.planner_early_stop_patience}, threshold={config.planner_early_stop_threshold}")
     print(f"Generator epochs/cycle: {config.generator_epochs_per_cycle}")
     print(f"Version sampling policy: {config.version_sample_policy}")
     print(f"Map: {config.env.map_size}x{config.env.map_size}, Agents: {config.env.num_agents}")
@@ -47,6 +54,9 @@ def coevolution_loop(
     
     # Setup
     os.makedirs(config.save_dir, exist_ok=True)
+    config_record_path = os.path.join(config.save_dir, "config_summary.json")
+    with open(config_record_path, "w", encoding="utf-8") as cfg_file:
+        json.dump(asdict(config), cfg_file, indent=2)
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -113,20 +123,55 @@ def coevolution_loop(
         # ============================================
         print(f"\n[Phase 1] Training Planner (using {registry.num_versions()} generator versions)")
         
-        for epoch in range(1, config.planner_epochs_per_cycle + 1):
-            print(f"\n  Planner Epoch {epoch}/{config.planner_epochs_per_cycle}")
+        # Use first_cycle_planner_epochs for cycle 1 if specified
+        if cycle == 1 and config.first_cycle_planner_epochs is not None:
+            planner_epochs = config.first_cycle_planner_epochs
+            print(f"  Using first cycle epochs: {planner_epochs}")
+        else:
+            planner_epochs = config.planner_epochs_per_cycle
+        
+        # Early stopping state for this cycle
+        best_score_in_cycle = float('inf')
+        epochs_without_improvement = 0
+        early_stop_patience = config.planner_early_stop_patience or 0
+        early_stop_threshold = config.planner_early_stop_threshold
+        
+        for epoch in range(1, planner_epochs + 1):
+            print(f"\n  Planner Epoch {epoch}/{planner_epochs}")
+            epoch_start = time.time()
             
             metrics = planner_trainer.train_epoch()
+            epoch_duration = time.time() - epoch_start
             
-            print(f"  -> Score: {metrics['score']:.4f}, Loss: {metrics['loss']:.4f}")
+            current_score = metrics['score']
+            print(f"  -> Score: {current_score:.4f}, Loss: {metrics['loss']:.4f}")
             if metrics.get("version_counts"):
                 print(f"  -> Version usage: {metrics['version_counts']}")
             
-            # Record to visualizer
-            visualizer.add_planner_epoch(metrics["loss"], metrics["score"])
+            print(f"  -> Epoch duration: {epoch_duration:.2f}s")
             
-            history["planner_scores"].append(metrics["score"])
+            # Record to visualizer
+            visualizer.add_planner_epoch(metrics["loss"], current_score)
+            
+            history["planner_scores"].append(current_score)
             history["planner_losses"].append(metrics["loss"])
+            
+            # Early stopping check (score is tour length, lower is better)
+            if early_stop_patience > 0:
+                improvement = best_score_in_cycle - current_score
+                if improvement > early_stop_threshold:
+                    # Improved
+                    best_score_in_cycle = current_score
+                    epochs_without_improvement = 0
+                    print(f"  -> [Early Stop] New best score: {best_score_in_cycle:.4f}")
+                else:
+                    # No significant improvement
+                    epochs_without_improvement += 1
+                    print(f"  -> [Early Stop] No improvement for {epochs_without_improvement}/{early_stop_patience} epochs")
+                    
+                    if epochs_without_improvement >= early_stop_patience:
+                        print(f"  -> [Early Stop] Stopping planner training early at epoch {epoch}/{planner_epochs}")
+                        break
         
         # Save planner checkpoint
         planner_ckpt_path = os.path.join(config.save_dir, f"planner_cycle_{cycle}.pt")
@@ -142,12 +187,15 @@ def coevolution_loop(
         
         for epoch in range(1, config.generator_epochs_per_cycle + 1):
             print(f"\n  Generator Epoch {epoch}/{config.generator_epochs_per_cycle}")
+            epoch_start = time.time()
             
             metrics = generator_trainer.train_epoch()
+            epoch_duration = time.time() - epoch_start
             
             print(f"  -> Planner reward: {metrics['planner_reward']:.2f}, "
                   f"Gen reward: {metrics['gen_reward']:.2f}, "
                   f"Loss: {metrics['loss']:.4f}")
+            print(f"  -> Epoch duration: {epoch_duration:.2f}s")
             
             # Record to visualizer
             visualizer.add_generator_epoch(

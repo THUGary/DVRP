@@ -1,0 +1,64 @@
+{
+  "next_id": 7,
+  "versions": [
+    {
+      "version_id": 1,
+      "checkpoint_path": "checkpoints/cotrain/static_20251203_182634/generator_v0.pth",
+      "timestamp": 1764786399.5059333,
+      "metrics": {
+        "cycle": 0,
+        "tag": "init"
+      }
+    },
+    {
+      "version_id": 2,
+      "checkpoint_path": "checkpoints/cotrain/static_20251203_182634/generator_cycle_1.pth",
+      "timestamp": 1764789906.7333941,
+      "metrics": {
+        "cycle": 1,
+        "planner_reward": -263.69207812499957,
+        "gen_reward": 606.0549112499993
+      }
+    },
+    {
+      "version_id": 3,
+      "checkpoint_path": "checkpoints/cotrain/static_20251203_182634/generator_cycle_2.pth",
+      "timestamp": 1764792086.451709,
+      "metrics": {
+        "cycle": 2,
+        "planner_reward": -290.54774999999995,
+        "gen_reward": 644.0564468749994
+      }
+    },
+    {
+      "version_id": 4,
+      "checkpoint_path": "checkpoints/cotrain/static_20251203_182634/generator_cycle_3.pth",
+      "timestamp": 1764794267.1749947,
+      "metrics": {
+        "cycle": 3,
+        "planner_reward": -293.7595781249997,
+        "gen_reward": 646.1193699999995
+      }
+    },
+    {
+      "version_id": 5,
+      "checkpoint_path": "checkpoints/cotrain/static_20251203_182634/generator_cycle_4.pth",
+      "timestamp": 1764796444.9584572,
+      "metrics": {
+        "cycle": 4,
+        "planner_reward": -294.0089296874999,
+        "gen_reward": 649.3216790625
+      }
+    },
+    {
+      "version_id": 6,
+      "checkpoint_path": "checkpoints/cotrain/static_20251203_182634/generator_cycle_5.pth",
+      "timestamp": 1764798536.631806,
+      "metrics": {
+        "cycle": 5,
+        "planner_reward": -280.5572578124992,
+        "gen_reward": 618.9883284374994
+      }
+    }
+  ]
+}

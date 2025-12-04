@@ -60,6 +60,17 @@ class CoevolutionConfig:
     planner_epochs_per_cycle: int = 5
     generator_epochs_per_cycle: int = 5
     
+    # First cycle can have different epochs for longer initial training
+    # If None, uses planner_epochs_per_cycle
+    first_cycle_planner_epochs: Optional[int] = None
+    
+    # Planner early stopping within each cycle
+    # Stop if score doesn't improve for this many consecutive epochs
+    # Set to None or 0 to disable early stopping
+    planner_early_stop_patience: Optional[int] = 3
+    # Minimum improvement threshold (score must decrease by at least this much)
+    planner_early_stop_threshold: float = 0.01
+    
     # Batch settings (shared)
     # Memory usage ≈ batch_size × pomo_size × num_nodes^2 × embedding_dim × 4 bytes
     batch_size: int = 64  # Reduce for limited GPU memory

@@ -15,16 +15,16 @@ cd "$SCRIPT_DIR/.."
 # =============================================================================
 
 # --- Agent Settings ---
-NUM_AGENTS=5              # Number of vehicles
+NUM_AGENTS=2              # Number of vehicles
 
 # --- Demand Settings ---
-NUM_NODES=20               # Number of demand nodes
-TOTAL_DEMAND=60            # Upper limit of sum of all customer demands (NOT node count!)
+NUM_NODES=30               # Number of demand nodes
+TOTAL_DEMAND=100            # Upper limit of sum of all customer demands (NOT node count!)
 MAX_C=5                    # Max demand per node (demands 1 to max_c)
 CAPACITY=30                # Vehicle capacity (fixed for model)
 
 # --- Environment Settings ---
-MAP_SIZE=40                # Square map side length (map is MAP_SIZE × MAP_SIZE)
+MAP_SIZE=30                # Square map side length (map is MAP_SIZE × MAP_SIZE)
 
 # --- Evaluation Settings ---
 NUM_RUNS=50                # Number of evaluation runs per distribution
@@ -33,7 +33,7 @@ STATIC_MAX_END=5000        # Time limit for static VRP
 MAX_STEPS=5000             # Max simulation steps
 
 # --- POMO Inference Parameters ---
-POMO_SIZE=20               # Number of parallel rollouts
+POMO_SIZE=100               # Number of parallel rollouts
 AUG_FACTOR=8               # Data augmentation factor
 
 # --- Planners to Evaluate ---
@@ -44,7 +44,7 @@ RULE_MODES="optimize,greedy,heuristic"
 GLOBAL_OPT_MODES=""
 
 # Model checkpoints (comma-separated, or "label=path" format)
-MODEL_CHECKPOINTS="checkpoints/cotrain/static_20251202_034046/planner_cycle_2.pt"
+MODEL_CHECKPOINTS="checkpoints/cotrain/static_20251203_182634/planner_cycle_5.pt"
 
 # --- Output Settings ---
 OUT_DIR="outputs/eval"
