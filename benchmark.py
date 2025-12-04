@@ -69,11 +69,11 @@ def get_benchmark_config(dataset_basepath: str, problem_type: str,instance_info:
 		"num_agents":least_num_vehicles if least_vehicles else instance_info.get("vehicle_number"),
 		"capacity":instance_info.get("vehicle_capacity"),
 		"depot":(instance_info.get("depot_x"), instance_info.get("depot_y")),
-		"max_time":instance_info.get("duration")+500,  # extra time buffer
+		"max_time":instance_info.get("duration")+50,  # extra time buffer
 		"generator_type":"benchmark",
 		"generator_params":{
 			"instance_data": df,
-			"max_time": instance_info.get("duration")+500,
+			"max_time": instance_info.get("duration")+50,
 		}
 	}
 	
@@ -93,6 +93,7 @@ def build_env(cfg: Config, planner_type: str, static_demands: bool) -> Tuple[Gri
 		gen = BenchmarkGenerator(cfg.width, cfg.height, **cfg.generator_params)
 		max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2))
 	
+
 	print(f"Vehicle number for planner: {cfg.num_agents}")
 	env = GridEnvironment(
 		width=cfg.width,
@@ -102,6 +103,9 @@ def build_env(cfg: Config, planner_type: str, static_demands: bool) -> Tuple[Gri
 		depot=cfg.depot,
 		generator=gen,
 		max_time=cfg.max_time,
+		max_end_time=max_end_time,
+		static_demands=static_demands,
+		include_service_time=bool(getattr(cfg, "include_service_time", False)),
 		expiry_penalty_scale=float(getattr(cfg, "expiry_penalty_scale", 5.0)),
 		switch_penalty_scale=float(getattr(cfg, "switch_penalty_scale", 0.01)),
 		capacity_reward_scale=float(getattr(cfg, "capacity_reward_scale", 10.0)),
@@ -109,8 +113,6 @@ def build_env(cfg: Config, planner_type: str, static_demands: bool) -> Tuple[Gri
 		exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
 		wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
 		depot_return_bonus_scale=float(getattr(cfg, "depot_return_bonus_scale", 0.0)),
-		max_end_time=max_end_time,
-		include_service_time=bool(getattr(cfg, "include_service_time", False)),
 	)
 	env.num_agents = cfg.num_agents
 	if planner_type == "greedy":
@@ -174,10 +176,12 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 		renderer = PygameRenderer(cfg.width, cfg.height, cell_size=10)
 		renderer.init()
 
+	total_demand_count = 0
 	while not done:
 		# 检测新增的需求
 		current_demands = obs["demands"]
 		new_demands = [d for d in current_demands if d not in prev_demands]
+		total_demand_count += len(new_demands)
 
 		# 更新规划状态（在规划之前）
 		agent_states = obs["agent_states"]  # list of (x,y,s)
@@ -234,6 +238,8 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 	if renderer is not None:
 		renderer.close()
 
+	print(f"Total new demands so far: {total_demand_count}")
+
 
 def gen_plan_choice(args: argparse.Namespace, cfg)->str:
 	"""Simplified planner selection for V2Planner architecture"""
@@ -269,7 +275,7 @@ def main() -> None:
 	parser.add_argument("--planner", choices=["greedy", "model", "static", "dynamic", "fri", "rbso", "dcp"], 
 						default="greedy", help="Planner type: greedy (rule-based), model/static/dynamic (V2Planner), fri, rbso, dcp")
 	parser.add_argument("--gmodel", action="store_true", help="Use neural net demand generator; otherwise rule")
-	parser.add_argument("--service-time", action="store_true", default=True, help="Enable service times for demands (vehicles must remain on-site before completion)")
+	parser.add_argument("--service-time", action="store_true", help="Enable service times for demands (vehicles must remain on-site before completion)")
 	parser.add_argument("--test-all", action="store_true", help="Run all instances in the specified dataset (not implemented yet)")
 	parser.add_argument("--instance", type=str, default="R101", help="Specify the problem instance name to run (default: R104)")
 	parser.add_argument("--least-vehs", action="store_true", help="Use the least number of vehicles used in known solution for the instance")
