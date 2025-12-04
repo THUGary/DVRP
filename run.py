@@ -68,7 +68,7 @@ def build_env(
 		wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
 		depot_return_bonus_scale=float(getattr(cfg, "depot_return_bonus_scale", 0.0)),
 	)
-	
+
 	env.num_agents = cfg.num_agents
 	planner_kwargs = planner_kwargs or {}
 	if planner_type in ("greedy", "rule", "optimize"):
@@ -393,7 +393,7 @@ def main() -> None:
 	parser.add_argument("--static-demands", action="store_true", help="Release all demands at time 0 to visualize static VRP instances")
 	parser.add_argument("--static-max-end", type=int, default=None, help="Max environment time for static demands (default: 2 * max_time)")
 	parser.add_argument("--max-steps", type=int, default=None, help="Maximum episode steps (default: no limit)")
-	parser.add_argument("--static-ckpt", type=str, default="./DVRP/checkpoints/static_vrp_v2/best_n50.pt", help="Path to V2 static model checkpoint (enables model planner)")
+	parser.add_argument("--static-ckpt", type=str, help="Path to V2 static model checkpoint (enables model planner)")
 	parser.add_argument("--adapter-ckpt", type=str, default=None, help="Path to V2 dynamic adapter checkpoint (enables dynamic mode)")
 	args = parser.parse_args()
 

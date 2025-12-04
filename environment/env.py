@@ -70,6 +70,7 @@ class GridEnvironment:
 		self.static_demands = bool(static_demands)
 		# Only wrap with StaticDemandGenerator if not already wrapped
 		if self.static_demands and generator is not None:
+			print("Using static demand Generator Wrapper in GridEnvironment.")
 			if not isinstance(generator, StaticDemandGenerator):
 				generator = StaticDemandGenerator(generator, max_end_time=resolved_max_end_time)
 		self._generator = generator
@@ -164,7 +165,7 @@ class GridEnvironment:
 		assert self._state is not None, "Call reset() first"
 		t = self._state.time
 		# 1) new demands appear
-		if self._generator:
+		if self._generator and t>0: #TODO: 确认这里t>0是否需要
 			new_demands = self._generator.sample(t)
 			self._state.demands.extend(new_demands)
 		else:
@@ -198,6 +199,8 @@ class GridEnvironment:
 				self._episode_stats["seen_demands_ids"].add(id(d))
 				self._episode_stats["demand_count"] += 1
 				self._episode_stats["demand_capacity"] += float(d.c)
+			#TODO: id(d)可能是有风险的，主要是动态下删减需求是可能会影响到id的唯一性。【出问题概率低但仍有可能出问题】
+			#由于自定义Demand为可变对象，【静态下】对self._state.demands[A list]进行修改时不会出问题。
 		# 2) apply actions to agents
 		# record previous positions to compute route distance
 		prev_states = [
@@ -332,6 +335,7 @@ class GridEnvironment:
 					)
 					capacity_reward += float(demand.c)
 					served_count += 1
+					print(f"Agent {agent_idx} completed service of demand at ({demand.x}, {demand.y}) with capacity {demand.c}.")
 					served_capacity += float(demand.c)
 					served_details.append((demand.x, demand.y, float(demand.c)))
 					new_active_services.pop(agent_idx, None)
@@ -364,6 +368,7 @@ class GridEnvironment:
 								service_time_remaining=service_time,
 								servicing_demand_id=id(demand),
 							)
+							# print(f"Agent {agent_idx} starts to serve demand at ({demand.x}, {demand.y}) with capacity {demand.c} for {service_time} steps.")
 							new_active_services[agent_idx] = (demand, service_time)
 							continue
 						else:
@@ -377,6 +382,7 @@ class GridEnvironment:
 							)
 							capacity_reward += float(demand.c)
 							served_count += 1
+							# print(f"Agent {agent_idx} served demand at ({demand.x}, {demand.y}) with capacity {demand.c} immediately.")
 							served_capacity += float(demand.c)
 							served_details.append((demand.x, demand.y, float(demand.c)))
 							continue
@@ -416,7 +422,7 @@ class GridEnvironment:
 				remaining.append(d)
 			self._state.demands = remaining
 			self._active_services = {}
-			
+
 		# compute route distance (Euclidean) this step
 		movement_distance = 0.0
 		agent_distances: List[float] = []
@@ -573,7 +579,9 @@ class GridEnvironment:
 			no_unserved = (len(self._state.demands) == 0)
 			all_at_depot = all((a.x, a.y) == self.depot for a in self._state.agent_states)
 			done = bool(no_unserved and all_at_depot)
-		elif self._state.time > self.max_end_time: #TODO: should it be >=?
+		elif self._state.time > self.max_end_time: 
+			#TODO: >= has been changed to >,
+			# BECAUSE self._state.time is incremented by 1 above, it needs to go to the next time step
 			done = True
 		elif self._state.time > self.max_time:
 			no_unserved = (len(self._state.demands) == 0)
@@ -639,6 +647,7 @@ class GridEnvironment:
 	def _obs(self) -> Dict:
 		assert self._state is not None
 		active_demands = [d for d in self._state.demands if d.t <= self._state.time]
+		# print(f"Obs at time {self._state.time}: {len(self._state.agent_states)} agents, {len(active_demands)} active demands.")
 		return {
 			"time": self._state.time,
 			"depot": self._state.depot,
