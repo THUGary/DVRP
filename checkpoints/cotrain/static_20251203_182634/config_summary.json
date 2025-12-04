@@ -1,0 +1,37 @@
+{
+  "mode": "static",
+  "num_cycles": 5,
+  "planner_epochs_per_cycle": 20,
+  "generator_epochs_per_cycle": 4,
+  "first_cycle_planner_epochs": 200,
+  "planner_early_stop_patience": 15,
+  "planner_early_stop_threshold": 0.01,
+  "batch_size": 32,
+  "pomo_size": 100,
+  "episodes_per_epoch": 128,
+  "version_sample_policy": "latest_biased",
+  "latest_bias": 0.5,
+  "device": "cuda",
+  "seed": 42,
+  "save_dir": "checkpoints/cotrain/static_20251203_182634",
+  "save_interval": 1,
+  "planner_checkpoint": "checkpoints/cotrain/static_20251203_104147/planner_cycle_1.pt",
+  "generator_checkpoint": "checkpoints/diffusion_model.pth",
+  "env": {
+    "map_size": 30,
+    "num_agents": 2,
+    "capacity": 30,
+    "max_time": 1000,
+    "max_end_time": 1200,
+    "depot": [
+      0,
+      0
+    ],
+    "randomize_depot": true,
+    "num_nodes": 30,
+    "total_demand": 100,
+    "max_c": 5,
+    "min_lifetime": 10,
+    "max_lifetime": 50
+  }
+}

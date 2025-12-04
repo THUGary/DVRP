@@ -10,7 +10,7 @@ set -e
 
 # Activate conda environment
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate drl
+conda activate dvrp
 
 # Go to project root
 cd "$(dirname "$0")/.."
@@ -25,14 +25,14 @@ MODE="static"                    # "static" or "dynamic"
 
 # --- Co-evolution Settings ---
 NUM_CYCLES=5             # Number of co-evolution cycles
-PLANNER_EPOCHS=1        # Planner training epochs per cycle
-FIRST_CYCLE_PLANNER_EPOCHS=1  # First cycle planner epochs (leave empty to use PLANNER_EPOCHS)
-GENERATOR_EPOCHS=1      # Generator training epochs per cycle
+PLANNER_EPOCHS=20        # Planner training epochs per cycle
+FIRST_CYCLE_PLANNER_EPOCHS=200  # First cycle planner epochs (leave empty to use PLANNER_EPOCHS)
+GENERATOR_EPOCHS=4      # Generator training epochs per cycle
 
 # --- Planner Early Stopping (within each cycle) ---
 # Stop planner training early if score doesn't improve for PATIENCE epochs
 # Set to 0 or empty to disable early stopping
-PLANNER_EARLY_STOP_PATIENCE=10    # Number of epochs without improvement to trigger early stop
+PLANNER_EARLY_STOP_PATIENCE=15    # Number of epochs without improvement to trigger early stop
 PLANNER_EARLY_STOP_THRESHOLD=0.01  # Minimum improvement threshold
 
 # --- Batch Settings ---
@@ -42,21 +42,22 @@ EPISODES_PER_EPOCH=128   # Episodes per epoch
 
 # --- Version Sampling (to prevent policy cycling) ---
 VERSION_POLICY="latest_biased"  # "uniform", "latest_biased", "all"
-LATEST_BIAS=0.7          # P(sample latest) when latest_biased
+LATEST_BIAS=0.5          # P(sample latest) when latest_biased
 
 # --- Environment Settings ---
 # map_size: Side length of the square map (map is map_size × map_size)
-MAP_SIZE=20              # Square map side length
+MAP_SIZE=30              # Square map side length
 NUM_AGENTS=2             # Number of vehicles
 CAPACITY=30              # Vehicle capacity (fixed at 30 = DEMAND_NORM)
-MAX_TIME=100             # Max simulation time
+MAX_TIME=1000             # Max simulation time
+MAX_END_TIME=1200        # Max deadline for static demands (when nodes disappear)
 
 # --- Demand Generation (for Generator) ---
 # TERMINOLOGY:
 #   - NUM_NODES: Actual number of demand nodes (for tensor shapes)
 #   - TOTAL_DEMAND: Upper limit of sum of all demands (capacity constraint, NOT node count)
-NUM_NODES=20             # Number of demand nodes (reduce for limited VRAM)
-TOTAL_DEMAND=60          # Upper limit of sum of all demands
+NUM_NODES=30             # Number of demand nodes (reduce for limited VRAM)
+TOTAL_DEMAND=100          # Upper limit of sum of all demands
 MAX_C=5                  # Max demand per node (demands 1 to max_c)
 MIN_LIFETIME=10          # Min demand lifetime
 MAX_LIFETIME=50          # Max demand lifetime
@@ -67,11 +68,11 @@ DEVICE="cuda"            # "cuda" or "cpu"
 SEED=42                  # Random seed
 
 # --- Checkpoints (optional, for loading pretrained models) ---
-PLANNER_CHECKPOINT=""    # Path to pretrained planner (leave empty if none)
+PLANNER_INITIALIZE="checkpoints/cotrain/static_20251203_104147/planner_cycle_1.pt"    # Path to pretrained planner (leave empty if none)
 # Path to pretrained diffusion generator checkpoint
 # Recommended: use a supervised-trained model to avoid random initialization
 # Example: "checkpoints/diffusion_model.pth"
-GENERATOR_CHECKPOINT=""
+GENERATOR_INITIALIZE="checkpoints/diffusion_model.pth"
 RESUME_FROM=""           # Resume from checkpoint directory (leave empty if none)
 
 # --- Output ---
@@ -107,6 +108,7 @@ echo "  Map size:         ${MAP_SIZE}x${MAP_SIZE}"
 echo "  Num agents:       ${NUM_AGENTS}"
 echo "  Capacity:         ${CAPACITY}"
 echo "  Max time:         ${MAX_TIME}"
+echo "  Max end time:     ${MAX_END_TIME}"
 echo ""
 echo "DEMAND GENERATION:"
 echo "  Num nodes:        ${NUM_NODES}"
@@ -119,13 +121,13 @@ echo "HARDWARE:"
 echo "  Device:           ${DEVICE}"
 echo "  Seed:             ${SEED}"
 echo ""
-echo "OUTPUT:"
+echo "INITIALIZE:"
 echo "  Save directory:   ${SAVE_DIR}"
-if [[ -n "${PLANNER_CHECKPOINT}" ]]; then
-    echo "  Planner ckpt:     ${PLANNER_CHECKPOINT}"
+if [[ -n "${PLANNER_INITIALIZE}" ]]; then
+    echo "  Planner initialize:     ${PLANNER_INITIALIZE}"
 fi
-if [[ -n "${GENERATOR_CHECKPOINT}" ]]; then
-    echo "  Generator ckpt:   ${GENERATOR_CHECKPOINT}"
+if [[ -n "${GENERATOR_INITIALIZE}" ]]; then
+    echo "  Generator initialize:   ${GENERATOR_INITIALIZE}"
 fi
 if [[ -n "${RESUME_FROM}" ]]; then
     echo "  Resume from:      ${RESUME_FROM}"
@@ -152,6 +154,7 @@ CMD=(
     --num-agents "${NUM_AGENTS}"
     --capacity "${CAPACITY}"
     --max-time "${MAX_TIME}"
+    --max-end-time "${MAX_END_TIME}"
     --num-nodes "${NUM_NODES}"
     --total-demand "${TOTAL_DEMAND}"
     --max-c "${MAX_C}"
@@ -180,13 +183,13 @@ if [[ "${RANDOMIZE_DEPOT}" == "true" ]]; then
     CMD+=(--randomize-depot)
 fi
 
-# Add optional checkpoints
-if [[ -n "${PLANNER_CHECKPOINT}" ]]; then
-    CMD+=(--planner-checkpoint "${PLANNER_CHECKPOINT}")
+# Add optional checkpoints (initialization paths)
+if [[ -n "${PLANNER_INITIALIZE}" ]]; then
+    CMD+=(--planner-checkpoint "${PLANNER_INITIALIZE}")
 fi
 
-if [[ -n "${GENERATOR_CHECKPOINT}" ]]; then
-    CMD+=(--generator-checkpoint "${GENERATOR_CHECKPOINT}")
+if [[ -n "${GENERATOR_INITIALIZE}" ]]; then
+    CMD+=(--generator-checkpoint "${GENERATOR_INITIALIZE}")
 fi
 
 if [[ -n "${RESUME_FROM}" ]]; then
