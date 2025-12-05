@@ -27,7 +27,7 @@ CAPACITY=30                # Vehicle capacity (fixed for model)
 MAP_SIZE=30                # Square map side length (map is MAP_SIZE × MAP_SIZE)
 
 # --- Evaluation Settings ---
-NUM_RUNS=50                # Number of evaluation runs per distribution
+NUM_RUNS=20                # Number of evaluation runs per distribution
 STATIC_DEMANDS="true"      # Use static demands mode ("true" or "false")
 STATIC_MAX_END=5000        # Time limit for static VRP
 MAX_STEPS=5000             # Max simulation steps
@@ -44,7 +44,13 @@ RULE_MODES="optimize,greedy,heuristic"
 GLOBAL_OPT_MODES=""
 
 # Model checkpoints (comma-separated, or "label=path" format)
-MODEL_CHECKPOINTS="checkpoints/cotrain/static_20251203_182634/planner_cycle_5.pt"
+MODEL_CHECKPOINTS="checkpoints/cotrain/static_20251203_182634/planner_cycle_1.pt"
+
+# --- Diffusion Generator Checkpoints (for additional distribution evaluation) ---
+# These diffusion models generate demand distributions for planner testing
+# Supports label=path format, comma-separated
+# Example: "adv=checkpoints/diffusion_adv.pth,baseline=checkpoints/diffusion_model.pth"
+DIFFUSION_CHECKPOINTS="version1=checkpoints/cotrain/static_20251203_182634/generator_cycle_1.pth,version5=checkpoints/cotrain/static_20251203_182634/generator_cycle_5.pth"
 
 # --- Output Settings ---
 OUT_DIR="outputs/eval"
@@ -65,6 +71,9 @@ GLOBAL_OPT_MODES="$(echo "$GLOBAL_OPT_MODES" | xargs)"
 MODEL_CHECKPOINTS="${MODEL_CHECKPOINTS//,/ }"
 MODEL_CHECKPOINTS="$(echo "$MODEL_CHECKPOINTS" | xargs)"
 
+DIFFUSION_CHECKPOINTS="${DIFFUSION_CHECKPOINTS//,/ }"
+DIFFUSION_CHECKPOINTS="$(echo "$DIFFUSION_CHECKPOINTS" | xargs)"
+
 echo "=========================================="
 echo "Evaluate Distributions Configuration"
 echo "=========================================="
@@ -84,6 +93,7 @@ echo "    Num runs:           $NUM_RUNS"
 echo "    Rule modes:         $RULE_MODES"
 echo "    Global opt:         $GLOBAL_OPT_MODES"
 echo "    Model ckpts:        $MODEL_CHECKPOINTS"
+echo "    Diffusion ckpts:    ${DIFFUSION_CHECKPOINTS:-<none>}"
 echo "    POMO size:          $POMO_SIZE"
 echo "    Aug factor:         $AUG_FACTOR"
 echo "    Max steps:          ${MAX_STEPS:-<unlimited>}"
@@ -100,6 +110,11 @@ if [[ -n "$GLOBAL_OPT_MODES" ]]; then
     read -ra GLOBAL_OPTS <<<"$GLOBAL_OPT_MODES"
 fi
 
+DIFFUSION_ENTRIES=()
+if [[ -n "$DIFFUSION_CHECKPOINTS" ]]; then
+    read -ra DIFFUSION_ENTRIES <<<"$DIFFUSION_CHECKPOINTS"
+fi
+
 MODEL_ENTRIES=()
 if [[ -n "$MODEL_CHECKPOINTS" ]]; then
     read -ra MODEL_ENTRIES <<<"$MODEL_CHECKPOINTS"
@@ -114,7 +129,21 @@ for ckpt in "${MODEL_ENTRIES[@]}"; do
         ckpt_path="$ckpt"
     fi
     if [[ ! -f "$ckpt_path" ]]; then
-        echo "ERROR: Checkpoint file not found: $ckpt_path"
+        echo "ERROR: Model checkpoint file not found: $ckpt_path"
+        exit 1
+    fi
+done
+
+# Validate diffusion checkpoint files exist
+for ckpt in "${DIFFUSION_ENTRIES[@]}"; do
+    # Handle label=path format
+    if [[ "$ckpt" == *"="* ]]; then
+        ckpt_path="${ckpt#*=}"
+    else
+        ckpt_path="$ckpt"
+    fi
+    if [[ ! -f "$ckpt_path" ]]; then
+        echo "ERROR: Diffusion checkpoint file not found: $ckpt_path"
         exit 1
     fi
 done
@@ -149,6 +178,12 @@ done
 
 cmd+=(--model-checkpoints)
 cmd+=("${MODEL_ENTRIES[@]}")
+
+# Add diffusion checkpoints if specified
+if [[ ${#DIFFUSION_ENTRIES[@]} -gt 0 ]]; then
+    cmd+=(--diffusion-checkpoints)
+    cmd+=("${DIFFUSION_ENTRIES[@]}")
+fi
 
 if [[ -n "$CAPACITY" ]]; then
     cmd+=(--capacity "$CAPACITY")

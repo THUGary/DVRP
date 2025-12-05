@@ -2,7 +2,7 @@ import argparse
 import copy
 import os
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import numpy as np
 import matplotlib
@@ -16,6 +16,135 @@ from agent.generator.distribution_sets import SUPPORTED_DEMAND_DISTRIBUTIONS
 
 # 支持的分布名称
 DISTRIBUTIONS = list(SUPPORTED_DEMAND_DISTRIBUTIONS)
+
+
+# =============================================================================
+# Diffusion Generator Support
+# =============================================================================
+
+class DiffusionDistributionGenerator:
+    """
+    Wrapper to generate demands using a diffusion model checkpoint.
+    
+    This allows comparing planner performance on diffusion-generated distributions
+    versus rule-based distributions (uniform, gaussian, cluster, etc.).
+    """
+    
+    def __init__(
+        self,
+        checkpoint_path: str,
+        map_size: int = 30,
+        max_time: int = 100,
+        max_end_time: int = 200,
+        max_c: int = 5,
+        device: str = "cuda",
+    ):
+        import torch
+        from models.generator_model.diffusion_model import DemandDiffusionModel
+        from agent.generator.data_utils import prepare_condition, CONDITION_DIM
+        from adversarial_v2.utils.demand_converter import DemandConverter
+        
+        self.checkpoint_path = checkpoint_path
+        self.map_size = map_size
+        self.max_time = max_time
+        self.max_end_time = max_end_time
+        self.max_c = max_c
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        
+        # Initialize diffusion model
+        self.model = DemandDiffusionModel(
+            condition_dim=CONDITION_DIM,
+            data_dim=5,
+            time_emb_dim=64,
+            num_steps=1000,
+        ).to(self.device)
+        
+        # Load checkpoint
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        if isinstance(ckpt, dict) and 'model' in ckpt:
+            self.model.load_state_dict(ckpt['model'], strict=False)
+        else:
+            self.model.load_state_dict(ckpt, strict=False)
+        self.model.eval()
+        
+        # Prepare condition
+        self.condition = prepare_condition({}).unsqueeze(0).to(self.device)
+        
+        # Demand converter
+        self.converter = DemandConverter(
+            map_size=map_size,
+            max_time=max_time,
+            max_end_time=max_end_time,
+            max_c=max_c,
+        )
+        
+        self._label = os.path.splitext(os.path.basename(checkpoint_path))[0]
+    
+    @property
+    def label(self) -> str:
+        return f"diffusion_{self._label}"
+    
+    def generate_demands(
+        self, 
+        num_nodes: int, 
+        seed: int = 0,
+        static_demands: bool = True,
+    ) -> List[tuple]:
+        """
+        Generate demands using the diffusion model.
+        
+        Returns:
+            List of demand tuples: (x, y, t, c, end_t)
+        """
+        import torch
+        
+        # Set seed for reproducibility
+        torch.manual_seed(seed)
+        
+        with torch.no_grad():
+            output = self.model.sample(
+                condition=self.condition,
+                num_demands=num_nodes,
+                grid_size=(self.map_size, self.map_size),
+            )
+        
+        if static_demands:
+            demands = self.converter.convert_to_static(output)
+        else:
+            demands = self.converter.convert_to_dynamic(output)
+        
+        # Convert to tuple format expected by environment
+        return [(d.x, d.y, d.t, d.c, d.end_t) for d in demands]
+
+
+def load_diffusion_generators(
+    checkpoint_paths: List[str],
+    map_size: int,
+    max_time: int,
+    max_end_time: int,
+    max_c: int,
+    device: str = "cuda",
+) -> List[DiffusionDistributionGenerator]:
+    """Load multiple diffusion generators from checkpoints."""
+    generators = []
+    for path in checkpoint_paths:
+        if not os.path.exists(path):
+            print(f"[WARNING] Diffusion checkpoint not found: {path}")
+            continue
+        try:
+            gen = DiffusionDistributionGenerator(
+                checkpoint_path=path,
+                map_size=map_size,
+                max_time=max_time,
+                max_end_time=max_end_time,
+                max_c=max_c,
+                device=device,
+            )
+            generators.append(gen)
+            print(f"[INFO] Loaded diffusion generator: {gen.label}")
+        except Exception as e:
+            print(f"[WARNING] Failed to load diffusion checkpoint {path}: {e}")
+    return generators
 
 
 def _cuda_warmup():
@@ -94,14 +223,36 @@ def evaluate_distributions(
     static_demands: bool = False,
     out_dir: str = "outputs/eval",
     max_steps: Optional[int] = None,
+    diffusion_generators: Optional[List[DiffusionDistributionGenerator]] = None,
 ):
+    """
+    Evaluate planners across multiple distributions.
+    
+    Args:
+        cfg: Base configuration
+        planner_specs: List of planner specifications to evaluate
+        num_runs: Number of evaluation runs per distribution
+        static_demands: Whether to use static demand mode
+        out_dir: Output directory for results
+        max_steps: Maximum episode steps
+        diffusion_generators: Optional list of diffusion generators for additional distributions
+    """
     import time as time_module
     
     results: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
     os.makedirs(out_dir, exist_ok=True)
     
+    # Build list of all distributions to evaluate
+    all_distributions = list(DISTRIBUTIONS)  # Rule-based distributions
+    diffusion_gen_map = {}  # Map distribution name to generator
+    
+    if diffusion_generators:
+        for gen in diffusion_generators:
+            all_distributions.append(gen.label)
+            diffusion_gen_map[gen.label] = gen
+    
     # Calculate total evaluations for progress tracking
-    total_evals = len(planner_specs) * len(DISTRIBUTIONS) * num_runs
+    total_evals = len(planner_specs) * len(all_distributions) * num_runs
     completed_evals = 0
     start_time = time_module.time()
 
@@ -111,6 +262,11 @@ def evaluate_distributions(
     print("Performing CUDA warmup...")
     _cuda_warmup()
     print("  CUDA warmup complete")
+    
+    print(f"\n[INFO] Evaluating {len(planner_specs)} planners on {len(all_distributions)} distributions:")
+    print(f"       Rule-based: {DISTRIBUTIONS}")
+    if diffusion_gen_map:
+        print(f"       Diffusion:  {list(diffusion_gen_map.keys())}")
 
     # Note: Model weights are loaded lazily on first use within each planner.
     # The first episode for each model planner will include model loading time,
@@ -141,13 +297,33 @@ def evaluate_distributions(
             )
             print(f"  [Warmup] Complete")
 
-        for dist_idx, dist in enumerate(DISTRIBUTIONS):
+        for dist_idx, dist in enumerate(all_distributions):
             dist_start = time_module.time()
             metrics_list = []
+            
+            # Check if this is a diffusion distribution
+            is_diffusion_dist = dist in diffusion_gen_map
 
             for seed in range(num_runs):
                 local_cfg = copy.deepcopy(cfg)
-                local_cfg.generator_params["distribution"] = dist
+                
+                if is_diffusion_dist:
+                    # Use diffusion generator - set generator_type to trigger custom handling
+                    diffusion_gen = diffusion_gen_map[dist]
+                    # Generate demands using diffusion model
+                    num_nodes = local_cfg.generator_params.get("num_nodes", 30)
+                    demands = diffusion_gen.generate_demands(
+                        num_nodes=num_nodes, 
+                        seed=seed,
+                        static_demands=static_demands,
+                    )
+                    # Inject pre-generated demands into config
+                    local_cfg.generator_params["distribution"] = "uniform"  # Fallback
+                    local_cfg.generator_params["_pregenerated_demands"] = demands
+                else:
+                    # Standard rule-based distribution
+                    local_cfg.generator_params["distribution"] = dist
+                    
                 local_cfg = sanitize_cfg(local_cfg)
                 local_cfg.seed = seed
 
@@ -215,18 +391,26 @@ def evaluate_distributions(
 
         results[spec.label] = planner_results
 
-    return results
+    return results, all_distributions
 
 
 def save_plots_from_results(results: dict[str, dict[str, dict[str, float]]],
                             metrics: list[str],
                             out_dir: str,
-                            num_runs: int):
+                            num_runs: int,
+                            dist_names: Optional[List[str]] = None):
     os.makedirs(out_dir, exist_ok=True)
     if not results:
         return
 
-    dist_names = DISTRIBUTIONS
+    # Use provided dist_names or infer from results
+    if dist_names is None:
+        # Get all distribution names from results
+        all_dists = set()
+        for planner_results in results.values():
+            all_dists.update(planner_results.keys())
+        dist_names = sorted(all_dists)
+    
     if not dist_names:
         return
 
@@ -262,7 +446,7 @@ def save_plots_from_results(results: dict[str, dict[str, dict[str, float]]],
             plt.close()
             continue
 
-        plt.xticks(x, dist_names)
+        plt.xticks(x, dist_names, rotation=45, ha='right')
         plt.ylabel(display_metric)
         plt.title(f"{display_metric} by distribution (n={num_runs})")
         plt.grid(axis="y", alpha=0.3)
@@ -287,10 +471,22 @@ def save_plots_from_results(results: dict[str, dict[str, dict[str, float]]],
         print(f"Saved plot: {fname}")
 
 
-def save_episode_length_chart(results: dict[str, dict[str, dict[str, float]]], out_dir: str, num_runs: int):
+def save_episode_length_chart(
+    results: dict[str, dict[str, dict[str, float]]], 
+    out_dir: str, 
+    num_runs: int,
+    dist_names: Optional[List[str]] = None,
+):
     if not results:
         return
-    dist_names = next(iter(results.values())).keys()
+    
+    # Use provided dist_names or infer from results
+    if dist_names is None:
+        all_dists = set()
+        for planner_results in results.values():
+            all_dists.update(planner_results.keys())
+        dist_names = sorted(all_dists)
+    
     if not dist_names:
         return
     planner_labels = list(results.keys())
@@ -320,7 +516,7 @@ def save_episode_length_chart(results: dict[str, dict[str, dict[str, float]]], o
         plt.close()
         return
 
-    plt.xticks(x, list(dist_names))
+    plt.xticks(x, list(dist_names), rotation=45, ha='right')
     plt.ylabel("episode_steps")
     plt.title(f"Episode Length by Distribution (n={num_runs})")
     plt.grid(axis="y", alpha=0.3)
@@ -369,6 +565,11 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-model", type=str, default=None, help="Checkpoint file for the learned planner (kept for backward compatibility)")
     parser.add_argument("--model-checkpoints", nargs="*", default=[],
                         help="List of checkpoint paths for models to compare. Supports label=path. Brackets/comma-separated lists are normalized.")
+    parser.add_argument(
+        "--diffusion-checkpoints", nargs="*", default=[],
+        help="List of diffusion generator checkpoint paths for distribution generation. "
+             "Supports label=path format. These distributions are evaluated alongside rule-based distributions."
+    )
     parser.add_argument("--use-hungarian", action="store_true",
                         help="Use Hungarian algorithm for model planner's global assignment (instead of greedy decoding)")
     parser.add_argument("--total-demand", type=int, default=None,
@@ -538,13 +739,48 @@ if __name__ == "__main__":
     cfg.v2_planner_params["pomo_size"] = args.pomo_size
     cfg.v2_planner_params["aug_factor"] = args.aug_factor
 
-    result = evaluate_distributions(
+    # Load diffusion generators if specified
+    diffusion_generators = []
+    diffusion_entries = normalize_entries(args.diffusion_checkpoints)
+    if diffusion_entries:
+        print(f"\n[INFO] Loading {len(diffusion_entries)} diffusion generator(s)...")
+        for entry in diffusion_entries:
+            if "=" in entry:
+                label, path = entry.split("=", 1)
+                label = label.strip()
+                path = path.strip()
+            else:
+                path = entry
+                label = None  # Will use default label from checkpoint name
+            
+            if not os.path.exists(path):
+                print(f"[WARNING] Diffusion checkpoint not found: {path}")
+                continue
+            
+            try:
+                gen = DiffusionDistributionGenerator(
+                    checkpoint_path=path,
+                    map_size=cfg.width,
+                    max_time=cfg.max_time,
+                    max_end_time=cfg.max_end_time,
+                    max_c=cfg.generator_params.get("max_c", 5),
+                    device="cuda",
+                )
+                if label:
+                    gen._label = label  # Override default label
+                diffusion_generators.append(gen)
+                print(f"  Loaded: {gen.label}")
+            except Exception as e:
+                print(f"[WARNING] Failed to load diffusion checkpoint {path}: {e}")
+
+    result, all_distributions = evaluate_distributions(
         cfg,
         planner_specs=planner_specs,
         num_runs=args.num_runs,
         static_demands=args.static_demands,
         out_dir=args.out_dir,
         max_steps=args.max_steps,
+        diffusion_generators=diffusion_generators if diffusion_generators else None,
     )
 
     # Parse metrics to plot before printing results
@@ -563,6 +799,7 @@ if __name__ == "__main__":
         metrics_to_plot = normalized
 
     print("\n==== Final Distribution Evaluation Results ====")
+    print(f"Distributions evaluated: {all_distributions}")
     for spec in planner_specs:
         msg = f"Method: {spec.label} ({spec.planner_type})"
         if spec.planner_type in ("model", "static", "dynamic"):
@@ -573,7 +810,8 @@ if __name__ == "__main__":
         print(msg)
         # Print per-distribution metrics for this planner
         if spec.label in result:
-            for dist, stats in result[spec.label].items():
+            for dist in all_distributions:
+                stats = result[spec.label].get(dist, {})
                 mean_dict = stats.get("mean", {})
                 parts = [f"{dist}:"]
                 # Print metrics specified in plot_metrics (or default set)
@@ -583,6 +821,6 @@ if __name__ == "__main__":
                         parts.append(f"{key}={mean_dict[key]:.4f}")
                 print("    " + " ".join(parts))
 
-    save_plots_from_results(result, metrics_to_plot, args.out_dir, args.num_runs)
+    save_plots_from_results(result, metrics_to_plot, args.out_dir, args.num_runs, dist_names=all_distributions)
     if args.static_demands:
-        save_episode_length_chart(result, args.out_dir, args.num_runs)
+        save_episode_length_chart(result, args.out_dir, args.num_runs, dist_names=all_distributions)
