@@ -103,6 +103,13 @@ class CoevolutionConfig:
     device: str = "cuda"
     seed: int = 42
     
+    # Multi-GPU settings
+    # num_gpus=1: single GPU training (default)
+    # num_gpus>1: distributed data parallel training
+    num_gpus: int = 1
+    # Local rank for distributed training (set automatically by launcher)
+    local_rank: int = 0
+    
     # Checkpointing
     save_dir: str = "checkpoints/adversarial_v2"
     save_interval: int = 1  # Save every N cycles

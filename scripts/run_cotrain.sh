@@ -4,6 +4,9 @@
 # Usage: bash scripts/run_cotrain.sh
 #
 # Edit the configuration variables below to change settings.
+#
+# Multi-GPU Training:
+#   Set NUM_GPUS > 1 to enable DDP training with torchrun
 # =============================================================================
 
 set -e
@@ -19,11 +22,14 @@ echo "Working directory: $(pwd)"
 # --- Training Mode ---
 MODE="static"                    # "static" or "dynamic"
 
+# --- Multi-GPU Settings ---
+NUM_GPUS=1                       # Number of GPUs (1=single GPU, >1=DDP with torchrun)
+
 # --- Co-evolution Settings ---
 NUM_CYCLES=5             # Number of co-evolution cycles
-PLANNER_EPOCHS=20        # Planner training epochs per cycle
-FIRST_CYCLE_PLANNER_EPOCHS=200  # First cycle planner epochs (leave empty to use PLANNER_EPOCHS)
-GENERATOR_EPOCHS=4      # Generator training epochs per cycle
+PLANNER_EPOCHS=1        # Planner training epochs per cycle
+FIRST_CYCLE_PLANNER_EPOCHS=1  # First cycle planner epochs (leave empty to use PLANNER_EPOCHS)
+GENERATOR_EPOCHS=1      # Generator training epochs per cycle
 
 # --- Planner Early Stopping (within each cycle) ---
 # Stop planner training early if score doesn't improve for PATIENCE epochs
@@ -98,6 +104,7 @@ echo "Co-evolution Training Configuration"
 echo "=============================================="
 echo ""
 echo "MODE:               ${MODE}"
+echo "NUM_GPUS:           ${NUM_GPUS}"
 echo ""
 echo "CO-EVOLUTION:"
 echo "  Cycles:           ${NUM_CYCLES}"
@@ -154,8 +161,8 @@ echo ""
 # Build Command
 # ==============================================================================
 
-CMD=(
-    python3 -m adversarial_v2.cotrain
+# Build common arguments
+ARGS=(
     --mode "${MODE}"
     --num-cycles "${NUM_CYCLES}"
     --planner-epochs "${PLANNER_EPOCHS}"
@@ -181,52 +188,59 @@ CMD=(
     --device "${DEVICE}"
     --seed "${SEED}"
     --save-dir "${SAVE_DIR}"
+    --num-gpus "${NUM_GPUS}"
 )
 
 # Add first cycle planner epochs if specified
 if [[ -n "${FIRST_CYCLE_PLANNER_EPOCHS}" ]]; then
-    CMD+=(--first-cycle-planner-epochs "${FIRST_CYCLE_PLANNER_EPOCHS}")
+    ARGS+=(--first-cycle-planner-epochs "${FIRST_CYCLE_PLANNER_EPOCHS}")
 fi
 
 # Add planner early stopping if specified
 if [[ -n "${PLANNER_EARLY_STOP_PATIENCE}" ]] && [[ "${PLANNER_EARLY_STOP_PATIENCE}" != "0" ]]; then
-    CMD+=(--planner-early-stop-patience "${PLANNER_EARLY_STOP_PATIENCE}")
+    ARGS+=(--planner-early-stop-patience "${PLANNER_EARLY_STOP_PATIENCE}")
 fi
 if [[ -n "${PLANNER_EARLY_STOP_THRESHOLD}" ]]; then
-    CMD+=(--planner-early-stop-threshold "${PLANNER_EARLY_STOP_THRESHOLD}")
+    ARGS+=(--planner-early-stop-threshold "${PLANNER_EARLY_STOP_THRESHOLD}")
 fi
 
 # Add generator early stopping if specified
 if [[ -n "${GENERATOR_EARLY_STOP_PATIENCE}" ]] && [[ "${GENERATOR_EARLY_STOP_PATIENCE}" != "0" ]]; then
-    CMD+=(--generator-early-stop-patience "${GENERATOR_EARLY_STOP_PATIENCE}")
+    ARGS+=(--generator-early-stop-patience "${GENERATOR_EARLY_STOP_PATIENCE}")
 fi
 if [[ -n "${GENERATOR_EARLY_STOP_THRESHOLD}" ]]; then
-    CMD+=(--generator-early-stop-threshold "${GENERATOR_EARLY_STOP_THRESHOLD}")
+    ARGS+=(--generator-early-stop-threshold "${GENERATOR_EARLY_STOP_THRESHOLD}")
 fi
 
 # Add optional flags
 if [[ "${RANDOMIZE_DEPOT}" == "true" ]]; then
-    CMD+=(--randomize-depot)
+    ARGS+=(--randomize-depot)
 fi
 
 # Add optional checkpoints (initialization paths)
 if [[ -n "${PLANNER_INITIALIZE}" ]]; then
-    CMD+=(--planner-checkpoint "${PLANNER_INITIALIZE}")
+    ARGS+=(--planner-checkpoint "${PLANNER_INITIALIZE}")
 fi
 
 if [[ -n "${GENERATOR_INITIALIZE}" ]]; then
-    CMD+=(--generator-checkpoint "${GENERATOR_INITIALIZE}")
+    ARGS+=(--generator-checkpoint "${GENERATOR_INITIALIZE}")
 fi
 
 if [[ -n "${RESUME_FROM}" ]]; then
-    CMD+=(--resume "${RESUME_FROM}")
+    ARGS+=(--resume "${RESUME_FROM}")
 fi
 
 # =============================================================================
 # Run Training
 # =============================================================================
 
-"${CMD[@]}"
+if [[ "${NUM_GPUS}" -gt 1 ]]; then
+    echo "Launching multi-GPU training with ${NUM_GPUS} GPUs using torchrun..."
+    torchrun --nproc_per_node="${NUM_GPUS}" -m adversarial_v2.cotrain "${ARGS[@]}"
+else
+    echo "Launching single-GPU training..."
+    python3 -m adversarial_v2.cotrain "${ARGS[@]}"
+fi
 
 echo ""
 echo "=============================================="

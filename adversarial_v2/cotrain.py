@@ -4,9 +4,17 @@ Co-evolution Training Entry Point
 
 Arguments are parsed here and stored in dataclass objects (CoevolutionConfig, EnvironmentConfig).
 These config objects are then passed to other modules.
+
+Multi-GPU Training:
+    # Single GPU (default)
+    python -m adversarial_v2.cotrain --num-gpus 1
+    
+    # Multi-GPU with torchrun
+    torchrun --nproc_per_node=4 -m adversarial_v2.cotrain --num-gpus 4
 """
 from __future__ import annotations
 import argparse
+import os
 import sys
 
 from adversarial_v2.config import CoevolutionConfig, EnvironmentConfig
@@ -147,12 +155,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to checkpoint directory to resume from"
     )
     
+    # Multi-GPU settings
+    parser.add_argument(
+        "--num-gpus", type=int, default=1,
+        help="Number of GPUs for distributed training (1=single GPU, >1=DDP)"
+    )
+    parser.add_argument(
+        "--local-rank", type=int, default=0,
+        help="Local rank for distributed training (set automatically by torchrun)"
+    )
+    
     return parser
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    
+    # =================================================================
+    # Handle distributed training environment variables
+    # When launched with torchrun, these are set automatically
+    # =================================================================
+    local_rank = args.local_rank
+    
+    # torchrun sets LOCAL_RANK environment variable
+    if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+    
+    # Detect num_gpus from WORLD_SIZE if using torchrun
+    num_gpus = args.num_gpus
+    if "WORLD_SIZE" in os.environ:
+        num_gpus = int(os.environ["WORLD_SIZE"])
     
     # =================================================================
     # Build config dataclasses from CLI arguments (single entry point)
@@ -195,6 +228,9 @@ def main():
         min_cache_size_for_reuse=args.min_cache_size_for_reuse,
         device=args.device,
         seed=args.seed,
+        # Multi-GPU settings
+        num_gpus=num_gpus,
+        local_rank=local_rank,
         save_dir=args.save_dir,
         planner_checkpoint=args.planner_checkpoint,
         generator_checkpoint=args.generator_checkpoint,

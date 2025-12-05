@@ -3,6 +3,8 @@ Planner Trainer Module
 
 Train V2Planner using distributions from multiple generator versions.
 Reuses existing training functions from training_v2/train_static.py and train_dynamic.py
+
+Supports multi-GPU training with DistributedDataParallel (DDP).
 """
 from __future__ import annotations
 from typing import List, Tuple, Dict, Any, Optional
@@ -15,6 +17,10 @@ from .config import CoevolutionConfig
 from .utils.registry import GeneratorRegistry, GeneratorVersion
 from .utils.demand_converter import DemandConverter, DemandTuple
 from .utils.problem_cache import ProblemCacheManager
+from .utils.distributed import (
+    is_distributed, is_main_process, get_world_size, get_rank,
+    wrap_model_ddp, unwrap_model, reduce_tensor, barrier, print_rank0
+)
 
 # Project imports
 from configs import COORD_NORM, DEMAND_NORM
@@ -87,9 +93,20 @@ class PlannerTrainer:
         self.device = device
         self.rng = random.Random(config.seed)
         
+        # Multi-GPU settings
+        self.num_gpus = getattr(config, 'num_gpus', 1)
+        self.local_rank = getattr(config, 'local_rank', 0)
+        self.distributed = is_distributed()
+        
         # Initialize models
         self._init_planner()
         self._init_diffusion()
+        
+        # Wrap planner model with DDP if distributed
+        if self.distributed:
+            self.model = wrap_model_ddp(self.model, device_ids=[self.local_rank])
+            print_rank0(f"[PlannerTrainer] Wrapped planner model with DDP on rank {self.local_rank}")
+        
         self._init_optimizer()
         
         # Get cache settings from config or use defaults
@@ -108,7 +125,7 @@ class PlannerTrainer:
             min_cache_size_for_reuse=_min_cache_size,
         )
         
-        print(f"[PlannerTrainer] Problem cache initialized: "
+        print_rank0(f"[PlannerTrainer] Problem cache initialized: "
               f"reuse_ratio={_cache_reuse_ratio:.1%}, "
               f"max_per_version={_max_problems}, "
               f"min_for_reuse={_min_cache_size}")
@@ -158,7 +175,7 @@ class PlannerTrainer:
                     self.model.load_state_dict(ckpt['model_state_dict'])
                 else:
                     self.model.load_state_dict(ckpt)
-                print(f"[PlannerTrainer] Loaded static model from {cfg.planner_checkpoint}")
+                print_rank0(f"[PlannerTrainer] Loaded static model from {cfg.planner_checkpoint}")
         else:
             # Dynamic mode: Use DynamicVRPModel with adapter
             self.model = create_dynamic_model(
@@ -283,17 +300,21 @@ class PlannerTrainer:
         self,
         batch_size: int,
         version: GeneratorVersion,
+        is_latest_version: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, int]]:
         """
         Get problems using cache + fresh generation mix.
         
         Decision logic:
-        1. If cache has enough problems AND random < cache_reuse_ratio: use cache
-        2. Otherwise: generate fresh problems and add to cache
+        1. Latest version: ALWAYS generate fresh problems (for adversarial challenge),
+           but cache them for future use when this version becomes historical
+        2. Historical versions: Use cache if available AND random < cache_reuse_ratio
+        3. Otherwise: generate fresh problems and add to cache
         
         Args:
             batch_size: Number of problems needed
             version: Generator version to use
+            is_latest_version: If True, always generate fresh (don't read from cache)
         
         Returns:
             depot_xy, node_xy, node_demand, stats dict with cache/fresh counts
@@ -301,7 +322,19 @@ class PlannerTrainer:
         version_id = version.version_id
         stats = {"from_cache": 0, "freshly_generated": 0}
         
-        # Check if we should use cache for this version
+        # Latest version: always generate fresh problems for adversarial training
+        # This ensures the planner always trains on the latest challenge
+        # But still cache them for future use (when this version becomes historical)
+        if is_latest_version:
+            depot_xy, node_xy, node_demand = self.generate_problems_from_diffusion(
+                batch_size, version
+            )
+            stats["freshly_generated"] = batch_size
+            # Cache for future use when this version becomes historical
+            self.problem_cache.add_problems(version_id, depot_xy, node_xy, node_demand)
+            return depot_xy, node_xy, node_demand, stats
+        
+        # Historical versions: check if we should use cache
         if self.problem_cache.should_use_cache(version_id, self.rng):
             # Sample from cache
             result = self.problem_cache.sample_from_cache(
@@ -311,13 +344,13 @@ class PlannerTrainer:
                 stats["from_cache"] = batch_size
                 return result[0], result[1], result[2], stats
         
-        # Generate fresh problems
+        # Generate fresh problems for historical version
         depot_xy, node_xy, node_demand = self.generate_problems_from_diffusion(
             batch_size, version
         )
         stats["freshly_generated"] = batch_size
         
-        # Add to cache
+        # Add to cache (historical versions are cached for reuse)
         self.problem_cache.add_problems(version_id, depot_xy, node_xy, node_demand)
         
         return depot_xy, node_xy, node_demand, stats
@@ -326,6 +359,7 @@ class PlannerTrainer:
         self,
         version: Optional[GeneratorVersion] = None,
         use_cache: bool = True,
+        is_latest_version: bool = False,
     ) -> Tuple[float, float, Dict[str, int]]:
         """
         Train one batch using POMO-style training with diffusion-generated problems.
@@ -336,6 +370,7 @@ class PlannerTrainer:
         Args:
             version: Generator version to use (loads into diffusion model)
             use_cache: Whether to use problem cache (default True)
+            is_latest_version: If True, always generate fresh problems (don't use cache)
         
         Returns:
             avg_score: average tour length (lower is better)
@@ -348,7 +383,7 @@ class PlannerTrainer:
         # Get problems (with cache if enabled and version provided)
         if use_cache and version is not None:
             depot_xy, node_xy, node_demand, cache_stats = self.get_problems_with_cache(
-                cfg.batch_size, version
+                cfg.batch_size, version, is_latest_version=is_latest_version
             )
         else:
             # Generate problems directly (no cache)
@@ -441,6 +476,9 @@ class PlannerTrainer:
         total_from_cache = 0
         total_freshly_generated = 0
         
+        # Get latest version ID for cache decision
+        latest_version_id = self.registry.latest().version_id if not self.registry.is_empty() else -1
+        
         for batch_idx in range(n_batches):
             if use_diffusion and not self.registry.is_empty():
                 # Sample generator version
@@ -456,8 +494,15 @@ class PlannerTrainer:
                 version_id = version.version_id
                 version_counts[version_id] = version_counts.get(version_id, 0) + 1
                 
+                # Determine if this is the latest version
+                # Latest version: always generate fresh problems (adversarial challenge)
+                # Historical versions: use cache according to cache_reuse_ratio
+                is_latest = (version_id == latest_version_id)
+                
                 # Train with diffusion-generated problems (with caching)
-                score, loss, cache_stats = self.train_static_batch_with_diffusion(version)
+                score, loss, cache_stats = self.train_static_batch_with_diffusion(
+                    version, is_latest_version=is_latest
+                )
                 total_from_cache += cache_stats.get("from_cache", 0)
                 total_freshly_generated += cache_stats.get("freshly_generated", 0)
             else:
@@ -470,8 +515,9 @@ class PlannerTrainer:
             
             if (batch_idx + 1) % 10 == 0:
                 cache_rate = total_from_cache / max(1, total_from_cache + total_freshly_generated) * 100
-                print(f"  Batch {batch_idx+1}/{n_batches}: score={score:.4f}, loss={loss:.4f}, "
-                      f"gen_v{version_id}, cache_rate={cache_rate:.0f}%")
+                is_latest_str = " [LATEST]" if (use_diffusion and not self.registry.is_empty() and version_id == latest_version_id) else ""
+                print_rank0(f"  Batch {batch_idx+1}/{n_batches}: score={score:.4f}, loss={loss:.4f}, "
+                      f"gen_v{version_id}{is_latest_str}, cache_rate={cache_rate:.0f}%")
         
         avg_score = total_score / n_batches
         avg_loss = total_loss / n_batches
@@ -492,7 +538,13 @@ class PlannerTrainer:
         }
     
     def save_checkpoint(self, path: str, epoch: int, extra_state: Optional[Dict] = None):
-        """Save planner checkpoint."""
+        """Save planner checkpoint. Only saves on main process in distributed mode."""
+        # Only save on main process
+        if self.distributed and not is_main_process():
+            # Sync before returning to ensure all processes finish together
+            barrier()
+            return
+            
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         
         state = {
@@ -500,10 +552,13 @@ class PlannerTrainer:
             "mode": self.config.mode,
         }
         
+        # Unwrap DDP model to save raw model state
+        model_to_save = unwrap_model(self.model) if self.distributed else self.model
+        
         if self.config.mode == "static":
-            state["model_state_dict"] = self.model.state_dict()
+            state["model_state_dict"] = model_to_save.state_dict()
         else:
-            state["adapter_state"] = self.model.adapter_state_dict()
+            state["adapter_state"] = model_to_save.adapter_state_dict()
         
         state["optimizer_state_dict"] = self.optimizer.state_dict()
         
@@ -511,10 +566,14 @@ class PlannerTrainer:
             state.update(extra_state)
         
         torch.save(state, path)
-        print(f"[PlannerTrainer] Saved checkpoint to {path}")
+        print_rank0(f"[PlannerTrainer] Saved checkpoint to {path}")
         
         # Also save problem cache to disk
         self.problem_cache.save_all()
+        
+        # Sync after saving
+        if self.distributed:
+            barrier()
     
     def load_checkpoint(self, path: str):
         """Load planner checkpoint."""
@@ -546,7 +605,7 @@ class PlannerTrainer:
             num_problems: Number of problems to generate and cache
             batch_size: Batch size for generation
         """
-        print(f"[PlannerTrainer] Populating cache for v{version.version_id} "
+        print_rank0(f"[PlannerTrainer] Populating cache for v{version.version_id} "
               f"with {num_problems} problems...")
         
         self.load_generator_version(version)
@@ -558,8 +617,8 @@ class PlannerTrainer:
             self.problem_cache.add_problems(version.version_id, depot_xy, node_xy, node_demand)
             generated += n
             if generated % 100 == 0:
-                print(f"  Generated {generated}/{num_problems}")
+                print_rank0(f"  Generated {generated}/{num_problems}")
         
         # Save to disk
         self.problem_cache.save_all()
-        print(f"[PlannerTrainer] Cache populated: {self.problem_cache.get_cache_stats()}")
+        print_rank0(f"[PlannerTrainer] Cache populated: {self.problem_cache.get_cache_stats()}")
