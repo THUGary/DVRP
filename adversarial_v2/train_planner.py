@@ -277,13 +277,22 @@ class PlannerTrainer:
             else:
                 depot = (cfg.env.depot[0] / cfg.env.map_size, cfg.env.depot[1] / cfg.env.map_size)
             
-            # Generate demands using diffusion
+            # Generate demands using diffusion (DDIM for speed)
             with torch.no_grad():
-                output = self.diffusion_model.sample(
-                    condition=self.condition,
-                    num_demands=cfg.env.total_demand,
-                    grid_size=(cfg.env.map_size, cfg.env.map_size),
-                )
+                if hasattr(self.diffusion_model, 'sample_ddim'):
+                    output = self.diffusion_model.sample_ddim(
+                        condition=self.condition,
+                        num_demands=cfg.env.total_demand,
+                        grid_size=(cfg.env.map_size, cfg.env.map_size),
+                        num_inference_steps=50,  # 50 steps vs 1000 for DDPM
+                        eta=0.0,
+                    )
+                else:
+                    output = self.diffusion_model.sample(
+                        condition=self.condition,
+                        num_demands=cfg.env.total_demand,
+                        grid_size=(cfg.env.map_size, cfg.env.map_size),
+                    )
             
             # Convert to static demands
             demands = self.converter.convert(output, mode=cfg.mode)

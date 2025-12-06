@@ -144,3 +144,65 @@ class DemandDiffusionModel(nn.Module):
         
         self.train()
         return x_t.squeeze(0)
+    
+    @torch.no_grad()
+    def sample_ddim(
+        self, 
+        condition: torch.Tensor, 
+        num_demands: int, 
+        grid_size: tuple[int, int],
+        num_inference_steps: int = 50,
+        eta: float = 0.0,
+    ) -> torch.Tensor:
+        """
+        DDIM sampling for faster generation (10-20x speedup).
+        
+        Args:
+            condition: Conditioning tensor
+            num_demands: Number of demands to generate
+            grid_size: Grid size tuple (not used, for API compatibility)
+            num_inference_steps: Number of denoising steps (default 50, vs 1000 for DDPM)
+            eta: DDIM stochasticity (0=deterministic, 1=DDPM-like)
+        
+        Returns:
+            Generated tensor of shape (num_demands, data_dim)
+        """
+        self.eval()
+        device = next(self.parameters()).device
+        
+        # Create timestep schedule (evenly spaced)
+        step_ratio = self.num_steps // num_inference_steps
+        timesteps = torch.arange(0, self.num_steps, step_ratio, device=device).flip(0)
+        
+        x_t = torch.randn((1, num_demands, self.data_dim), device=device)
+        
+        for i, t_int in enumerate(timesteps):
+            t = torch.full((1,), t_int.item(), device=device, dtype=torch.long)
+            
+            predicted_noise = self.predict_noise(x_t, t, condition)
+            
+            alpha_t = self.alphas_cumprod[t]
+            
+            # Get previous timestep
+            if i < len(timesteps) - 1:
+                t_prev = timesteps[i + 1]
+                alpha_t_prev = self.alphas_cumprod[t_prev]
+            else:
+                alpha_t_prev = torch.tensor(1.0, device=device)
+            
+            # DDIM update
+            pred_x0 = (x_t - torch.sqrt(1 - alpha_t) * predicted_noise) / torch.sqrt(alpha_t)
+            
+            # Direction pointing to x_t
+            dir_xt = torch.sqrt(1 - alpha_t_prev - eta**2 * (1 - alpha_t_prev) / (1 - alpha_t) * (1 - alpha_t / alpha_t_prev)) * predicted_noise
+            
+            # Random noise (only if eta > 0)
+            if eta > 0 and i < len(timesteps) - 1:
+                noise = torch.randn_like(x_t)
+                sigma = eta * torch.sqrt((1 - alpha_t_prev) / (1 - alpha_t) * (1 - alpha_t / alpha_t_prev))
+                x_t = torch.sqrt(alpha_t_prev) * pred_x0 + dir_xt + sigma * noise
+            else:
+                x_t = torch.sqrt(alpha_t_prev) * pred_x0 + dir_xt
+        
+        self.train()
+        return x_t.squeeze(0)

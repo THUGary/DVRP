@@ -241,11 +241,23 @@ class GeneratorTrainer:
         
         with torch.no_grad():
             model_for_sample.eval()
-            output = model_for_sample.sample(
-                condition=condition,
-                num_demands=cfg.env.total_demand,
-                grid_size=(cfg.env.map_size, cfg.env.map_size),
-            )
+            # Use DDIM for faster sampling (50 steps instead of 1000)
+            # This gives ~20x speedup with minimal quality loss
+            if hasattr(model_for_sample, 'sample_ddim'):
+                output = model_for_sample.sample_ddim(
+                    condition=condition,
+                    num_demands=cfg.env.total_demand,
+                    grid_size=(cfg.env.map_size, cfg.env.map_size),
+                    num_inference_steps=50,  # 50 steps vs 1000 for DDPM
+                    eta=0.0,  # Deterministic sampling
+                )
+            else:
+                # Fallback to DDPM
+                output = model_for_sample.sample(
+                    condition=condition,
+                    num_demands=cfg.env.total_demand,
+                    grid_size=(cfg.env.map_size, cfg.env.map_size),
+                )
         
         # Decode to demands
         demands = decode_demands_from_tensor(output, self.trainer_cfg)
