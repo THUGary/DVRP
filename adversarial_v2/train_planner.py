@@ -692,10 +692,11 @@ class PlannerTrainer:
         """Load planner checkpoint."""
         ckpt = torch.load(path, map_location=self.device)
         
+        target_model = unwrap_model(self.model) if self.distributed else self.model
         if self.config.mode == "static":
-            self.model.load_state_dict(ckpt["model_state_dict"])
+            target_model.load_state_dict(ckpt["model_state_dict"])
         else:
-            self.model.load_adapter_state_dict(ckpt["adapter_state"])
+            target_model.load_adapter_state_dict(ckpt["adapter_state"])
         
         if "optimizer_state_dict" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])

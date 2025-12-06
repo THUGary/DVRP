@@ -27,37 +27,35 @@ NUM_GPUS=4                       # Number of GPUs (1=single GPU, >1=DDP with tor
 
 # --- Co-evolution Settings ---
 NUM_CYCLES=10             # Number of co-evolution cycles
-PLANNER_EPOCHS=20        # Planner training epochs per cycle
-FIRST_CYCLE_PLANNER_EPOCHS=20  # First cycle planner epochs (leave empty to use PLANNER_EPOCHS)
-GENERATOR_EPOCHS=20      # Generator training epochs per cycle
+PLANNER_EPOCHS=50        # Planner training epochs per cycle
+FIRST_CYCLE_PLANNER_EPOCHS=400  # First cycle planner epochs (leave empty to use PLANNER_EPOCHS)
+GENERATOR_EPOCHS=50      # Generator training epochs per cycle
 
 # --- Planner Early Stopping (within each cycle) ---
 # Stop planner training early if score doesn't improve for PATIENCE epochs
 # Set to 0 or empty to disable early stopping
-PLANNER_EARLY_STOP_PATIENCE=5    # Number of epochs without improvement to trigger early stop
-PLANNER_EARLY_STOP_THRESHOLD=0.0001  # Minimum improvement threshold
+PLANNER_EARLY_STOP_PATIENCE=20    # Number of epochs without improvement to trigger early stop
+PLANNER_EARLY_STOP_THRESHOLD=0.1  # Minimum improvement threshold
 
 # --- Generator Early Stopping (within each cycle) ---
 # Stop generator training early if gen_reward doesn't improve for PATIENCE epochs
 # Set to 0 or empty to disable early stopping
-GENERATOR_EARLY_STOP_PATIENCE=5   # Number of epochs without improvement to trigger early stop (0 = disabled)
-GENERATOR_EARLY_STOP_THRESHOLD=0.0001  # Minimum improvement threshold for gen_reward
+GENERATOR_EARLY_STOP_PATIENCE=20   # Number of epochs without improvement to trigger early stop (0 = disabled)
+GENERATOR_EARLY_STOP_THRESHOLD=1  # Minimum improvement threshold for gen_reward
 
 # --- Batch Settings ---
-BATCH_SIZE=128            # Batch size for training
+BATCH_SIZE=512            # Batch size for training
 POMO_SIZE=100            # POMO parallel rollouts
-EPISODES_PER_EPOCH=512   # Episodes per epoch
+EPISODES_PER_EPOCH=10240   # Episodes per epoch
 
 # --- Problem Cache Settings ---
-# Caching diffusion-generated problems speeds up training significantly
-# since diffusion sampling is slow (~540ms/sample)
 # Memory usage: ~0.6 MB per 1000 problems per version (num_nodes=50)
-CACHE_REUSE_RATIO=0.6        # Probability of using cached problems (0.0=always generate, 1.0=always cache)
-MAX_PROBLEMS_PER_VERSION=10000 # Max problems to cache per generator version
-MIN_CACHE_SIZE_FOR_REUSE=100  # Minimum cache size before enabling reuse
+CACHE_REUSE_RATIO=0.7        # Probability of using cached problems (0.0=always generate, 1.0=always cache)
+MAX_PROBLEMS_PER_VERSION=30000 # Max problems to cache per generator version
+MIN_CACHE_SIZE_FOR_REUSE=5000  # Minimum cache size before enabling reuse
 
 # --- Version Sampling (to prevent policy cycling) ---
-VERSION_POLICY="latest_biased"  # "uniform", "latest_biased", "all"
+VERSION_POLICY="uniform"  # "uniform", "latest_biased", "all"
 LATEST_BIAS=0.3          # P(sample latest) when latest_biased
 
 # --- Environment Settings ---
