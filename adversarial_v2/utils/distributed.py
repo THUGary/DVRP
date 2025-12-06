@@ -211,12 +211,7 @@ def sync_params(model: nn.Module, src: int = 0):
 def barrier():
     """Synchronize all processes."""
     if is_distributed():
-        print(f"[Rank {dist.get_rank()}] entering barrier", flush=True)
-        try:
-            dist.barrier()
-        except Exception as e:
-            print(f"[Rank {dist.get_rank()}] barrier failed: {e}", flush=True)
-        print(f"[Rank {dist.get_rank()}] leaving barrier", flush=True)
+        dist.barrier()
 
 
 def print_rank0(*args, **kwargs):

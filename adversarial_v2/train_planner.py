@@ -647,39 +647,35 @@ class PlannerTrainer:
     
     def save_checkpoint(self, path: str, epoch: int, extra_state: Optional[Dict] = None):
         """Save planner checkpoint. Only saves on main process in distributed mode."""
-        # Only save on main process
-        if self.distributed and not is_main_process():
-            # Sync before returning to ensure all processes finish together
-            barrier()
-            return
+        # Only main process saves
+        if is_main_process():
+            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
             
-        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+            state = {
+                "epoch": epoch,
+                "mode": self.config.mode,
+            }
+            
+            # Unwrap DDP model to save raw model state
+            model_to_save = unwrap_model(self.model) if self.distributed else self.model
+            
+            if self.config.mode == "static":
+                state["model_state_dict"] = model_to_save.state_dict()
+            else:
+                state["adapter_state"] = model_to_save.adapter_state_dict()
+            
+            state["optimizer_state_dict"] = self.optimizer.state_dict()
+            
+            if extra_state:
+                state.update(extra_state)
+            
+            torch.save(state, path)
+            print_rank0(f"[PlannerTrainer] Saved checkpoint to {path}")
+            
+            # Also save problem cache to disk
+            self.problem_cache.save_all()
         
-        state = {
-            "epoch": epoch,
-            "mode": self.config.mode,
-        }
-        
-        # Unwrap DDP model to save raw model state
-        model_to_save = unwrap_model(self.model) if self.distributed else self.model
-        
-        if self.config.mode == "static":
-            state["model_state_dict"] = model_to_save.state_dict()
-        else:
-            state["adapter_state"] = model_to_save.adapter_state_dict()
-        
-        state["optimizer_state_dict"] = self.optimizer.state_dict()
-        
-        if extra_state:
-            state.update(extra_state)
-        
-        torch.save(state, path)
-        print_rank0(f"[PlannerTrainer] Saved checkpoint to {path}")
-        
-        # Also save problem cache to disk
-        self.problem_cache.save_all()
-        
-        # Sync after saving
+        # All processes sync here after saving is complete
         if self.distributed:
             barrier()
     

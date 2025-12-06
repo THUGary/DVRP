@@ -116,6 +116,9 @@ class GeneratorTrainer:
         # Initialize V2Planner for rollout (wraps the static model)
         self._init_v2_planner()
         
+        # Initialize static environment for batch rollout (optimization for static VRP)
+        self._init_static_env()
+        
         # Build config object for rollout
         self._build_trainer_cfg()
         
@@ -203,6 +206,24 @@ class GeneratorTrainer:
             max_time=cfg.env.max_time,
         )
         self._sync_planner_weights()
+    
+    def _init_static_env(self):
+        """Initialize StaticVRPEnv for batch rollout (used in static mode)."""
+        from models_v2.static_model import StaticVRPEnv
+        from configs import DEMAND_NORM
+        
+        cfg = self.config
+        
+        # Create static environment for batch evaluation
+        # This allows parallel evaluation of multiple problems
+        self.static_env = StaticVRPEnv(
+            problem_size=cfg.env.num_nodes,
+            pomo_size=1,  # We use pomo_size=1 for generator eval (single route per problem)
+            vehicle_capacity=cfg.env.capacity / DEMAND_NORM,  # Normalized capacity
+        )
+        # Note: StaticVRPEnv is not an nn.Module, tensors are created on device in load_problems
+        self.coord_norm = cfg.env.map_size
+        self.demand_norm = DEMAND_NORM
     
     def _sync_planner_weights(self):
         """Sync weights from planner_model to V2Planner."""
@@ -292,6 +313,179 @@ class GeneratorTrainer:
             static_mode=(self.config.mode == "static"),
         )
     
+    def generate_batch_demands(
+        self,
+        batch_size: int,
+        base_seed: int,
+    ) -> Tuple[List[List[Tuple[int, int, int, int, int]]], List[Tuple[int, int]]]:
+        """
+        Generate demands for a batch of episodes using DDIM sampling.
+        
+        Args:
+            batch_size: Number of episodes to generate
+            base_seed: Base seed for reproducibility
+            
+        Returns:
+            demands_list: List of demand lists for each episode
+            depots: List of depot locations for each episode
+        """
+        from training.generator.rl_utils import decode_demands_from_tensor, apply_static_constraints
+        
+        cfg = self.config
+        demands_list = []
+        depots = []
+        
+        # Get underlying model for sampling
+        model_for_sample = unwrap_model(self.model) if self.distributed else self.model
+        
+        for i in range(batch_size):
+            episode_seed = base_seed + i
+            rng = random.Random(episode_seed)
+            
+            # Randomize depot
+            if cfg.env.randomize_depot:
+                depot = (
+                    rng.randint(0, cfg.env.map_size - 1),
+                    rng.randint(0, cfg.env.map_size - 1)
+                )
+            else:
+                depot = cfg.env.depot
+            depots.append(depot)
+            
+            # Generate demands with DDIM
+            cond_params = {"depot": depot}
+            condition = prepare_condition(cond_params).unsqueeze(0).to(self.device)
+            
+            with torch.no_grad():
+                model_for_sample.eval()
+                if hasattr(model_for_sample, 'sample_ddim'):
+                    output = model_for_sample.sample_ddim(
+                        condition=condition,
+                        num_demands=cfg.env.total_demand,
+                        grid_size=(cfg.env.map_size, cfg.env.map_size),
+                        num_inference_steps=50,
+                        eta=0.0,
+                    )
+                else:
+                    output = model_for_sample.sample(
+                        condition=condition,
+                        num_demands=cfg.env.total_demand,
+                        grid_size=(cfg.env.map_size, cfg.env.map_size),
+                    )
+            
+            demands = decode_demands_from_tensor(output, self.trainer_cfg)
+            if cfg.mode == "static":
+                demands = apply_static_constraints(demands, cfg.env.max_time)
+            demands_list.append(demands)
+        
+        return demands_list, depots
+    
+    def batch_rollout_static(
+        self,
+        demands_list: List[List[Tuple[int, int, int, int, int]]],
+        depots: List[Tuple[int, int]],
+    ) -> List[Tuple[float, float, float]]:
+        """
+        Batch rollout for static VRP using the POMO model directly.
+        
+        This is much faster than serial rollouts because:
+        1. Single forward pass through the model for all problems
+        2. Parallelized on GPU
+        
+        Args:
+            demands_list: List of demand lists for each episode
+            depots: List of depot locations for each episode
+            
+        Returns:
+            List of (serviced_reward, total_demand_cap, total_failed_cap) tuples
+        """
+        batch_size = len(demands_list)
+        cfg = self.config
+        
+        # Prepare tensors for batch processing
+        depot_xy_list = []
+        node_xy_list = []
+        node_demand_list = []
+        total_caps = []
+        
+        for i, (demands, depot) in enumerate(zip(demands_list, depots)):
+            # Normalize depot coordinates
+            depot_norm = [depot[0] / self.coord_norm, depot[1] / self.coord_norm]
+            depot_xy_list.append([[depot_norm[0], depot_norm[1]]])
+            
+            # Normalize node coordinates and demands
+            node_coords = [[d[0] / self.coord_norm, d[1] / self.coord_norm] for d in demands]
+            node_demands = [d[3] / self.demand_norm for d in demands]
+            
+            node_xy_list.append(node_coords)
+            node_demand_list.append(node_demands)
+            total_caps.append(sum(d[3] for d in demands))
+        
+        # Stack into tensors
+        depot_xy = torch.tensor(depot_xy_list, dtype=torch.float32, device=self.device)
+        node_xy = torch.tensor(node_xy_list, dtype=torch.float32, device=self.device)
+        node_demand = torch.tensor(node_demand_list, dtype=torch.float32, device=self.device)
+        
+        # Load problems into static environment
+        self.static_env.load_problems(depot_xy, node_xy, node_demand, aug_factor=1)
+        
+        # Get the planner model (unwrap if DDP)
+        planner_model = unwrap_model(self.planner_model) if self.distributed else self.planner_model
+        planner_model.eval()
+        
+        # Run batch rollout
+        with torch.no_grad():
+            reset_state, _, _ = self.static_env.reset()
+            planner_model.pre_forward(reset_state)
+            
+            state, _, done = self.static_env.pre_step()
+            
+            while not done:
+                selected, _ = planner_model(state)
+                state, reward, done = self.static_env.step(selected)
+        
+        # reward shape: (batch, pomo_size) = (batch, 1) with pomo_size=1
+        # reward is negative tour length, so positive means shorter tours
+        # We convert to "serviced reward" which should be higher for better solutions
+        tour_lengths = -reward.squeeze(1)  # (batch,)
+        
+        # For static VRP with batch rollout:
+        # - tour_length is the total travel distance (normalized coordinates)
+        # - We need to return values compatible with compute_loss_for_episode
+        # 
+        # In the original serial rollout (_plan_episode):
+        # - serviced_reward = sum of capacities of serviced demands
+        # - total_demand_cap = sum of all demand capacities
+        # - failed_cap = capacity of unserviced demands
+        #
+        # For static VRP (all demands serviced):
+        # - serviced_reward ≈ total_demand_cap (all serviced)
+        # - failed_cap = 0
+        #
+        # But we want the generator to maximize tour_length (harder problems)
+        # So we use tour_length directly as a proxy:
+        # - Higher tour_length = harder problem = better for generator
+        # - We set serviced_reward = -tour_length * scale (lower is better for generator)
+        
+        results = []
+        for i in range(batch_size):
+            total_cap = total_caps[i]
+            tour_len = tour_lengths[i].item()
+            
+            # Scale tour_length to unnormalized coordinates (for consistent scale)
+            # tour_len is in [0,1] normalized space, scale back to grid space
+            tour_len_scaled = tour_len * self.coord_norm
+            
+            # Use tour_length as the "cost" that generator wants to maximize
+            # serviced_reward = -tour_length (lower reward for planner = higher for generator)
+            # This is consistent with the adversarial objective
+            serviced_reward = -tour_len_scaled
+            failed_cap = 0.0  # In static VRP, no demands fail
+            
+            results.append((serviced_reward, float(total_cap), failed_cap))
+        
+        return results
+    
     def compute_loss_for_episode(
         self,
         demands: List[Tuple[int, int, int, int, int]],
@@ -364,12 +558,14 @@ class GeneratorTrainer:
     
     def train_batch(self, batch_seed: int) -> Dict[str, float]:
         """
-        Train one batch using gradient accumulation.
+        Train one batch using gradient accumulation with batch rollout.
         
         In distributed mode:
         - Total batch_size episodes are split across GPUs
         - Each GPU processes local_batch_size = batch_size / num_gpus episodes
         - Gradients are accumulated locally, then DDP syncs on optimizer.step()
+        
+        For static VRP, uses batch_rollout_static for parallel evaluation.
         
         Args:
             batch_seed: Base seed for this batch
@@ -386,6 +582,22 @@ class GeneratorTrainer:
         if local_batch_size < 1:
             local_batch_size = 1
         
+        # Compute base seed for this GPU's portion
+        gpu_base_seed = batch_seed + rank * local_batch_size
+        
+        # Generate all demands and depots for this batch
+        demands_list, depots = self.generate_batch_demands(local_batch_size, gpu_base_seed)
+        
+        # Batch rollout (parallel evaluation)
+        if cfg.mode == "static":
+            rollout_results = self.batch_rollout_static(demands_list, depots)
+        else:
+            # Fallback to serial rollout for dynamic mode
+            rollout_results = []
+            for demands, depot in zip(demands_list, depots):
+                result = self.rollout(demands, depot)
+                rollout_results.append(result)
+        
         # Zero gradients at start of batch
         self.optimizer.zero_grad()
         
@@ -393,33 +605,16 @@ class GeneratorTrainer:
         total_loss = 0.0
         total_metrics = {}
         
-        for i in range(local_batch_size):
-            # Each GPU uses different seed offset based on rank
-            episode_seed = batch_seed + rank * local_batch_size + i
-            
-            # Randomize depot
-            rng = random.Random(episode_seed)
-            if cfg.env.randomize_depot:
-                depot = (
-                    rng.randint(0, cfg.env.map_size - 1),
-                    rng.randint(0, cfg.env.map_size - 1)
-                )
-            else:
-                depot = cfg.env.depot
-            
-            # Generate demands
-            demands = self.generate_demands(seed=episode_seed, depot=depot)
-            
-            # Rollout
-            serviced_reward, total_demand_cap, total_failed_cap = self.rollout(demands, depot)
-            
+        # Compute loss for each episode and accumulate gradients
+        for i, (demands, (serviced_reward, total_demand_cap, total_failed_cap)) in enumerate(
+            zip(demands_list, rollout_results)
+        ):
             # Compute loss (but don't step yet)
             loss, metrics = self.compute_loss_for_episode(
                 demands, serviced_reward, total_demand_cap, total_failed_cap
             )
             
             # Scale loss by local_batch_size for gradient accumulation
-            # This ensures the total gradient magnitude is independent of batch size
             scaled_loss = loss / local_batch_size
             scaled_loss.backward()
             
@@ -494,28 +689,26 @@ class GeneratorTrainer:
     
     def save_checkpoint(self, path: str, epoch: int, extra_state: Optional[Dict] = None):
         """Save generator checkpoint. Only saves on main process in distributed mode."""
-        # Only save on main process
-        if self.distributed and not is_main_process():
-            barrier()
-            return
+        # Only main process saves
+        if is_main_process():
+            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+            
+            # Unwrap DDP model to save raw state
+            model_to_save = unwrap_model(self.model) if self.distributed else self.model
+            
+            state = {
+                "epoch": epoch,
+                "model_state_dict": model_to_save.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "baseline": self.baseline,
+            }
+            if extra_state:
+                state.update(extra_state)
+            
+            torch.save(state, path)
+            print_rank0(f"[GeneratorTrainer] Saved checkpoint to {path}")
         
-        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-        
-        # Unwrap DDP model to save raw state
-        model_to_save = unwrap_model(self.model) if self.distributed else self.model
-        
-        state = {
-            "epoch": epoch,
-            "model_state_dict": model_to_save.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "baseline": self.baseline,
-        }
-        if extra_state:
-            state.update(extra_state)
-        
-        torch.save(state, path)
-        print_rank0(f"[GeneratorTrainer] Saved checkpoint to {path}")
-        
+        # All processes sync here after saving is complete
         if self.distributed:
             barrier()
     
