@@ -19,23 +19,26 @@ cd "$SCRIPT_DIR/.."
 # =============================================================================
 
 # --- Agent Settings ---
-NUM_AGENTS=10              # Number of vehicles
+NUM_AGENTS=2              # Number of vehicles
 
 # --- Demand Settings ---
 NUM_NODES=20               # Number of demand nodes
-TOTAL_DEMAND=80            # Upper limit of sum of all customer demands (capacity constraint)
+TOTAL_DEMAND=60            # Upper limit of sum of all customer demands (capacity constraint)
 
 # --- Environment Settings ---
-MAP_SIZE=50                # Square map side length (map is MAP_SIZE × MAP_SIZE)
-TARGET_VEHICLES=10         # Target number of vehicles (usually same as NUM_AGENTS)
+MAP_SIZE=30                # Square map side length (map is MAP_SIZE × MAP_SIZE)
+TARGET_VEHICLES=2         # Target number of vehicles (usually same as NUM_AGENTS)
 
 # --- Training Parameters ---
-EPOCHS=500                 # Training epochs (500-2000 for good results)
+EPOCHS=2000                 # Training epochs (500-2000 for good results)
 EPISODES_PER_EPOCH=10000   # Episodes per epoch
 BATCH_SIZE=64              # Batch size
 LR="1e-4"                  # Learning rate
 POMO_SIZE=100              # Parallel rollouts (50-100 recommended)
 AUG_FACTOR=1               # Data augmentation (1 or 8)
+
+PATIENCE=50                # Early stopping patience
+THRESHOLD=0.0001            # Early stopping improvement threshold
 
 # --- Model Architecture ---
 EMBEDDING_DIM=128
@@ -78,6 +81,8 @@ echo "    Batch size:         $BATCH_SIZE"
 echo "    Learning rate:      $LR"
 echo "    Save directory:     $SAVE_DIR"
 echo "    Device:             $DEVICE"
+echo "    Early stopping patience: $PATIENCE"
+echo "    Early stopping threshold: $THRESHOLD"
 if [[ -n "$RESUME_FROM" ]]; then
     echo "    Resume from:        $RESUME_FROM"
 fi
@@ -105,6 +110,8 @@ cmd=(
     --lr "$LR"
     --save-dir "$SAVE_DIR"
     --device "$DEVICE"
+    --patience "$PATIENCE"
+    --threshold "$THRESHOLD"
 )
 
 if [[ -n "$RESUME_FROM" ]]; then

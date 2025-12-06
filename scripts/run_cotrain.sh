@@ -23,30 +23,30 @@ echo "Working directory: $(pwd)"
 MODE="static"                    # "static" or "dynamic"
 
 # --- Multi-GPU Settings ---
-NUM_GPUS=1                       # Number of GPUs (1=single GPU, >1=DDP with torchrun)
+NUM_GPUS=4                       # Number of GPUs (1=single GPU, >1=DDP with torchrun)
 
 # --- Co-evolution Settings ---
-NUM_CYCLES=5             # Number of co-evolution cycles
-PLANNER_EPOCHS=1        # Planner training epochs per cycle
-FIRST_CYCLE_PLANNER_EPOCHS=1  # First cycle planner epochs (leave empty to use PLANNER_EPOCHS)
-GENERATOR_EPOCHS=1      # Generator training epochs per cycle
+NUM_CYCLES=10             # Number of co-evolution cycles
+PLANNER_EPOCHS=20        # Planner training epochs per cycle
+FIRST_CYCLE_PLANNER_EPOCHS=20  # First cycle planner epochs (leave empty to use PLANNER_EPOCHS)
+GENERATOR_EPOCHS=20      # Generator training epochs per cycle
 
 # --- Planner Early Stopping (within each cycle) ---
 # Stop planner training early if score doesn't improve for PATIENCE epochs
 # Set to 0 or empty to disable early stopping
-PLANNER_EARLY_STOP_PATIENCE=15    # Number of epochs without improvement to trigger early stop
-PLANNER_EARLY_STOP_THRESHOLD=0.01  # Minimum improvement threshold
+PLANNER_EARLY_STOP_PATIENCE=5    # Number of epochs without improvement to trigger early stop
+PLANNER_EARLY_STOP_THRESHOLD=0.0001  # Minimum improvement threshold
 
 # --- Generator Early Stopping (within each cycle) ---
 # Stop generator training early if gen_reward doesn't improve for PATIENCE epochs
 # Set to 0 or empty to disable early stopping
-GENERATOR_EARLY_STOP_PATIENCE=10   # Number of epochs without improvement to trigger early stop (0 = disabled)
-GENERATOR_EARLY_STOP_THRESHOLD=0.1  # Minimum improvement threshold for gen_reward
+GENERATOR_EARLY_STOP_PATIENCE=5   # Number of epochs without improvement to trigger early stop (0 = disabled)
+GENERATOR_EARLY_STOP_THRESHOLD=0.0001  # Minimum improvement threshold for gen_reward
 
 # --- Batch Settings ---
-BATCH_SIZE=32            # Batch size for training
+BATCH_SIZE=128            # Batch size for training
 POMO_SIZE=100            # POMO parallel rollouts
-EPISODES_PER_EPOCH=128   # Episodes per epoch
+EPISODES_PER_EPOCH=512   # Episodes per epoch
 
 # --- Problem Cache Settings ---
 # Caching diffusion-generated problems speeds up training significantly
@@ -72,8 +72,8 @@ MAX_END_TIME=1200        # Max deadline for static demands (when nodes disappear
 # TERMINOLOGY:
 #   - NUM_NODES: Actual number of demand nodes (for tensor shapes)
 #   - TOTAL_DEMAND: Upper limit of sum of all demands (capacity constraint, NOT node count)
-NUM_NODES=30             # Number of demand nodes (reduce for limited VRAM)
-TOTAL_DEMAND=100          # Upper limit of sum of all demands
+NUM_NODES=20             # Number of demand nodes (reduce for limited VRAM)
+TOTAL_DEMAND=60          # Upper limit of sum of all demands
 MAX_C=5                  # Max demand per node (demands 1 to max_c)
 MIN_LIFETIME=10          # Min demand lifetime
 MAX_LIFETIME=50          # Max demand lifetime
@@ -84,11 +84,11 @@ DEVICE="cuda"            # "cuda" or "cpu"
 SEED=42                  # Random seed
 
 # --- Checkpoints (optional, for loading pretrained models) ---
-PLANNER_INITIALIZE="checkpoints/cotrain/static_20251203_104147/planner_cycle_1.pt"    # Path to pretrained planner (leave empty if none)
+PLANNER_INITIALIZE="checkpoints/static_vrp_v2/best_n20.pt"    # Path to pretrained planner (leave empty if none)
 # Path to pretrained diffusion generator checkpoint
 # Recommended: use a supervised-trained model to avoid random initialization
 # Example: "checkpoints/diffusion_model.pth"
-GENERATOR_INITIALIZE="checkpoints/diffusion_model.pth"
+GENERATOR_INITIALIZE="checkpoints/rl_generator/greedy_static_20251205-142015/best.pth"
 RESUME_FROM=""           # Resume from checkpoint directory (leave empty if none)
 
 # --- Output ---

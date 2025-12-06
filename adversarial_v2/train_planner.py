@@ -104,7 +104,7 @@ class PlannerTrainer:
         
         # Wrap planner model with DDP if distributed
         if self.distributed:
-            self.model = wrap_model_ddp(self.model, device_ids=[self.local_rank])
+            self.model = wrap_model_ddp(self.model, self.device)
             print_rank0(f"[PlannerTrainer] Wrapped planner model with DDP on rank {self.local_rank}")
         
         self._init_optimizer()
@@ -403,7 +403,13 @@ class PlannerTrainer:
         
         # Reset
         reset_state, _, _ = self.static_env.reset()
-        self.model.pre_forward(reset_state)
+        
+        # `self.model` may be a DistributedDataParallel wrapper. `pre_forward` is
+        # a custom method on the underlying module, not on DDP. Call it on the
+        # unwrapped module to avoid AttributeError while keeping forward passes
+        # through the DDP wrapper for correct gradient syncing.
+        model_for_state = unwrap_model(self.model) if self.distributed else self.model
+        model_for_state.pre_forward(reset_state)
         
         # Collect rollout (same as train_static.py)
         prob_list = []
@@ -468,23 +474,48 @@ class PlannerTrainer:
             Dictionary of training metrics
         """
         cfg = self.config
-        n_batches = cfg.episodes_per_epoch // cfg.batch_size
-        
-        total_score = 0.0
-        total_loss = 0.0
-        version_counts = {}
-        total_from_cache = 0
-        total_freshly_generated = 0
-        
+        n_batches_total = cfg.episodes_per_epoch // cfg.batch_size
+
+        # Determine per-process batch allocation when distributed
+        world_size = get_world_size() if is_distributed() else 1
+        rank = get_rank() if is_distributed() else 0
+
+        if n_batches_total == 0:
+            # Nothing to run
+            return {
+                "score": 0.0,
+                "loss": 0.0,
+                "version_counts": {},
+                "cache_stats": {
+                    "from_cache": 0,
+                    "freshly_generated": 0,
+                    "cache_hit_rate": 0.0,
+                    "total_cached_problems": self.problem_cache.get_cache_stats()["total_problems"],
+                },
+            }
+
+        base = n_batches_total // world_size
+        rem = n_batches_total % world_size
+        local_n_batches = base + (1 if rank < rem else 0)
+
+        # Local accumulators
+        local_total_score = 0.0
+        local_total_loss = 0.0
+        local_version_counts: Dict[int, int] = {}
+        local_from_cache = 0
+        local_freshly_generated = 0
+
         # Get latest version ID for cache decision
         latest_version_id = self.registry.latest().version_id if not self.registry.is_empty() else -1
-        
-        for batch_idx in range(n_batches):
+
+        for local_idx in range(local_n_batches):
+            # Note: each process will sample its own versions; this avoids duplicated
+            # work across GPUs when generating fresh problems.
             if use_diffusion and not self.registry.is_empty():
                 # Sample generator version
                 if cfg.version_sample_policy == "all":
-                    # Round-robin through all versions
-                    version = self.registry.all_versions()[batch_idx % self.registry.num_versions()]
+                    # Round-robin across versions but offset by rank/local_idx
+                    version = self.registry.all_versions()[(local_idx * world_size + rank) % self.registry.num_versions()]
                 else:
                     version = self.registry.sample(
                         policy=cfg.version_sample_policy,
@@ -492,39 +523,53 @@ class PlannerTrainer:
                         rng=self.rng,
                     )
                 version_id = version.version_id
-                version_counts[version_id] = version_counts.get(version_id, 0) + 1
-                
-                # Determine if this is the latest version
-                # Latest version: always generate fresh problems (adversarial challenge)
-                # Historical versions: use cache according to cache_reuse_ratio
+                local_version_counts[version_id] = local_version_counts.get(version_id, 0) + 1
+
                 is_latest = (version_id == latest_version_id)
-                
-                # Train with diffusion-generated problems (with caching)
+
                 score, loss, cache_stats = self.train_static_batch_with_diffusion(
                     version, is_latest_version=is_latest
                 )
-                total_from_cache += cache_stats.get("from_cache", 0)
-                total_freshly_generated += cache_stats.get("freshly_generated", 0)
+                local_from_cache += cache_stats.get("from_cache", 0)
+                local_freshly_generated += cache_stats.get("freshly_generated", 0)
             else:
-                # Train with random problems (reuse train_static.py)
                 version_id = 0
                 score, loss = self.train_static_batch_random()
-            
-            total_score += score
-            total_loss += loss
-            
-            if (batch_idx + 1) % 10 == 0:
-                cache_rate = total_from_cache / max(1, total_from_cache + total_freshly_generated) * 100
+
+            local_total_score += score
+            local_total_loss += loss
+
+            # Periodic logging from rank 0 only to avoid clutter
+            if is_main_process() and ((local_idx + 1) % 10 == 0 or (local_idx + 1) == local_n_batches):
+                cache_rate = local_from_cache / max(1, local_from_cache + local_freshly_generated) * 100
                 is_latest_str = " [LATEST]" if (use_diffusion and not self.registry.is_empty() and version_id == latest_version_id) else ""
-                print_rank0(f"  Batch {batch_idx+1}/{n_batches}: score={score:.4f}, loss={loss:.4f}, "
+                print_rank0(f"  Rank {rank} local batch {local_idx+1}/{local_n_batches}: score={score:.4f}, loss={loss:.4f}, "
                       f"gen_v{version_id}{is_latest_str}, cache_rate={cache_rate:.0f}%")
-        
-        avg_score = total_score / n_batches
-        avg_loss = total_loss / n_batches
-        
-        # Log cache statistics
-        cache_stats_summary = self.problem_cache.get_cache_stats()
-        
+
+        # Aggregate numeric metrics across processes
+        # Convert to tensors and sum across processes, then compute averages
+        total_score_t = reduce_tensor(torch.tensor(local_total_score, device=self.device), op="sum")
+        total_loss_t = reduce_tensor(torch.tensor(local_total_loss, device=self.device), op="sum")
+        from_cache_t = reduce_tensor(torch.tensor(local_from_cache, device=self.device), op="sum")
+        fresh_t = reduce_tensor(torch.tensor(local_freshly_generated, device=self.device), op="sum")
+
+        total_score = total_score_t.item()
+        total_loss = total_loss_t.item()
+        total_from_cache = int(from_cache_t.item())
+        total_freshly_generated = int(fresh_t.item())
+
+        # Compute global averages using the original total batch count
+        avg_score = total_score / n_batches_total
+        avg_loss = total_loss / n_batches_total
+
+        # Version counts: provide only local counts on non-main ranks. The main
+        # process will return its own local counts (aggregating across ranks is
+        # more involved and can be added if needed).
+        version_counts = local_version_counts if is_main_process() else {}
+
+        # Log cache statistics (only main process)
+        cache_stats_summary = self.problem_cache.get_cache_stats() if is_main_process() else {"total_problems": 0}
+
         return {
             "score": avg_score,
             "loss": avg_loss,

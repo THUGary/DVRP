@@ -18,8 +18,8 @@ cd "$SCRIPT_DIR/.."
 NUM_AGENTS=2              # Number of vehicles
 
 # --- Demand Settings ---
-NUM_NODES=30               # Number of demand nodes
-TOTAL_DEMAND=100            # Upper limit of sum of all customer demands (NOT node count!)
+NUM_NODES=20               # Number of demand nodes
+TOTAL_DEMAND=60            # Upper limit of sum of all customer demands (NOT node count!)
 MAX_C=5                    # Max demand per node (demands 1 to max_c)
 CAPACITY=30                # Vehicle capacity (fixed for model)
 
@@ -44,13 +44,19 @@ RULE_MODES="optimize,greedy,heuristic"
 GLOBAL_OPT_MODES=""
 
 # Model checkpoints (comma-separated, or "label=path" format)
-MODEL_CHECKPOINTS="checkpoints/cotrain/static_20251203_182634/planner_cycle_1.pt"
+MODEL_CHECKPOINTS="checkpoints/cotrain/static_20251205_144853/planner_cycle_1_best.pt"
 
 # --- Diffusion Generator Checkpoints (for additional distribution evaluation) ---
 # These diffusion models generate demand distributions for planner testing
 # Supports label=path format, comma-separated
 # Example: "adv=checkpoints/diffusion_adv.pth,baseline=checkpoints/diffusion_model.pth"
-DIFFUSION_CHECKPOINTS="version1=checkpoints/cotrain/static_20251203_182634/generator_cycle_1.pth,version5=checkpoints/cotrain/static_20251203_182634/generator_cycle_5.pth"
+DIFFUSION_CHECKPOINTS="version0=checkpoints/cotrain/static_20251205_144853/generator_v0.pth,version1=checkpoints/cotrain/static_20251205_144853/generator_cycle_1.pth,version2=checkpoints/cotrain/static_20251205_144853/generator_cycle_2.pth,version3=checkpoints/cotrain/static_20251205_144853/generator_cycle_3.pth,version4=checkpoints/cotrain/static_20251205_144853/generator_cycle_4.pth,version5=checkpoints/cotrain/static_20251205_144853/generator_cycle_5.pth"
+SEED_BASE=42
+
+# --- Diffusion Problem Bank (optional two-stage workflow) ---
+PROBLEM_BANK_IN=""     # Existing JSON file to read pregenerated diffusion problems
+PROBLEM_BANK_OUT=""    # Output JSON file to store generated diffusion problems
+GENERATE_ONLY="false"  # "true" to only (re)generate problems without running planners
 
 # --- Output Settings ---
 OUT_DIR="outputs/eval"
@@ -94,6 +100,9 @@ echo "    Rule modes:         $RULE_MODES"
 echo "    Global opt:         $GLOBAL_OPT_MODES"
 echo "    Model ckpts:        $MODEL_CHECKPOINTS"
 echo "    Diffusion ckpts:    ${DIFFUSION_CHECKPOINTS:-<none>}"
+echo "    Problem bank in:    ${PROBLEM_BANK_IN:-<none>}"
+echo "    Problem bank out:   ${PROBLEM_BANK_OUT:-<none>}"
+echo "    Generate only:      ${GENERATE_ONLY}"
 echo "    POMO size:          $POMO_SIZE"
 echo "    Aug factor:         $AUG_FACTOR"
 echo "    Max steps:          ${MAX_STEPS:-<unlimited>}"
@@ -148,8 +157,20 @@ for ckpt in "${DIFFUSION_ENTRIES[@]}"; do
     fi
 done
 
+# Validate problem bank inputs
+if [[ -n "$PROBLEM_BANK_IN" && ! -f "$PROBLEM_BANK_IN" ]]; then
+    echo "ERROR: Problem bank input file not found: $PROBLEM_BANK_IN"
+    exit 1
+fi
+
+if [[ "${GENERATE_ONLY}" == "true" && -z "$PROBLEM_BANK_OUT" ]]; then
+    echo "ERROR: GENERATE_ONLY=true requires PROBLEM_BANK_OUT to be set"
+    exit 1
+fi
+
 cmd+=(
     python3 evaluate_distributions.py
+    --seed-base "$SEED_BASE"
     --num-runs "$NUM_RUNS"
     --num-agents "$NUM_AGENTS"
     --num-nodes "$NUM_NODES"
@@ -183,6 +204,18 @@ cmd+=("${MODEL_ENTRIES[@]}")
 if [[ ${#DIFFUSION_ENTRIES[@]} -gt 0 ]]; then
     cmd+=(--diffusion-checkpoints)
     cmd+=("${DIFFUSION_ENTRIES[@]}")
+fi
+
+if [[ -n "$PROBLEM_BANK_IN" ]]; then
+    cmd+=(--problem-bank-in "$PROBLEM_BANK_IN")
+fi
+
+if [[ -n "$PROBLEM_BANK_OUT" ]]; then
+    cmd+=(--problem-bank-out "$PROBLEM_BANK_OUT")
+fi
+
+if [[ "${GENERATE_ONLY}" == "true" ]]; then
+    cmd+=(--generate-only)
 fi
 
 if [[ -n "$CAPACITY" ]]; then

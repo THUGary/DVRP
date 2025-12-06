@@ -19,6 +19,15 @@ from dataclasses import dataclass, field
 import os
 import matplotlib.pyplot as plt
 import numpy as np
+import sys
+
+# Add project root to path to import configs
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+try:
+    from configs import DEMAND_NORM
+except ImportError:
+    DEMAND_NORM = 30.0  # Fallback if import fails
+
 
 
 @dataclass
@@ -135,7 +144,7 @@ class TrainingVisualizer:
         self._plot_single_metric(
             data=self.metrics.planner_scores,
             title=f"Planner Score (Cycle {cycle})",
-            ylabel="Score",
+            ylabel="Score (Avg Distance)",
             color="green",
             save_path=self.plot_paths["planner_score"],
             show_best=True,
@@ -149,21 +158,30 @@ class TrainingVisualizer:
             save_path=self.plot_paths["generator_loss"],
         )
         
+        # Normalize generator rewards for better visualization
+        # Divide by DEMAND_NORM to make it comparable to capacity units
+        gen_rewards_norm = [(s, r / DEMAND_NORM) for s, r in self.metrics.generator_rewards]
+        
         self._plot_single_metric(
-            data=self.metrics.generator_rewards,
-            title=f"Generator Reward (Cycle {cycle})",
-            ylabel="Reward",
+            data=gen_rewards_norm,
+            title=f"Generator Reward (Normalized) (Cycle {cycle})",
+            ylabel="Reward / Capacity",
             color="orange",
             save_path=self.plot_paths["generator_reward"],
             show_zero_line=True,
+            smoothing_window=20,  # Higher smoothing for high variance
         )
         
+        # Invert planner rewards to show positive distance (comparable to score)
+        planner_rewards_pos = [(s, -r) for s, r in self.metrics.planner_rewards]
+        
         self._plot_single_metric(
-            data=self.metrics.planner_rewards,
-            title=f"Planner Reward (Cycle {cycle})",
-            ylabel="Reward",
+            data=planner_rewards_pos,
+            title=f"Planner Reward (Distance) (Cycle {cycle})",
+            ylabel="Distance",
             color="purple",
             save_path=self.plot_paths["planner_reward"],
+            smoothing_window=10,
         )
         
         # Create overview plot
@@ -180,6 +198,7 @@ class TrainingVisualizer:
         save_path: str,
         show_best: bool = False,
         show_zero_line: bool = False,
+        smoothing_window: int = 5,
     ):
         """
         Plot a single metric with gaps where data doesn't exist.
@@ -192,6 +211,7 @@ class TrainingVisualizer:
             save_path: Path to save the plot
             show_best: If True, show running best line
             show_zero_line: If True, show y=0 reference line
+            smoothing_window: Window size for smoothing
         """
         fig, ax = plt.subplots(figsize=(10, 5))
         
@@ -203,8 +223,8 @@ class TrainingVisualizer:
             ax.plot(steps, values, f'{color[0]}-', linewidth=2, label=ylabel, alpha=0.8)
             
             # Add smoothed line if enough data
-            if len(values) > 5:
-                smoothed = self._smooth(values)
+            if len(values) > smoothing_window:
+                smoothed = self._smooth(values, window=smoothing_window)
                 ax.plot(steps, smoothed, f'{color[0]}--', linewidth=1, alpha=0.5, label=f'{ylabel} (smoothed)')
             
             # Show running best for score
@@ -239,13 +259,17 @@ class TrainingVisualizer:
         fig, axes = plt.subplots(2, 3, figsize=(15, 8))
         fig.suptitle(f'Training Overview (Cycle {cycle})', fontsize=14, fontweight='bold')
         
+        # Prepare normalized data
+        gen_rewards_norm = [(s, r / DEMAND_NORM) for s, r in self.metrics.generator_rewards]
+        planner_rewards_pos = [(s, -r) for s, r in self.metrics.planner_rewards]
+        
         # Plot configurations: (data, title, ylabel, color, ax_position, options)
         plot_configs = [
             (self.metrics.planner_losses, 'Planner Loss', 'Loss', 'blue', (0, 0), {}),
             (self.metrics.planner_scores, 'Planner Score', 'Score', 'green', (0, 1), {'show_best': True}),
             (self.metrics.generator_losses, 'Generator Loss', 'Loss', 'red', (0, 2), {}),
-            (self.metrics.generator_rewards, 'Generator Reward', 'Reward', 'orange', (1, 0), {'show_zero_line': True}),
-            (self.metrics.planner_rewards, 'Planner Reward', 'Reward', 'purple', (1, 1), {}),
+            (gen_rewards_norm, 'Generator Reward (Norm)', 'Reward/Cap', 'orange', (1, 0), {'show_zero_line': True, 'smoothing_window': 20}),
+            (planner_rewards_pos, 'Planner Reward (Dist)', 'Distance', 'purple', (1, 1), {'smoothing_window': 10}),
         ]
         
         for data, title, ylabel, color, (row, col), options in plot_configs:
@@ -257,8 +281,9 @@ class TrainingVisualizer:
                 
                 ax.plot(steps, values, f'{color[0]}-', linewidth=1.5, alpha=0.8)
                 
-                if len(values) > 5:
-                    smoothed = self._smooth(values)
+                smoothing_window = options.get('smoothing_window', 5)
+                if len(values) > smoothing_window:
+                    smoothed = self._smooth(values, window=smoothing_window)
                     ax.plot(steps, smoothed, f'{color[0]}--', linewidth=1, alpha=0.4)
                 
                 if options.get('show_best') and len(values) > 0:
@@ -295,7 +320,8 @@ class TrainingVisualizer:
         
         if len(self.metrics.generator_rewards) > 0:
             latest_gen_reward = self.metrics.generator_rewards[-1][1]
-            summary_text += f"Generator Reward:\n  Latest: {latest_gen_reward:.2f}\n"
+            latest_gen_reward_norm = latest_gen_reward / DEMAND_NORM
+            summary_text += f"Generator Reward:\n  Latest: {latest_gen_reward:.2f}\n  Norm: {latest_gen_reward_norm:.2f}\n"
         
         ax_info.text(0.1, 0.9, summary_text, transform=ax_info.transAxes, fontsize=10,
                     verticalalignment='top', fontfamily='monospace',

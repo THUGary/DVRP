@@ -98,7 +98,7 @@ class Config:
         # - total_demand: limit by sum of all demand capacities (legacy)
         "num_nodes": 20,  # Number of demand nodes to generate
         "total_demand": 60,  # Legacy: upper limit of sum of all demands (used if num_nodes not set)
-        "max_c": 10, # from 1 to 10
+        "max_c": 5, # from 1 to 10
         "min_lifetime": 40,
         "max_lifetime": 50,
         "min_service_time": 1,

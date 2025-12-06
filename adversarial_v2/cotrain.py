@@ -16,6 +16,9 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import faulthandler
+
+faulthandler.enable()
 
 from adversarial_v2.config import CoevolutionConfig, EnvironmentConfig
 from adversarial_v2.coevolution import coevolution_loop
@@ -186,6 +189,8 @@ def main():
     num_gpus = args.num_gpus
     if "WORLD_SIZE" in os.environ:
         num_gpus = int(os.environ["WORLD_SIZE"])
+
+    print(f"Using {num_gpus} GPUs, local rank {local_rank}")
     
     # =================================================================
     # Build config dataclasses from CLI arguments (single entry point)
@@ -236,6 +241,8 @@ def main():
         generator_checkpoint=args.generator_checkpoint,
         env=env_config,
     )
+
+    print("Coevolution Loop begin")
     
     # =================================================================
     # Run training (pass config object, not individual args)

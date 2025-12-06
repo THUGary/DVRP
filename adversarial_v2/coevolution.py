@@ -53,7 +53,8 @@ def coevolution_loop(
     distributed = num_gpus > 1
     
     if distributed:
-        setup_distributed()
+        torch.cuda.set_device(local_rank)
+        setup_distributed(num_gpus, local_rank)
         print_rank0(f"[Distributed] Initialized DDP with {num_gpus} GPUs")
     
     print_rank0("=" * 60)
@@ -214,6 +215,9 @@ def coevolution_loop(
                     best_score_in_cycle = current_score
                     epochs_without_improvement = 0
                     print_rank0(f"  -> [Early Stop] New best score: {best_score_in_cycle:.4f}")
+                    # Save planner checkpoint
+                    best_planner_ckpt_path = os.path.join(config.save_dir, f"planner_cycle_{cycle}_best.pt")
+                    planner_trainer.save_checkpoint(best_planner_ckpt_path, epoch=cycle)
                 else:
                     # No significant improvement
                     epochs_without_improvement += 1

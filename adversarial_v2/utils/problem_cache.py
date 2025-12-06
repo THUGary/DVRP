@@ -20,6 +20,8 @@ import random
 import torch
 import numpy as np
 from pathlib import Path
+from .distributed import is_distributed, is_main_process
+import os
 
 
 @dataclass
@@ -153,17 +155,29 @@ class VersionProblemCache:
         """Persist cache to disk."""
         if not self.cache_dir:
             return
-        
         os.makedirs(self.cache_dir, exist_ok=True)
-        
-        # Save as tensor file for efficiency
+
+        # Save atomically to avoid partial writes when multiple processes
+        # or interruptions occur. Write to a temp file then replace.
         data = {
             "version_id": self.version_id,
             "creation_time": self._creation_time,
             "problems": [p.to_dict() for p in self._problems],
         }
-        torch.save(data, self._cache_path)
-        print(f"[ProblemCache] Saved {len(self._problems)} problems for v{self.version_id}")
+        tmp_path = f"{self._cache_path}.tmp.{os.getpid()}"
+        try:
+            torch.save(data, tmp_path)
+            # Atomic replace
+            os.replace(tmp_path, self._cache_path)
+            print(f"[ProblemCache] Saved {len(self._problems)} problems for v{self.version_id}")
+        except Exception as e:
+            print(f"[ProblemCache] Failed to save cache v{self.version_id}: {e}")
+            # Cleanup tmp file if exists
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
     
     def _load_from_disk(self):
         """Load cache from disk if exists."""
@@ -374,6 +388,11 @@ class ProblemCacheManager:
     
     def save_all(self):
         """Save all caches to disk."""
+        # In distributed training avoid multiple processes writing the same
+        # cache files concurrently. Only the main process performs disk writes.
+        if is_distributed() and not is_main_process():
+            return
+
         for cache in self._version_caches.values():
             cache.save_to_disk()
     

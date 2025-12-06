@@ -1,8 +1,9 @@
 import argparse
 import copy
+import json
 import os
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 
 import numpy as np
 import matplotlib
@@ -16,6 +17,166 @@ from agent.generator.distribution_sets import SUPPORTED_DEMAND_DISTRIBUTIONS
 
 # 支持的分布名称
 DISTRIBUTIONS = list(SUPPORTED_DEMAND_DISTRIBUTIONS)
+
+
+class DiffusionProblemBank:
+    """Store and reuse diffusion-generated problems for reproducibility."""
+
+    def __init__(self, load_path: Optional[str] = None):
+        self._store: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._load_path = load_path
+        self._save_path: Optional[str] = None
+        self._dirty = False
+        if load_path:
+            self._load(load_path)
+
+    def _load(self, path: str) -> None:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Problem bank not found: {path}")
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        problems = raw.get("problems", raw)
+        if not isinstance(problems, dict):
+            raise ValueError(f"Malformed problem bank: {path}")
+        self._store = problems
+
+    def assign_save_path(self, path: Optional[str]) -> None:
+        self._save_path = path
+
+    @staticmethod
+    def _serialize_demands(demands: List[tuple]) -> List[List[int]]:
+        result: List[List[int]] = []
+        for demand in demands:
+            if len(demand) < 5:
+                continue
+            x, y, t, c, end_t = demand
+            result.append([int(x), int(y), int(t), int(c), int(end_t)])
+        return result
+
+    @staticmethod
+    def _deserialize_demands(entry: List[List[int]]) -> List[tuple]:
+        restored: List[tuple] = []
+        for demand in entry:
+            if len(demand) < 5:
+                continue
+            x, y, t, c, end_t = demand[:5]
+            restored.append((int(x), int(y), int(t), int(c), int(end_t)))
+        return restored
+
+    def list_distributions(self, *, static_demands: Optional[bool] = None) -> List[str]:
+        names: Set[str] = set()
+        for label, seed_map in self._store.items():
+            if static_demands is None:
+                names.add(label)
+                continue
+            for entry in seed_map.values():
+                meta = entry.get("meta", {}) if isinstance(entry, dict) else {}
+                meta_static = meta.get("static_demands")
+                if meta_static is None or meta_static == static_demands:
+                    names.add(label)
+                    break
+        return sorted(names)
+
+    def get(
+        self,
+        label: str,
+        seed: int,
+        *,
+        num_nodes: Optional[int],
+        static_demands: bool,
+    ) -> Optional[List[tuple]]:
+        seed_entries = self._store.get(label)
+        if not isinstance(seed_entries, dict):
+            return None
+        entry = seed_entries.get(str(seed))
+        if not isinstance(entry, dict):
+            return None
+        meta = entry.get("meta", {})
+        meta_nodes = meta.get("num_nodes")
+        if meta_nodes is not None and num_nodes is not None and meta_nodes != num_nodes:
+            return None
+        meta_static = meta.get("static_demands")
+        if meta_static is not None and meta_static != static_demands:
+            return None
+        serialized = entry.get("demands", [])
+        if not isinstance(serialized, list):
+            return None
+        if num_nodes is not None and len(serialized) not in (0, num_nodes):
+            return None
+        return self._deserialize_demands(serialized)
+
+    def set(
+        self,
+        label: str,
+        seed: int,
+        demands: List[tuple],
+        meta: Dict[str, Any],
+    ) -> None:
+        serialized = self._serialize_demands(demands)
+        label_store = self._store.setdefault(label, {})
+        label_store[str(seed)] = {"demands": serialized, "meta": meta}
+        self._dirty = True
+
+    def save(self, path: Optional[str] = None) -> None:
+        target = path or self._save_path or self._load_path
+        if not target or (not self._dirty and path is None):
+            return
+        folder = os.path.dirname(target)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        payload = {"version": 1, "problems": self._store}
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        self._dirty = False
+
+
+def _precompute_diffusion_demands(
+    diffusion_map: Dict[str, Optional["DiffusionDistributionGenerator"]],
+    seed_values: List[int],
+    num_nodes: int,
+    static_demands: bool,
+    problem_bank: Optional[DiffusionProblemBank],
+) -> Dict[tuple[str, int], List[tuple]]:
+    """Generate or load diffusion problems once per (label, seed)."""
+
+    cache: Dict[tuple[str, int], List[tuple]] = {}
+    if not diffusion_map or not seed_values:
+        return cache
+
+    for label, generator in diffusion_map.items():
+        for seed_value in seed_values:
+            demands: Optional[List[tuple]] = None
+            if problem_bank:
+                demands = problem_bank.get(
+                    label,
+                    seed_value,
+                    num_nodes=num_nodes,
+                    static_demands=static_demands,
+                )
+            if demands is None:
+                if generator is None:
+                    raise ValueError(
+                        f"Problem bank missing diffusion instances for '{label}' (seed={seed_value})."
+                    )
+                demands = generator.generate_demands(
+                    num_nodes=num_nodes,
+                    seed=seed_value,
+                    static_demands=static_demands,
+                )
+                if problem_bank:
+                    meta = {
+                        "num_nodes": num_nodes,
+                        "static_demands": static_demands,
+                        "map_size": generator.map_size,
+                        "max_time": generator.max_time,
+                        "max_end_time": generator.max_end_time,
+                        "max_c": generator.max_c,
+                    }
+                    problem_bank.set(label, seed_value, demands, meta)
+            cache[(label, seed_value)] = [tuple(d) for d in demands]
+
+    return cache
+
 
 
 # =============================================================================
@@ -100,6 +261,8 @@ class DiffusionDistributionGenerator:
         
         # Set seed for reproducibility
         torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
         
         with torch.no_grad():
             output = self.model.sample(
@@ -224,6 +387,9 @@ def evaluate_distributions(
     out_dir: str = "outputs/eval",
     max_steps: Optional[int] = None,
     diffusion_generators: Optional[List[DiffusionDistributionGenerator]] = None,
+    seed_base: int = 0,
+    problem_bank: Optional[DiffusionProblemBank] = None,
+    generate_only: bool = False,
 ):
     """
     Evaluate planners across multiple distributions.
@@ -236,25 +402,50 @@ def evaluate_distributions(
         out_dir: Output directory for results
         max_steps: Maximum episode steps
         diffusion_generators: Optional list of diffusion generators for additional distributions
+        seed_base: Base value added to run index to form the per-episode seed
+        problem_bank: Optional cache for loading/saving diffusion problems
+        generate_only: When True, only generate/store problems and skip planner eval
     """
     import time as time_module
     
     results: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
     os.makedirs(out_dir, exist_ok=True)
-    
+
     # Build list of all distributions to evaluate
-    all_distributions = list(DISTRIBUTIONS)  # Rule-based distributions
-    diffusion_gen_map = {}  # Map distribution name to generator
-    
+    diffusion_gen_map: Dict[str, Optional[DiffusionDistributionGenerator]] = {}
     if diffusion_generators:
         for gen in diffusion_generators:
-            all_distributions.append(gen.label)
             diffusion_gen_map[gen.label] = gen
+    if problem_bank:
+        for label in problem_bank.list_distributions(static_demands=static_demands):
+            diffusion_gen_map.setdefault(label, None)
+
+    all_distributions = list(DISTRIBUTIONS)
+    all_distributions.extend(diffusion_gen_map.keys())
     
     # Calculate total evaluations for progress tracking
     total_evals = len(planner_specs) * len(all_distributions) * num_runs
     completed_evals = 0
     start_time = time_module.time()
+
+    seed_values = [seed_base + idx for idx in range(num_runs)]
+    num_nodes = int(cfg.generator_params.get("num_nodes", 30))
+    precomputed_diffusion = _precompute_diffusion_demands(
+        diffusion_gen_map,
+        seed_values,
+        num_nodes,
+        static_demands,
+        problem_bank,
+    )
+
+    if generate_only:
+        diffusion_count = len(diffusion_gen_map)
+        if diffusion_count == 0:
+            raise ValueError("--generate-only requires at least one diffusion distribution.")
+        print(
+            f"[INFO] Generated {len(seed_values)} seed(s) for {diffusion_count} diffusion distribution(s)."
+        )
+        return {}, list(diffusion_gen_map.keys())
 
     # CUDA Warmup: Initialize CUDA/PyTorch once before any measurements
     # This ensures the first-run CUDA initialization overhead (~1.5s) doesn't
@@ -304,28 +495,23 @@ def evaluate_distributions(
             # Check if this is a diffusion distribution
             is_diffusion_dist = dist in diffusion_gen_map
 
-            for seed in range(num_runs):
+            for run_idx, seed_value in enumerate(seed_values):
                 local_cfg = copy.deepcopy(cfg)
                 
                 if is_diffusion_dist:
-                    # Use diffusion generator - set generator_type to trigger custom handling
-                    diffusion_gen = diffusion_gen_map[dist]
-                    # Generate demands using diffusion model
-                    num_nodes = local_cfg.generator_params.get("num_nodes", 30)
-                    demands = diffusion_gen.generate_demands(
-                        num_nodes=num_nodes, 
-                        seed=seed,
-                        static_demands=static_demands,
-                    )
-                    # Inject pre-generated demands into config
-                    local_cfg.generator_params["distribution"] = "uniform"  # Fallback
-                    local_cfg.generator_params["_pregenerated_demands"] = demands
+                    demands = precomputed_diffusion.get((dist, seed_value))
+                    if demands is None:
+                        raise ValueError(
+                            f"Missing diffusion demands for '{dist}' (seed={seed_value})."
+                        )
+                    local_cfg.generator_params["distribution"] = "uniform"
+                    local_cfg.generator_params["_pregenerated_demands"] = [tuple(d) for d in demands]
                 else:
                     # Standard rule-based distribution
                     local_cfg.generator_params["distribution"] = dist
                     
                 local_cfg = sanitize_cfg(local_cfg)
-                local_cfg.seed = seed
+                local_cfg.seed = seed_value
 
                 if spec.ckpt_model:
                     # V2Planner checkpoint injection
@@ -341,7 +527,7 @@ def evaluate_distributions(
 
                 episode_metrics = run_episode_return_metrics(
                     local_cfg,
-                    seed=seed,
+                    seed=seed_value,
                     render=False,
                     fps=0,
                     planner=spec.planner_type,
@@ -570,6 +756,14 @@ if __name__ == "__main__":
         help="List of diffusion generator checkpoint paths for distribution generation. "
              "Supports label=path format. These distributions are evaluated alongside rule-based distributions."
     )
+    parser.add_argument("--seed-base", type=int, default=0,
+                        help="Base offset added to run index to form the per-episode seed")
+    parser.add_argument("--problem-bank-in", type=str, default=None,
+                        help="Load pregenerated diffusion problems from this JSON file")
+    parser.add_argument("--problem-bank-out", type=str, default=None,
+                        help="Write diffusion problems to this JSON file for reuse")
+    parser.add_argument("--generate-only", action="store_true",
+                        help="Only (re)generate diffusion problems and skip planner evaluation")
     parser.add_argument("--use-hungarian", action="store_true",
                         help="Use Hungarian algorithm for model planner's global assignment (instead of greedy decoding)")
     parser.add_argument("--total-demand", type=int, default=None,
@@ -598,12 +792,23 @@ if __name__ == "__main__":
                         help="Maximum episode steps (default: no limit)")
     args = parser.parse_args()
 
+    if args.generate_only and not args.problem_bank_out:
+        parser.error("--generate-only requires --problem-bank-out")
+
     cfg = get_default_config()
     evaluation_root = args.out_dir or "outputs/eval"
     eval_run_dir = create_output_run_dir(evaluation_root, "eval")
     args.out_dir = eval_run_dir
     print(f"[EVAL] Output directory: {eval_run_dir}")
     planner_specs: list[PlannerSpec] = []
+
+    problem_bank: Optional[DiffusionProblemBank] = None
+    if args.problem_bank_in:
+        problem_bank = DiffusionProblemBank(args.problem_bank_in)
+    if args.problem_bank_out:
+        if problem_bank is None:
+            problem_bank = DiffusionProblemBank()
+        problem_bank.assign_save_path(args.problem_bank_out)
 
     rule_modes: list[str] = []
     if args.rule_based:
@@ -781,7 +986,20 @@ if __name__ == "__main__":
         out_dir=args.out_dir,
         max_steps=args.max_steps,
         diffusion_generators=diffusion_generators if diffusion_generators else None,
+        seed_base=args.seed_base,
+        problem_bank=problem_bank,
+        generate_only=args.generate_only,
     )
+
+    if problem_bank:
+        problem_bank.save(args.problem_bank_out)
+
+    if args.generate_only:
+        if args.problem_bank_out:
+            print(f"[INFO] Diffusion problems written to {args.problem_bank_out}")
+        else:
+            print("[INFO] Diffusion problems generated in-memory only")
+        raise SystemExit(0)
 
     # Parse metrics to plot before printing results
     metrics_to_plot = [m.strip() for m in args.plot_metrics.split(",") if m.strip()]

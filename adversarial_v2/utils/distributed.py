@@ -63,11 +63,12 @@ def setup_distributed(
         raise RuntimeError("Multi-GPU training requires CUDA")
     
     # Set device for this process
-    torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
+
     
     # Initialize process group if not already done
     if not dist.is_initialized():
+        
         # Use environment variables set by torchrun/torch.distributed.launch
         if "RANK" not in os.environ:
             os.environ["RANK"] = str(local_rank)
@@ -85,10 +86,12 @@ def setup_distributed(
         dist.init_process_group(
             backend=backend,
             init_method="env://",
-            world_size=num_gpus,
-            rank=local_rank,
+            world_size=int(os.environ["WORLD_SIZE"]),
+            rank=int(os.environ.get('RANK', '0')),
+            # device_id=torch.cuda.,
         )
-    
+
+        print(f"rank {local_rank} init ok", flush=True)
     return device, True
 
 
@@ -208,7 +211,12 @@ def sync_params(model: nn.Module, src: int = 0):
 def barrier():
     """Synchronize all processes."""
     if is_distributed():
-        dist.barrier()
+        print(f"[Rank {dist.get_rank()}] entering barrier", flush=True)
+        try:
+            dist.barrier()
+        except Exception as e:
+            print(f"[Rank {dist.get_rank()}] barrier failed: {e}", flush=True)
+        print(f"[Rank {dist.get_rank()}] leaving barrier", flush=True)
 
 
 def print_rank0(*args, **kwargs):

@@ -12,10 +12,6 @@
 
 set -e
 
-# Activate conda environment
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate drl
-
 # Go to project root
 cd "$(dirname "$0")/.."
 echo "Working directory: $(pwd)"
@@ -26,7 +22,7 @@ echo "Working directory: $(pwd)"
 
 # --- Checkpoint Path ---
 # Path to the trained diffusion model checkpoint
-CHECKPOINT="checkpoints/cotrain/static_20251203_182634/generator_cycle_1.pth"
+CHECKPOINT="checkpoints/cotrain/static_20251205_065614/generator_cycle_1.pth"
 
 # --- Visualization Mode ---
 # Options: "heatmap", "episode", "compare"

@@ -173,6 +173,8 @@ def train_static_model(
     device: str = "cuda",
     resume_from: Optional[str] = None,
     target_num_vehicles: int = 4,
+    patience: int = 20,
+    threshold: float = 1e-4,
 ):
     """
     Train static VRP model.
@@ -193,6 +195,8 @@ def train_static_model(
         device: cuda or cpu
         resume_from: checkpoint to resume from
         target_num_vehicles: target number of vehicles
+        patience: early stopping patience
+        threshold: early stopping threshold
     """
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     print(f"Training on {device}")
@@ -237,9 +241,11 @@ def train_static_model(
     print(f"  Epochs: {epochs}")
     print(f"  Episodes/epoch: {episodes_per_epoch}")
     print(f"  Batch size: {batch_size}")
+    print(f"  Early stopping: patience={patience}, threshold={threshold}")
     print()
     
     best_score = float('inf')
+    no_improve_epochs = 0
     
     for epoch in range(start_epoch, epochs + 1):
         epoch_score = 0.0
@@ -276,10 +282,19 @@ def train_static_model(
             'num_nodes': num_nodes,
         }
         
-        if avg_score < best_score:
+        if avg_score < best_score - threshold:
             best_score = avg_score
+            no_improve_epochs = 0
             torch.save(checkpoint, os.path.join(save_dir, f"best_n{num_nodes}.pt"))
             print(f"  New best score: {best_score:.4f}")
+        else:
+            no_improve_epochs += 1
+            print(f"  No improvement for {no_improve_epochs}/{patience} epochs (best: {best_score:.4f})")
+            if no_improve_epochs >= patience:
+                print(f"  Early stopping triggered after {epoch} epochs.")
+                torch.save(checkpoint, os.path.join(save_dir, f"final_n{num_nodes}_ep{epoch}.pt"))
+                print(f"  Saved final checkpoint at epoch {epoch}")
+                break
         
         # Save final epoch checkpoint for resuming
         if epoch == epochs:
@@ -309,6 +324,8 @@ def main():
     parser.add_argument("--save-dir", type=str, default="checkpoints/static_vrp")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--patience", type=int, default=20, help="Early stopping patience")
+    parser.add_argument("--threshold", type=float, default=1e-4, help="Early stopping threshold")
     
     args = parser.parse_args()
     
@@ -327,6 +344,8 @@ def main():
         device=args.device,
         resume_from=args.resume,
         target_num_vehicles=args.target_vehicles,
+        patience=args.patience,
+        threshold=args.threshold,
     )
 
 

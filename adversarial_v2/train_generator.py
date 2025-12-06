@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import List, Tuple, Dict, Any, Optional
 import os
 import random
+from copy import deepcopy
 import torch
 import torch.nn as nn
 
@@ -35,6 +36,7 @@ from agent.generator.data_utils import CONDITION_DIM
 from environment.env import GridEnvironment
 from training.generator.train_rl_diffusion_generator import RLGeneratorTrainer
 from training.generator.rl_utils import make_environment
+from configs import get_default_config
 
 # Default hyperparameters
 DEFAULT_GEN_LR = 2e-6
@@ -75,7 +77,7 @@ class GeneratorTrainer:
         
         # Wrap model with DDP if distributed
         if self.distributed:
-            self.model = wrap_model_ddp(self.model, device_ids=[self.local_rank])
+            self.model = wrap_model_ddp(self.model, self.device)
             print_rank0(f"[GeneratorTrainer] Wrapped diffusion model with DDP on rank {self.local_rank}")
         
         # Initialize V2Planner for rollout (wraps the static model)
@@ -96,9 +98,11 @@ class GeneratorTrainer:
         )
         
         # Initialize RLGeneratorTrainer
-        # Note: Pass unwrapped model since RLGeneratorTrainer manages training
-        # The DDP wrapper is stored in self.model for potential direct access
-        model_for_trainer = unwrap_model(self.model) if self.distributed else self.model
+        # Pass model into RLGeneratorTrainer. If distributed, pass the DDP-wrapped
+        # module so that gradient synchronization happens automatically during
+        # backward() in RLGeneratorTrainer. The trainer will create its own
+        # optimizer from the passed model.parameters().
+        model_for_trainer = self.model if self.distributed else self.model
         self.rl_trainer = RLGeneratorTrainer(
             model=model_for_trainer,
             planner=self.v2_planner,
@@ -123,18 +127,15 @@ class GeneratorTrainer:
         class TrainerCfg:
             pass
         
+        trainer_cfg = get_default_config()
+        
         self.trainer_cfg = TrainerCfg()
         self.trainer_cfg.width = cfg.env.map_size
         self.trainer_cfg.height = cfg.env.map_size
         self.trainer_cfg.max_time = cfg.env.max_time
         self.trainer_cfg.depot = cfg.env.depot
-        self.trainer_cfg.generator_params = {
-            'max_c': cfg.env.max_c,
-            'min_lifetime': cfg.env.min_lifetime,
-            'max_lifetime': cfg.env.max_lifetime,
-            'total_demand': cfg.env.total_demand,
-            'depot': cfg.env.depot,
-        }
+        self.trainer_cfg.generator_params = trainer_cfg.generator_params
+        
     
     def _init_diffusion(self):
         """Initialize diffusion model."""
@@ -175,7 +176,7 @@ class GeneratorTrainer:
     def _sync_planner_weights(self):
         """Sync weights from planner_model to V2Planner."""
         self.v2_planner._ensure_model_loaded()
-        self.v2_planner._model.load_state_dict(self.planner_model.state_dict())
+        self.v2_planner._model.load_state_dict(self.planner_model.state_dict(), strict=False)
         self.v2_planner._model.eval()
     
     def update_planner(self, planner_model: nn.Module):
