@@ -162,6 +162,10 @@ def coevolution_loop(
         "generator_losses": [],
     }
     
+    # Track best planner checkpoint from previous cycle
+    # Generator trains against the best planner from previous cycle
+    prev_cycle_best_planner_path = None
+    
     # Main training loop
     for cycle in range(start_cycle, config.num_cycles + 1):
         print_rank0(f"\n{'='*60}")
@@ -171,7 +175,8 @@ def coevolution_loop(
         # ============================================
         # Phase 1: Planner Training
         # ============================================
-        print_rank0(f"\n[Phase 1] Training Planner (using {registry.num_versions()} generator versions)")
+        # Planner samples from ALL historical best generator versions in registry
+        print_rank0(f"\n[Phase 1] Training Planner (sampling from {registry.num_versions()} generator versions)")
         
         # Use first_cycle_planner_epochs for cycle 1 if specified
         if cycle == 1 and config.first_cycle_planner_epochs is not None:
@@ -227,17 +232,31 @@ def coevolution_loop(
                         print_rank0(f"  -> [Early Stop] Stopping planner training early at epoch {epoch}/{planner_epochs}")
                         break
         
-        # Save planner checkpoint
+        # Save planner checkpoint (this cycle's final planner)
         planner_ckpt_path = os.path.join(config.save_dir, f"planner_cycle_{cycle}.pt")
         planner_trainer.save_checkpoint(planner_ckpt_path, epoch=cycle)
+        
+        # Determine best planner path from this cycle
+        best_planner_in_cycle = os.path.join(config.save_dir, f"planner_cycle_{cycle}_best.pt")
+        if not os.path.exists(best_planner_in_cycle):
+            # If no early stopping improvement was made, use the final checkpoint as best
+            best_planner_in_cycle = planner_ckpt_path
         
         # ============================================
         # Phase 2: Generator Training (Adversarial)
         # ============================================
-        print_rank0(f"\n[Phase 2] Training Generator (adversarial against current planner)")
-        
-        # Update generator's planner reference
-        generator_trainer.update_planner(planner_trainer.model)
+        # Use best planner from PREVIOUS cycle (not current cycle)
+        # This ensures generator trains against a stable target
+        if prev_cycle_best_planner_path and os.path.exists(prev_cycle_best_planner_path):
+            print_rank0(f"\n[Phase 2] Training Generator (adversarial against best planner from cycle {cycle-1})")
+            print_rank0(f"  Planner checkpoint: {prev_cycle_best_planner_path}")
+            # Load the best planner from previous cycle
+            planner_trainer.load_checkpoint(prev_cycle_best_planner_path)
+            generator_trainer.update_planner(planner_trainer.model)
+        else:
+            print_rank0(f"\n[Phase 2] Training Generator (adversarial against current planner)")
+            # For cycle 1 or if no best exists, use current planner
+            generator_trainer.update_planner(planner_trainer.model)
         
         # Generator early stopping state for this cycle
         best_gen_reward_in_cycle = -float('inf')
@@ -289,16 +308,29 @@ def coevolution_loop(
                         print_rank0(f"  -> [Early Stop] Stopping generator training early at epoch {epoch}/{config.generator_epochs_per_cycle}")
                         break
         
-        # Save generator checkpoint
+        # Save generator checkpoint (final checkpoint for this cycle)
         gen_ckpt_path = os.path.join(config.save_dir, f"generator_cycle_{cycle}.pth")
         generator_trainer.save_checkpoint(gen_ckpt_path, epoch=cycle)
         
-        # Register new generator version (only main process, then sync)
+        # Determine best generator path from this cycle
+        best_gen_in_cycle = os.path.join(config.save_dir, f"generator_cycle_{cycle}_best.pth")
+        if not os.path.exists(best_gen_in_cycle):
+            # If no early stopping improvement was made, use the final checkpoint as best
+            best_gen_in_cycle = gen_ckpt_path
+            # Copy final to best for consistency
+            if is_main_process():
+                import shutil
+                shutil.copy(gen_ckpt_path, os.path.join(config.save_dir, f"generator_cycle_{cycle}_best.pth"))
+                best_gen_in_cycle = os.path.join(config.save_dir, f"generator_cycle_{cycle}_best.pth")
+        
+        # Register BEST generator version to registry (not final)
+        # This ensures planner trains against best generators from all cycles
         if is_main_process():
-            registry.add(gen_ckpt_path, metrics={
+            registry.add(best_gen_in_cycle, metrics={
                 "cycle": cycle,
+                "tag": "best",
                 "planner_reward": metrics["planner_reward"],
-                "gen_reward": metrics["gen_reward"],
+                "gen_reward": best_gen_reward_in_cycle if best_gen_reward_in_cycle > -float('inf') else metrics["gen_reward"],
             })
             registry.save()
         
@@ -314,8 +346,16 @@ def coevolution_loop(
         
         print_rank0(f"\n{registry.summary()}")
         
-        # Update planner trainer's diffusion model with latest generator
-        planner_trainer.load_generator_version(registry.latest())
+        # ============================================
+        # Update best planner checkpoint for next cycle
+        # ============================================
+        # Next cycle's generator will train against this cycle's best planner
+        prev_cycle_best_planner_path = best_planner_in_cycle
+        
+        print_rank0(f"\n[Cycle {cycle} Summary]")
+        print_rank0(f"  Best planner saved: {best_planner_in_cycle}")
+        print_rank0(f"  Best generator registered: {best_gen_in_cycle}")
+        print_rank0(f"  Registry now has {registry.num_versions()} generator versions")
     
     # Cleanup distributed
     if distributed:

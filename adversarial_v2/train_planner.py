@@ -230,6 +230,20 @@ class PlannerTrainer:
         self.diffusion_model.load_state_dict(state_dict, strict=False)
         self.diffusion_model.eval()
     
+    def load_generator_checkpoint(self, checkpoint_path: str):
+        """Load generator directly from checkpoint path (not via registry)."""
+        state_dict = torch.load(checkpoint_path, map_location=self.device)
+        
+        # Handle different checkpoint formats
+        if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
+            state_dict = state_dict['model_state_dict']
+        elif isinstance(state_dict, dict) and 'model' in state_dict:
+            state_dict = state_dict['model']
+        
+        self.diffusion_model.load_state_dict(state_dict, strict=False)
+        self.diffusion_model.eval()
+        print_rank0(f"[PlannerTrainer] Loaded generator from {checkpoint_path}")
+    
     def generate_problems_from_diffusion(
         self,
         batch_size: int,
