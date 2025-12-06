@@ -563,7 +563,8 @@ class GeneratorTrainer:
         In distributed mode:
         - Total batch_size episodes are split across GPUs
         - Each GPU processes local_batch_size = batch_size / num_gpus episodes
-        - Gradients are accumulated locally, then DDP syncs on optimizer.step()
+        - Use model.no_sync() for gradient accumulation to avoid redundant all-reduce
+        - Only sync gradients on the last backward call, then optimizer.step()
         
         For static VRP, uses batch_rollout_static for parallel evaluation.
         
@@ -605,18 +606,34 @@ class GeneratorTrainer:
         total_loss = 0.0
         total_metrics = {}
         
+        # For DDP with gradient accumulation:
+        # - Use no_sync() for all but the last backward to avoid redundant all-reduce
+        # - This ensures gradients are only synced once after all local accumulation
+        from contextlib import nullcontext
+        
         # Compute loss for each episode and accumulate gradients
         for i, (demands, (serviced_reward, total_demand_cap, total_failed_cap)) in enumerate(
             zip(demands_list, rollout_results)
         ):
-            # Compute loss (but don't step yet)
-            loss, metrics = self.compute_loss_for_episode(
-                demands, serviced_reward, total_demand_cap, total_failed_cap
-            )
+            is_last_step = (i == local_batch_size - 1)
             
-            # Scale loss by local_batch_size for gradient accumulation
-            scaled_loss = loss / local_batch_size
-            scaled_loss.backward()
+            # Use no_sync for all steps except the last one in distributed mode
+            # This prevents redundant gradient synchronization during accumulation
+            if self.distributed and not is_last_step:
+                sync_context = self.model.no_sync()
+            else:
+                sync_context = nullcontext()
+            
+            with sync_context:
+                # Compute loss (but don't step yet)
+                loss, metrics = self.compute_loss_for_episode(
+                    demands, serviced_reward, total_demand_cap, total_failed_cap
+                )
+                
+                # Scale loss by local_batch_size for gradient accumulation
+                # Also scale by world_size to ensure global batch average
+                scaled_loss = loss / (local_batch_size * world_size)
+                scaled_loss.backward()
             
             total_loss += loss.item()
             
@@ -625,10 +642,10 @@ class GeneratorTrainer:
                     total_metrics[k] = 0.0
                 total_metrics[k] += v
         
-        # Clip gradients
+        # Clip gradients (after all-reduce is complete)
         nn.utils.clip_grad_norm_(self.model.parameters(), DEFAULT_MAX_GRAD_NORM)
         
-        # Step optimizer - DDP will sync gradients here automatically
+        # Step optimizer - at this point all GPUs have synchronized gradients
         self.optimizer.step()
         
         # Average metrics over local batch
@@ -677,8 +694,8 @@ class GeneratorTrainer:
         
         avg_metrics = {k: v / n_batches for k, v in total_metrics.items()}
         
-        # Rename for compatibility
-        return {
+        # Build result dict
+        result = {
             "diff_loss": avg_metrics.get("diff_loss", 0.0),
             "advantage": avg_metrics.get("advantage", 0.0),
             "gen_reward": avg_metrics.get("gen_reward", 0.0),
@@ -686,6 +703,17 @@ class GeneratorTrainer:
             "baseline": avg_metrics.get("baseline", 0.0),
             "loss": avg_metrics.get("batch_loss", 0.0),
         }
+        
+        # In distributed mode, reduce metrics across all GPUs to get global averages.
+        # This is CRITICAL: all GPUs must see the same metric values to make
+        # consistent decisions about early stopping and best checkpoint saving.
+        if self.distributed:
+            for key in result:
+                tensor_val = torch.tensor(result[key], device=self.device)
+                reduced_val = reduce_tensor(tensor_val, op="mean")
+                result[key] = reduced_val.item()
+        
+        return result
     
     def save_checkpoint(self, path: str, epoch: int, extra_state: Optional[Dict] = None):
         """Save generator checkpoint. Only saves on main process in distributed mode."""

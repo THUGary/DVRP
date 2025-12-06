@@ -630,6 +630,15 @@ class PlannerTrainer:
         avg_score = total_score / n_batches
         avg_loss = total_loss / n_batches
 
+        # In distributed mode, reduce score and loss across all GPUs to get global averages.
+        # This is CRITICAL: all GPUs must see the same metric values to make
+        # consistent decisions about early stopping and best checkpoint saving.
+        if self.distributed:
+            score_tensor = torch.tensor(avg_score, device=self.device)
+            loss_tensor = torch.tensor(avg_loss, device=self.device)
+            avg_score = reduce_tensor(score_tensor, op="mean").item()
+            avg_loss = reduce_tensor(loss_tensor, op="mean").item()
+
         # Log cache statistics
         cache_stats_summary = self.problem_cache.get_cache_stats()
 
