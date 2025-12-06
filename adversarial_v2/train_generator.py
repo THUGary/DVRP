@@ -141,20 +141,31 @@ class GeneratorTrainer:
         )
     
     def _build_trainer_cfg(self):
-        """Build config object compatible with RLGeneratorTrainer."""
+        """Build config dict compatible with decode_demands_from_tensor."""
         cfg = self.config
         
-        class TrainerCfg:
+        default_cfg = get_default_config()
+        gen_params = default_cfg.generator_params
+        
+        # Build dict for decode_demands_from_tensor
+        self.trainer_cfg = {
+            "width": cfg.env.map_size,
+            "height": cfg.env.map_size,
+            "max_time": cfg.env.max_time,
+            "max_c": gen_params.get("max_demand", 5),
+            "min_lifetime": gen_params.get("lifetime_min", 10),
+            "max_lifetime": gen_params.get("lifetime_max", 50),
+        }
+        
+        # Also keep object-style for normalize_demands_for_training
+        class TrainerCfgObj:
             pass
-        
-        trainer_cfg = get_default_config()
-        
-        self.trainer_cfg = TrainerCfg()
-        self.trainer_cfg.width = cfg.env.map_size
-        self.trainer_cfg.height = cfg.env.map_size
-        self.trainer_cfg.max_time = cfg.env.max_time
-        self.trainer_cfg.depot = cfg.env.depot
-        self.trainer_cfg.generator_params = trainer_cfg.generator_params
+        self.trainer_cfg_obj = TrainerCfgObj()
+        self.trainer_cfg_obj.width = cfg.env.map_size
+        self.trainer_cfg_obj.height = cfg.env.map_size
+        self.trainer_cfg_obj.max_time = cfg.env.max_time
+        self.trainer_cfg_obj.depot = cfg.env.depot
+        self.trainer_cfg_obj.generator_params = gen_params
         
     
     def _init_diffusion(self):
@@ -315,8 +326,8 @@ class GeneratorTrainer:
         else:
             adv_scaled = torch.tensor(adv, dtype=torch.float32, device=self.device)
         
-        # Normalize demands for training
-        x_start = normalize_demands_for_training(demands, self.trainer_cfg).to(self.device).unsqueeze(0)
+        # Normalize demands for training (uses object-style config)
+        x_start = normalize_demands_for_training(demands, self.trainer_cfg_obj).to(self.device).unsqueeze(0)
         
         # Forward diffusion loss
         self.model.train()
