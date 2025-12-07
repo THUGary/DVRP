@@ -254,9 +254,9 @@ class GeneratorTrainer:
         cfg = self.config
         
         # Update condition with depot
-        cond_params = {"depot": depot}
-        condition = prepare_condition(cond_params).unsqueeze(0).to(self.device)
-        
+        # cond_params = {"depot": depot}
+        condition = prepare_condition({}).unsqueeze(0).to(self.device)
+
         # Get underlying model for sampling
         model_for_sample = unwrap_model(self.model) if self.distributed else self.model
         
@@ -353,9 +353,9 @@ class GeneratorTrainer:
             depots.append(depot)
             
             # Generate demands with DDIM
-            cond_params = {"depot": depot}
-            condition = prepare_condition(cond_params).unsqueeze(0).to(self.device)
-            
+            # cond_params = {"depot": depot}
+            condition = prepare_condition({}).unsqueeze(0).to(self.device)
+
             with torch.no_grad():
                 model_for_sample.eval()
                 if hasattr(model_for_sample, 'sample_ddim'):

@@ -1,0 +1,36 @@
+{
+  "next_id": 4,
+  "versions": [
+    {
+      "version_id": 1,
+      "checkpoint_path": "checkpoints/cotrain/static_20251207_131359/generator_v0.pth",
+      "timestamp": 1765113244.8556213,
+      "metrics": {
+        "cycle": 0,
+        "tag": "init"
+      }
+    },
+    {
+      "version_id": 2,
+      "checkpoint_path": "checkpoints/cotrain/static_20251207_131359/generator_cycle_1_best.pth",
+      "timestamp": 1765113246.616107,
+      "metrics": {
+        "cycle": 1,
+        "tag": "best",
+        "planner_reward": -508.8163948059082,
+        "gen_reward": 825.1106170281303
+      }
+    },
+    {
+      "version_id": 3,
+      "checkpoint_path": "checkpoints/cotrain/static_20251207_131359/generator_cycle_2_best.pth",
+      "timestamp": 1765113248.865247,
+      "metrics": {
+        "cycle": 2,
+        "tag": "best",
+        "planner_reward": -356.8436908721924,
+        "gen_reward": 685.9579130944151
+      }
+    }
+  ]
+}

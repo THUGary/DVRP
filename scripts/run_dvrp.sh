@@ -15,10 +15,10 @@ cd "$PROJECT_DIR"
 # =============================================================================
 
 # Model checkpoint path (set to "" to use rule-based planner)
-STATIC_CKPT="checkpoints/cotrain/static_20251202_034046/planner_cycle_1.pt"
+STATIC_CKPT="checkpoints/cotrain/static_20251207_131359/planner_cycle_1_best.pt"
 
 # Number of agents/vehicles
-NUM_AGENTS=5
+NUM_AGENTS=2
 
 # Random seed for reproducibility
 SEED=2025
@@ -37,13 +37,13 @@ RULE_MODE=""
 SAVE_RUN="--save-run"
 
 # MAP_SIZE: Side length of the square map (map is MAP_SIZE × MAP_SIZE)
-MAP_SIZE=40
+MAP_SIZE=30
 
 # TOTAL_DEMAND: Upper limit of sum of all customer demands (NOT node count!)
-TOTAL_DEMAND=150
+TOTAL_DEMAND=60
 
 # NUM_NODES: Number of demand nodes
-NUM_NODES=30
+NUM_NODES=20
 
 # MAX_STEPS: Maximum episode steps (leave empty for unlimited)
 MAX_STEPS=""
