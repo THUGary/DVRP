@@ -25,9 +25,9 @@ class EnvironmentConfig:
     num_agents: int = 5
     capacity: int = 30  # Fixed vehicle capacity (= DEMAND_NORM)
     
-    # Time settings  
-    max_time: int = 100
-    max_end_time: int = 200
+    # Time settings
+    # For static VRP, max_time serves as both episode limit and demand deadline
+    max_time: int = 5000
     
     # Depot (can be randomized)
     depot: tuple = (0, 0)

@@ -24,18 +24,18 @@ class PregeneratedDemandGenerator(BaseDemandGenerator):
         width: int,
         height: int,
         demands: List[Tuple[int, int, int, int, int]],
-        max_end_time: Optional[int] = None,
+        max_time: Optional[int] = None,
     ):
         """
         Args:
             width: Grid width
             height: Grid height
             demands: List of (x, y, t, c, end_t) tuples
-            max_end_time: Override end_t for static mode
+            max_time: Override end_t for static mode
         """
         super().__init__(width, height)
         self._demands = demands
-        self._max_end_time = max_end_time
+        self._max_time = max_time
         self._generated = False
     
     def reset(self, seed: Optional[int] = None):
@@ -50,9 +50,9 @@ class PregeneratedDemandGenerator(BaseDemandGenerator):
         """
         if not self._generated:
             self._generated = True
-            # Return all demands with adjusted end_t if max_end_time specified
-            if self._max_end_time is not None:
-                demands = [(x, y, t, c, self._max_end_time) for x, y, t, c, end_t in self._demands]
+            # Return all demands with adjusted end_t if max_time specified
+            if self._max_time is not None:
+                demands = [(x, y, t, c, self._max_time) for x, y, t, c, end_t in self._demands]
             else:
                 demands = list(self._demands)
             
@@ -68,7 +68,7 @@ def build_rule_based_generator(
     *,
     depot: Optional[Tuple[int, int]] = None,
     static_demands: bool = False,
-    max_end_time: Optional[int] = None,
+    max_time: Optional[int] = None,
 ) -> BaseDemandGenerator:
     """Create a rule-based generator with consistent parameter sanitization."""
 
@@ -78,11 +78,11 @@ def build_rule_based_generator(
     pregenerated = params.pop("_pregenerated_demands", None)
     if pregenerated is not None:
         # Use pre-generated demands instead of rule-based generation
-        resolved_end = max_end_time if static_demands else None
+        resolved_end = max_time if static_demands else None
         return PregeneratedDemandGenerator(
             width, height, 
             demands=pregenerated,
-            max_end_time=resolved_end,
+            max_time=resolved_end,
         )
     
     # Ensure depot is injected only once.
@@ -90,8 +90,8 @@ def build_rule_based_generator(
         params["depot"] = depot
     base_gen = RuleBasedGenerator(width, height, **params)
     if static_demands:
-        resolved_end = None if max_end_time is None else int(max_end_time)
-        return StaticDemandGenerator(base_gen, max_end_time=resolved_end)
+        resolved_end = None if max_time is None else int(max_time)
+        return StaticDemandGenerator(base_gen, max_time=resolved_end)
     return base_gen
 
 

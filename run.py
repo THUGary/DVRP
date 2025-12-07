@@ -46,9 +46,6 @@ def build_env(
 		else:
 			raise ValueError("Static demands only supported with 'rule' generator type.")
 
-	max_end_time_cfg = getattr(cfg, "max_end_time", None)
-	max_end_time = int(max_end_time_cfg if max_end_time_cfg is not None else cfg.max_time * 2)
-
 	env = GridEnvironment(
 		width=cfg.width,
 		height=cfg.height,
@@ -57,7 +54,6 @@ def build_env(
 		depot=cfg.depot,
 		generator=gen,
 		max_time=cfg.max_time,
-		max_end_time=max_end_time,
 		include_service_time=bool(getattr(cfg, "include_service_time", False)),
 		static_demands=static_demands,  # Pass static_demands flag to environment
 		expiry_penalty_scale=float(getattr(cfg, "expiry_penalty_scale", 5.0)),
@@ -135,7 +131,6 @@ def run_episode(
 	static_demands: bool = False,
 	planner_kwargs: Optional[Dict[str, Any]] = None,
 	save_run: bool = False,
-	max_steps: Optional[int] = None,
 ) -> None:
 	# deterministically randomize depot location per episode
 	rng = random.Random(seed)
@@ -193,10 +188,6 @@ def run_episode(
 		renderer.init()
 
 	while not done:
-		# Check max steps limit
-		if max_steps is not None and step >= max_steps:
-			print(f"Max steps ({max_steps}) reached, terminating episode.")
-			break
 		# 检测新增的需求
 		current_demands = obs["demands"]
 		new_demands = [d for d in current_demands if d not in prev_demands]
@@ -391,8 +382,7 @@ def main() -> None:
 	parser.add_argument("--total-demand", type=int, default=None, help="Override total demand capacity (upper limit of sum of all demands)")
 	parser.add_argument("--num-nodes", type=int, default=None, help="Override number of demand nodes")
 	parser.add_argument("--static-demands", action="store_true", help="Release all demands at time 0 to visualize static VRP instances")
-	parser.add_argument("--static-max-end", type=int, default=None, help="Max environment time for static demands (default: 2 * max_time)")
-	parser.add_argument("--max-steps", type=int, default=None, help="Maximum episode steps (default: no limit)")
+	parser.add_argument("--max-time", type=int, default=None, help="Max simulation time / episode steps")
 	parser.add_argument("--static-ckpt", type=str, help="Path to V2 static model checkpoint (enables model planner)")
 	parser.add_argument("--adapter-ckpt", type=str, default=None, help="Path to V2 dynamic adapter checkpoint (enables dynamic mode)")
 	args = parser.parse_args()
@@ -416,9 +406,9 @@ def main() -> None:
 	if args.num_nodes is not None and args.num_nodes > 0:
 		cfg.generator_params["num_nodes"] = int(args.num_nodes)
 
-	# Override max_end_time for static demands if specified
-	if args.static_max_end is not None and args.static_max_end > 0:
-		cfg.max_end_time = int(args.static_max_end)
+	# Override max_time if specified
+	if args.max_time is not None and args.max_time > 0:
+		cfg.max_time = int(args.max_time)
 
 	# Auto-detect planner based on checkpoint arguments
 	# Priority: model (with checkpoints) > rule-mode > greedy (default)
@@ -467,7 +457,6 @@ def main() -> None:
 		static_demands=args.static_demands,
 		planner_kwargs=planner_kwargs,
 		save_run=bool(getattr(args, 'save_run', False)),
-		max_steps=args.max_steps,
 	)
 
 

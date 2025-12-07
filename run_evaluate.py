@@ -226,7 +226,6 @@ def build_env(
     planner_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[GridEnvironment, BaseDemandGenerator, BasePlanner, RuleBasedController]:
     planner_kwargs = planner_kwargs or {}
-    resolved_max_end_time = int(getattr(cfg, "max_end_time", cfg.max_time * 2))
     if cfg.generator_type == "net":
         from agent.generator.net_generator import NetDemandGenerator as GenClass
 
@@ -239,7 +238,7 @@ def build_env(
             cfg.generator_params,
             depot=cfg.depot,
             static_demands=static_demands,
-            max_end_time=resolved_max_end_time,
+            max_time=cfg.max_time,
         )
         # Even though static wrapper handles demand generation, environment needs
         # static_demands=True for early termination logic (terminate when all
@@ -260,7 +259,6 @@ def build_env(
         exploration_penalty_scale=float(getattr(cfg, "exploration_penalty_scale", 0.0)),
         wait_penalty_scale=float(getattr(cfg, "wait_penalty_scale", 0.001)),
         depot_return_bonus_scale=float(getattr(cfg, "depot_return_bonus_scale", 0.0)),
-        max_end_time=resolved_max_end_time,
         include_service_time=bool(getattr(cfg, "include_service_time", False)),
         static_demands=env_static_demands,
     )
@@ -328,7 +326,6 @@ def run_episode_return_metrics(
     *,
     static_demands: bool = False,
     planner_kwargs: Optional[Dict[str, Any]] = None,
-    max_steps: Optional[int] = None,
 ) -> Dict[str, Any]:
     rng = random.Random(seed)
     depot = (rng.randint(0, cfg.width - 1), rng.randint(0, cfg.height - 1))
@@ -483,10 +480,6 @@ def run_episode_return_metrics(
         obs = obs_after
         total_reward += reward
         step += 1
-
-        # Early termination if max_steps is reached
-        if max_steps is not None and step >= max_steps:
-            break
 
     if renderer:
         renderer.close()

@@ -75,7 +75,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     p.add_argument("--planner", type=str, default="greedy", choices=["greedy", "model"])
     p.add_argument("--planner_ckpt", type=str, default="checkpoints/planner/planner_dynamic_20_2_200.pt")
-    p.add_argument("--total_demand", type=int, default=50)
+    p.add_argument("--total_demand", type=int, default=60)
     p.add_argument("--lr", type=float, default=2e-6)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--init_diffusion_ckpt", type=str, default="checkpoints/diffusion_model.pth")

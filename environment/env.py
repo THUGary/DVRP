@@ -33,11 +33,10 @@ class GridEnvironment:
 		capacity: int,
 		depot: Tuple[int, int] = (0, 0),
 		generator: Optional[BaseDemandGenerator] = None,
-		max_time: int = 100,
-		# Interpretation changed: max_time is the last demand generation time.
-		# Episode does NOT end at max_time immediately. After max_time, the
-		# episode will terminate when there are no unserved demands AND all
-		# agents are back at the depot; or when hitting max_end_time.
+		max_time: int = 5000,
+		# For static VRP: max_time is the hard time limit (episode ends when time > max_time)
+		# For dynamic VRP: max_time is the last demand generation time, episode continues
+		# until all demands served and agents return to depot
 		expiry_penalty_scale: float = 5.0,
 		switch_penalty_scale: float = 0.01,
 		capacity_reward_scale: float = 10.0,
@@ -55,9 +54,6 @@ class GridEnvironment:
 		# reward shaping for moving closer to nearby demands
 		approach_bonus_scale: float = 0.0,
 		approach_bonus_max_dist: float = 10.0,
-		# Hard cap on episode length; regardless of vehicle positions, if the
-		# current time reaches max_end_time, the episode ends.
-		max_end_time: Optional[int] = None,
 		include_service_time: bool = False,
 		static_demands: bool = False,
 	) -> None:
@@ -66,13 +62,12 @@ class GridEnvironment:
 		self.max_time = max_time
 		self.depot = depot
 		self.capacity = capacity
-		resolved_max_end_time = int(max_time if max_end_time is None else max_end_time)
 		self.static_demands = bool(static_demands)
 		# Only wrap with StaticDemandGenerator if not already wrapped
 		if self.static_demands and generator is not None:
 			print("Using static demand Generator Wrapper in GridEnvironment.")
 			if not isinstance(generator, StaticDemandGenerator):
-				generator = StaticDemandGenerator(generator, max_end_time=resolved_max_end_time)
+				generator = StaticDemandGenerator(generator, max_time=max_time)
 		self._generator = generator
 		self.expiry_penalty_scale = expiry_penalty_scale
 		self.switch_penalty_scale = switch_penalty_scale
@@ -87,8 +82,6 @@ class GridEnvironment:
 		self.approach_bonus_scale = float(approach_bonus_scale)
 		self.approach_bonus_max_dist = float(max(0.0, approach_bonus_max_dist))
 		self.include_service_time = bool(include_service_time)
-		# If not specified, default to max_time to preserve previous behavior
-		self.max_end_time = resolved_max_end_time
 		self._state: Optional[EnvState] = None
 
 		# cache for resolved full capacity to avoid repeated imports
@@ -568,18 +561,16 @@ class GridEnvironment:
 		self._state.time += 1
 		# Termination logic:
 		# - For static demands: if no unserved demands AND all agents at depot -> done
-		#   (no time limit for static VRP - episode ends when all demands served)
-		# - If reached hard cap max_end_time -> done (only for dynamic VRP or as safety)
-		# - Else if past last generation time (max_time) and there are no
-		#   unserved demands AND all agents are at depot -> done
+		#   Also terminate if time > max_time as a safety limit
+		# - For dynamic VRP: if past max_time and no unserved demands AND all at depot -> done
 		# - Else -> continue
 		if self.static_demands:
 			# For static demands, terminate when all demands served
-			# and all agents returned to depot (no time limit)
+			# and all agents returned to depot, or when time limit reached
 			no_unserved = (len(self._state.demands) == 0)
 			all_at_depot = all((a.x, a.y) == self.depot for a in self._state.agent_states)
-			done = bool(no_unserved and all_at_depot)
-		elif self._state.time > self.max_end_time: 
+			done = bool(no_unserved and all_at_depot) or (self._state.time > self.max_time)
+		elif self._state.time > self.max_time: 
 			#TODO: >= has been changed to >,
 			# BECAUSE self._state.time is incremented by 1 above, it needs to go to the next time step
 			done = True

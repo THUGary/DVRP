@@ -31,7 +31,7 @@ from __future__ import annotations
 import os
 import argparse
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Iterator
 import torch
 import torch.nn as nn
 from torch.optim import Adam
@@ -48,6 +48,84 @@ AVG_DEMAND_PER_NODE = (1 + MAX_DEMAND_PER_NODE) / 2  # = 3.0
 
 # Default number of nodes
 DEFAULT_NUM_NODES = 50
+
+
+class DatasetLoader:
+    """
+    Iterator for loading pre-generated VRP problems from file.
+    
+    Supports infinite iteration with optional shuffling.
+    """
+    
+    def __init__(
+        self,
+        data_path: str,
+        batch_size: int,
+        device: torch.device,
+        shuffle: bool = True,
+    ):
+        """
+        Args:
+            data_path: Path to .pt file with pre-generated problems
+            batch_size: Batch size for training
+            device: Device to load data to
+            shuffle: Whether to shuffle data each epoch
+        """
+        self.batch_size = batch_size
+        self.device = device
+        self.shuffle = shuffle
+        
+        # Load data
+        print(f"Loading dataset from {data_path}...")
+        data = torch.load(data_path, map_location='cpu')
+        
+        self.depot_xy = data['depot_xy']  # (num_problems, 1, 2)
+        self.node_xy = data['node_xy']    # (num_problems, num_nodes, 2)
+        self.node_demand = data['node_demand']  # (num_problems, num_nodes)
+        
+        self.num_problems = self.depot_xy.size(0)
+        self.num_nodes = self.node_xy.size(1)
+        self.num_batches = self.num_problems // batch_size
+        
+        print(f"  Loaded {self.num_problems} problems with {self.num_nodes} nodes")
+        print(f"  Batches per epoch: {self.num_batches}")
+        
+        self._indices = torch.arange(self.num_problems)
+        self._current_idx = 0
+    
+    def _shuffle_data(self):
+        """Shuffle indices for new epoch."""
+        if self.shuffle:
+            self._indices = torch.randperm(self.num_problems)
+        self._current_idx = 0
+    
+    def get_batch(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Get next batch of problems.
+        
+        Returns:
+            depot_xy: (batch_size, 1, 2)
+            node_xy: (batch_size, num_nodes, 2)
+            node_demand: (batch_size, num_nodes)
+        """
+        # Check if we need to start new epoch
+        if self._current_idx + self.batch_size > self.num_problems:
+            self._shuffle_data()
+        
+        # Get batch indices
+        batch_indices = self._indices[self._current_idx:self._current_idx + self.batch_size]
+        self._current_idx += self.batch_size
+        
+        # Get batch data
+        depot_xy = self.depot_xy[batch_indices].to(self.device)
+        node_xy = self.node_xy[batch_indices].to(self.device)
+        node_demand = self.node_demand[batch_indices].to(self.device)
+        
+        return depot_xy, node_xy, node_demand
+    
+    def __len__(self) -> int:
+        """Return number of batches per epoch."""
+        return self.num_batches
 
 
 def generate_random_problems(
@@ -104,9 +182,14 @@ def train_one_batch(
     aug_factor: int,
     device: torch.device,
     target_num_vehicles: int = 4,
+    preloaded_data: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[float, float]:
     """
     Train on one batch.
+    
+    Args:
+        preloaded_data: Optional tuple (depot_xy, node_xy, node_demand) for pre-generated data.
+                        If None, will generate random problems.
     
     Returns:
         avg_score: average tour length (lower is better)
@@ -114,10 +197,13 @@ def train_one_batch(
     """
     model.train()
     
-    # Generate problems
-    depot_xy, node_xy, node_demand = generate_random_problems(
-        batch_size, num_nodes, device, target_num_vehicles
-    )
+    # Use preloaded data or generate random problems
+    if preloaded_data is not None:
+        depot_xy, node_xy, node_demand = preloaded_data
+    else:
+        depot_xy, node_xy, node_demand = generate_random_problems(
+            batch_size, num_nodes, device, target_num_vehicles
+        )
     env.load_problems(depot_xy, node_xy, node_demand, aug_factor=aug_factor)
     
     # Reset
@@ -175,6 +261,7 @@ def train_static_model(
     target_num_vehicles: int = 4,
     patience: int = 20,
     threshold: float = 1e-4,
+    train_data: Optional[str] = None,
 ):
     """
     Train static VRP model.
@@ -186,7 +273,7 @@ def train_static_model(
         encoder_layers: number of encoder layers
         heads: number of attention heads
         epochs: number of training epochs
-        episodes_per_epoch: training episodes per epoch
+        episodes_per_epoch: training episodes per epoch (ignored when train_data is set)
         batch_size: batch size
         lr: learning rate
         weight_decay: weight decay
@@ -197,9 +284,19 @@ def train_static_model(
         target_num_vehicles: target number of vehicles
         patience: early stopping patience
         threshold: early stopping threshold
+        train_data: path to pre-generated training data (.pt file)
     """
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     print(f"Training on {device}")
+    
+    # Load dataset if provided
+    data_loader = None
+    if train_data and os.path.exists(train_data):
+        data_loader = DatasetLoader(train_data, batch_size, device, shuffle=True)
+        num_nodes = data_loader.num_nodes  # Use num_nodes from dataset
+        print(f"Using pre-generated dataset: {train_data}")
+    elif train_data:
+        print(f"WARNING: train_data file not found: {train_data}, using random generation")
     
     # Create model
     model = create_static_model(
@@ -230,8 +327,17 @@ def train_static_model(
     os.makedirs(save_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
+    # Determine number of batches per epoch
+    if data_loader is not None:
+        n_batches = len(data_loader)
+        data_source = "pre-generated dataset"
+    else:
+        n_batches = episodes_per_epoch // batch_size
+        data_source = "random generation"
+    
     # Training loop
     print(f"\nTraining Static VRP Model")
+    print(f"  Data source: {data_source}")
     print(f"  Num nodes: {num_nodes} (demand node count)")
     print(f"  Target vehicles: {target_num_vehicles}")
     print(f"  Map size: [0,1] x [0,1] (unit square)")
@@ -239,7 +345,7 @@ def train_static_model(
     print(f"  Avg total demand: ~{target_num_vehicles:.1f}")
     print(f"  POMO size: {pomo_size}")
     print(f"  Epochs: {epochs}")
-    print(f"  Episodes/epoch: {episodes_per_epoch}")
+    print(f"  Batches/epoch: {n_batches}")
     print(f"  Batch size: {batch_size}")
     print(f"  Early stopping: patience={patience}, threshold={threshold}")
     print()
@@ -250,12 +356,22 @@ def train_static_model(
     for epoch in range(start_epoch, epochs + 1):
         epoch_score = 0.0
         epoch_loss = 0.0
-        n_batches = episodes_per_epoch // batch_size
+        
+        # Shuffle data at start of each epoch (for dataset loader)
+        if data_loader is not None:
+            data_loader._shuffle_data()
         
         for batch_idx in range(n_batches):
+            # Get data (from loader or generate)
+            if data_loader is not None:
+                preloaded_data = data_loader.get_batch()
+            else:
+                preloaded_data = None
+            
             score, loss = train_one_batch(
                 model, env, optimizer, batch_size, num_nodes, pomo_size, aug_factor, device,
-                target_num_vehicles=target_num_vehicles
+                target_num_vehicles=target_num_vehicles,
+                preloaded_data=preloaded_data,
             )
             epoch_score += score
             epoch_loss += loss
@@ -326,6 +442,8 @@ def main():
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--patience", type=int, default=20, help="Early stopping patience")
     parser.add_argument("--threshold", type=float, default=1e-4, help="Early stopping threshold")
+    parser.add_argument("--train-data", type=str, default=None,
+                        help="Path to pre-generated training data (.pt file). If provided, uses this instead of random generation.")
     
     args = parser.parse_args()
     
@@ -346,6 +464,7 @@ def main():
         target_num_vehicles=args.target_vehicles,
         patience=args.patience,
         threshold=args.threshold,
+        train_data=args.train_data,
     )
 
 

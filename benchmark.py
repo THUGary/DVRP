@@ -87,11 +87,9 @@ def build_env(cfg: Config, planner_type: str, static_demands: bool) -> Tuple[Gri
 	if static_demands:
 		from agent.generator.static_benchmark_gen import StaticBenchmarkGenerator
 		gen = StaticBenchmarkGenerator(cfg.width, cfg.height, **cfg.generator_params)
-		max_end_time = cfg.max_time
 	else:
 		from agent.generator.benchmark_gen import BenchmarkGenerator
 		gen = BenchmarkGenerator(cfg.width, cfg.height, **cfg.generator_params)
-		max_end_time=int(getattr(cfg, "max_end_time", cfg.max_time * 2))
 	
 
 	print(f"Vehicle number for planner: {cfg.num_agents}")
@@ -103,7 +101,6 @@ def build_env(cfg: Config, planner_type: str, static_demands: bool) -> Tuple[Gri
 		depot=cfg.depot,
 		generator=gen,
 		max_time=cfg.max_time,
-		max_end_time=max_end_time,
 		static_demands=static_demands,
 		include_service_time=bool(getattr(cfg, "include_service_time", False)),
 		expiry_penalty_scale=float(getattr(cfg, "expiry_penalty_scale", 5.0)),

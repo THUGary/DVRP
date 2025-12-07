@@ -169,7 +169,6 @@ def _precompute_diffusion_demands(
                         "static_demands": static_demands,
                         "map_size": generator.map_size,
                         "max_time": generator.max_time,
-                        "max_end_time": generator.max_end_time,
                         "max_c": generator.max_c,
                     }
                     problem_bank.set(label, seed_value, demands, meta)
@@ -195,8 +194,7 @@ class DiffusionDistributionGenerator:
         self,
         checkpoint_path: str,
         map_size: int = 30,
-        max_time: int = 100,
-        max_end_time: int = 200,
+        max_time: int = 5000,
         max_c: int = 5,
         device: str = "cuda",
     ):
@@ -208,7 +206,6 @@ class DiffusionDistributionGenerator:
         self.checkpoint_path = checkpoint_path
         self.map_size = map_size
         self.max_time = max_time
-        self.max_end_time = max_end_time
         self.max_c = max_c
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         
@@ -235,7 +232,6 @@ class DiffusionDistributionGenerator:
         self.converter = DemandConverter(
             map_size=map_size,
             max_time=max_time,
-            max_end_time=max_end_time,
             max_c=max_c,
         )
         
@@ -284,7 +280,6 @@ def load_diffusion_generators(
     checkpoint_paths: List[str],
     map_size: int,
     max_time: int,
-    max_end_time: int,
     max_c: int,
     device: str = "cuda",
 ) -> List[DiffusionDistributionGenerator]:
@@ -299,7 +294,6 @@ def load_diffusion_generators(
                 checkpoint_path=path,
                 map_size=map_size,
                 max_time=max_time,
-                max_end_time=max_end_time,
                 max_c=max_c,
                 device=device,
             )
@@ -385,9 +379,8 @@ def evaluate_distributions(
     *,
     static_demands: bool = False,
     out_dir: str = "outputs/eval",
-    max_steps: Optional[int] = None,
     diffusion_generators: Optional[List[DiffusionDistributionGenerator]] = None,
-    seed_base: int = 0,
+    seed: int = 0,
     problem_bank: Optional[DiffusionProblemBank] = None,
     generate_only: bool = False,
 ):
@@ -400,9 +393,8 @@ def evaluate_distributions(
         num_runs: Number of evaluation runs per distribution
         static_demands: Whether to use static demand mode
         out_dir: Output directory for results
-        max_steps: Maximum episode steps
         diffusion_generators: Optional list of diffusion generators for additional distributions
-        seed_base: Base value added to run index to form the per-episode seed
+        seed: Base value added to run index to form the per-episode seed
         problem_bank: Optional cache for loading/saving diffusion problems
         generate_only: When True, only generate/store problems and skip planner eval
     """
@@ -428,7 +420,7 @@ def evaluate_distributions(
     completed_evals = 0
     start_time = time_module.time()
 
-    seed_values = [seed_base + idx for idx in range(num_runs)]
+    seed_values = [seed + idx for idx in range(num_runs)]
     num_nodes = int(cfg.generator_params.get("num_nodes", 30))
     precomputed_diffusion = _precompute_diffusion_demands(
         diffusion_gen_map,
@@ -484,7 +476,7 @@ def evaluate_distributions(
             _ = run_episode_return_metrics(
                 warmup_cfg, seed=9999, render=False, fps=0,
                 planner=spec.planner_type, static_demands=static_demands,
-                planner_kwargs=spec.planner_kwargs, max_steps=max_steps,
+                planner_kwargs=spec.planner_kwargs,
             )
             print(f"  [Warmup] Complete")
 
@@ -533,7 +525,6 @@ def evaluate_distributions(
                     planner=spec.planner_type,
                     static_demands=static_demands,
                     planner_kwargs=spec.planner_kwargs,
-                    max_steps=max_steps,
                 )
                 metrics_list.append(episode_metrics)
                 completed_evals += 1
@@ -756,8 +747,8 @@ if __name__ == "__main__":
         help="List of diffusion generator checkpoint paths for distribution generation. "
              "Supports label=path format. These distributions are evaluated alongside rule-based distributions."
     )
-    parser.add_argument("--seed-base", type=int, default=0,
-                        help="Base offset added to run index to form the per-episode seed")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Base random seed (added to run index for per-episode seed)")
     parser.add_argument("--problem-bank-in", type=str, default=None,
                         help="Load pregenerated diffusion problems from this JSON file")
     parser.add_argument("--problem-bank-out", type=str, default=None,
@@ -779,8 +770,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-c", type=int, default=None,
                         help="Override max demand per node. Higher values make capacity constraint more meaningful (default=5)")
     parser.add_argument("--static-demands", action="store_true", help="Use static demand release (all demands at t=0)")
-    parser.add_argument("--static-max-end", type=int, default=None,
-                        help="When --static-demands is set, override the max_end_time (fail if exceeded).")
+    parser.add_argument("--max-time", type=int, default=None,
+                        help="Max simulation time / episode steps (unified time limit)")
     parser.add_argument("--out-dir", type=str, default="outputs/eval", help="Directory where plots will be written")
     parser.add_argument("--plot-metrics", type=str, default="service_ratio,total_distance",
                         help="Comma-separated metrics to visualize (defaults to service_ratio,total_distance)")
@@ -788,8 +779,6 @@ if __name__ == "__main__":
                         help="POMO parallel rollouts for model inference (higher=better but slower, default=20)")
     parser.add_argument("--aug-factor", type=int, default=8, choices=[1, 8],
                         help="Data augmentation factor for POMO inference (1 or 8, default=8)")
-    parser.add_argument("--max-steps", type=int, default=None,
-                        help="Maximum episode steps (default: no limit)")
     args = parser.parse_args()
 
     if args.generate_only and not args.problem_bank_out:
@@ -932,11 +921,9 @@ if __name__ == "__main__":
     if args.max_c is not None and args.max_c > 0:
         cfg.generator_params = dict(cfg.generator_params)
         cfg.generator_params["max_c"] = args.max_c
-    if args.static_demands:
-        if args.static_max_end is not None and args.static_max_end > 0:
-            cfg.max_end_time = args.static_max_end
-        else:
-            cfg.max_end_time = max(cfg.max_time * 10, cfg.max_time + 200)
+    # Override max_time if specified
+    if args.max_time is not None and args.max_time > 0:
+        cfg.max_time = args.max_time
 
     # Set POMO parameters in v2_planner_params
     if not hasattr(cfg, 'v2_planner_params'):
@@ -967,7 +954,6 @@ if __name__ == "__main__":
                     checkpoint_path=path,
                     map_size=cfg.width,
                     max_time=cfg.max_time,
-                    max_end_time=cfg.max_end_time,
                     max_c=cfg.generator_params.get("max_c", 5),
                     device="cuda",
                 )
@@ -984,9 +970,8 @@ if __name__ == "__main__":
         num_runs=args.num_runs,
         static_demands=args.static_demands,
         out_dir=args.out_dir,
-        max_steps=args.max_steps,
         diffusion_generators=diffusion_generators if diffusion_generators else None,
-        seed_base=args.seed_base,
+        seed=args.seed,
         problem_bank=problem_bank,
         generate_only=args.generate_only,
     )

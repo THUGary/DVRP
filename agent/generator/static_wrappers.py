@@ -14,13 +14,13 @@ class StaticDemandGenerator(BaseDemandGenerator):
     # Very large number to ensure demands never expire in static VRP
     INFINITE_END_TIME = 999999
 
-    def __init__(self, base_generator: BaseDemandGenerator, *, max_end_time: Optional[int] = None) -> None:
+    def __init__(self, base_generator: BaseDemandGenerator, *, max_time: Optional[int] = None) -> None:
         super().__init__(base_generator.width, base_generator.height, **getattr(base_generator, "params", {}))
         self._base = base_generator
         self._snapshot: List[Demand] = []
         self._released = False
         # For static VRP, demands should never expire - use a very large end_t
-        # Ignore max_end_time parameter as it's not relevant for static VRP
+        # max_time parameter is accepted but not used (for API compatibility)
         self._extended_end_t = self.INFINITE_END_TIME
 
     def reset(self, seed: Optional[int] = None) -> None:

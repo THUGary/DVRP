@@ -130,7 +130,6 @@ class GeneratorTrainer:
             capacity=config.env.capacity,
             depot=config.env.depot,
             max_time=config.env.max_time,
-            max_end_time=config.env.max_end_time,
         )
         
         # Prepare default condition

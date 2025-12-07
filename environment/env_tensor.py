@@ -74,8 +74,7 @@ class TensorGridEnvironment:
         generator_factory: Optional[GeneratorFactory] = None,
         device: Union[str, torch.device] = "cpu",
         include_service_time: bool = False,
-        max_time: int = 100,
-        max_end_time: Optional[int] = None,
+        max_time: int = 5000,
         expiry_penalty_scale: float = 5.0,
         switch_penalty_scale: float = 0.01,
         capacity_reward_scale: float = 10.0,
@@ -98,7 +97,6 @@ class TensorGridEnvironment:
         self.max_demands = int(max_demands)
         self.include_service_time = bool(include_service_time)
         self.max_time = int(max_time)
-        self.max_end_time = int(max_time if max_end_time is None else max_end_time)
         self.expiry_penalty_scale = float(expiry_penalty_scale)
         self.switch_penalty_scale = float(switch_penalty_scale)
         self.capacity_reward_scale = float(capacity_reward_scale)
@@ -493,8 +491,7 @@ class TensorGridEnvironment:
         return penalty
 
     def _compute_done(self) -> Tensor:
-        at_limit = self.time >= self.max_end_time
-        beyond_gen = self.time > self.max_time
+        at_limit = self.time >= self.max_time
         depot_x, depot_y = self.depot_xy
         agents_at_depot = torch.logical_and(
             self.agent_pos[..., 0] == depot_x,
@@ -505,7 +502,8 @@ class TensorGridEnvironment:
             self.demands_start <= self.time.view(-1, 1),
         )
         empty_demands = ~active_demands.any(dim=1)
-        done = torch.logical_or(at_limit, torch.logical_and(beyond_gen, torch.logical_and(empty_demands, agents_at_depot)))
+        # Done if: time limit reached OR (no active demands AND all agents at depot)
+        done = torch.logical_or(at_limit, torch.logical_and(empty_demands, agents_at_depot))
         return done
 
     def _build_info(self, done: Tensor, verbose: bool, reward_terms: Dict[str, Tensor]) -> Dict[str, Tensor]:

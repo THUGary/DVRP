@@ -134,7 +134,6 @@ class PlannerTrainer:
         self.converter = DemandConverter(
             map_size=config.env.map_size,
             max_time=config.env.max_time,
-            max_end_time=config.env.max_end_time,
             max_c=config.env.max_c,
             min_lifetime=config.env.min_lifetime,
             max_lifetime=config.env.max_lifetime,

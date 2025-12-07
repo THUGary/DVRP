@@ -63,9 +63,7 @@ class Config:
     num_agents: int = 2
     capacity: int = DEFAULT_CAPACITY  # Use centralized default (30)
     depot: Tuple[int, int] = (0, 0)
-    max_time: int = 100 # the value has to be consistent with generator_params' max_time
-    # Hard cap on episode after last generation time; if None, will be set in __post_init__
-    max_end_time: Optional[int] = None
+    max_time: int = 5000  # Max simulation time / episode steps (unified for static VRP)
     include_service_time: bool = False #Attention:  Overwritten in run.py and benchmark.py
     # Reward scales
     # Reward scale tweaks tuned for smaller agent counts (e.g., 2 vehicles)
@@ -88,7 +86,7 @@ class Config:
 
     # Generator params
     # Use "rule" for static VRP evaluation, "net" for dynamic with diffusion model
-    generator_type: str = "rule"  # "rule" | "net"
+    generator_type: str = "net"  # "rule" | "net"
     generator_params: Dict[str, Any] = field(default_factory=lambda: {
         "max_per_step": 2, # not used in rule-based generator
         "depot": "__depot__",  # placeholder to be replaced with Config.depot (accepts "__depot__" or "__DEPOT__")
@@ -110,7 +108,7 @@ class Config:
         "neighborhood_size": 5, # 3-15, the average radius of the concentrated generation areas
         "burst_prob": 0.1, # 0.0 - 1.0, probability of bursting demands among all demands
         # Checkpoint path for the network-based generator (only used when generator_type="net")
-        "model_path": "checkpoints/diffusion_model.pth",
+        "model_path": "checkpoints/rl_generator/greedy_static_20251205-142015/best.pth",
     })
 
     # Planner params
@@ -144,11 +142,6 @@ class Config:
             max_service = min_service
         self.generator_params["min_service_time"] = min_service
         self.generator_params["max_service_time"] = max_service
-        # default max_end_time if not provided: allow time after last generation
-        # to return to depot and finish remaining work
-        if self.max_end_time is None:
-            # heuristic default: 2x max_time to allow wind-down
-            self.max_end_time = int(self.max_time * 2)
 
 
 def get_default_config() -> Config:

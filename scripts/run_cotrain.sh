@@ -1,247 +1,188 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
 # =============================================================================
-# Co-evolution training script for V2Planner and Diffusion Generator
+# Run Co-Training (Alternating Generator and Planner Training)
 # Usage: bash scripts/run_cotrain.sh
 #
-# Edit the configuration variables below to change settings.
-#
-# Multi-GPU Training:
-#   Set NUM_GPUS > 1 to enable DDP training with torchrun
+# Configuration is read from static_config.py
 # =============================================================================
 
-set -e
-
-# Go to project root
-cd "$(dirname "$0")/.."
-echo "Working directory: $(pwd)"
+set -euo pipefail
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "$SCRIPT_DIR/.."
 
 # =============================================================================
-# CONFIGURATION - Edit these variables to change settings
+# Read configuration from static_config.py
 # =============================================================================
+get_config() {
+    python3 -c "from static_config import $1; print($1)"
+}
 
-# --- Training Mode ---
-MODE="static"                    # "static" or "dynamic"
+# --- Co-Training Settings ---
+NUM_CYCLES=$(get_config "NUM_CYCLES")
+MODE=$(get_config "MODE")
+NUM_GPUS=$(get_config "NUM_GPUS")
 
-# --- Multi-GPU Settings ---
-NUM_GPUS=4                       # Number of GPUs (1=single GPU, >1=DDP with torchrun)
+# --- Generator Training ---
+GENERATOR_EPOCHS=$(get_config "GENERATOR_EPOCHS")
 
-# --- Co-evolution Settings ---
-NUM_CYCLES=10             # Number of co-evolution cycles
-PLANNER_EPOCHS=50        # Planner training epochs per cycle
-FIRST_CYCLE_PLANNER_EPOCHS=400  # First cycle planner epochs (leave empty to use PLANNER_EPOCHS)
-GENERATOR_EPOCHS=50      # Generator training epochs per cycle
+# --- Planner Training ---
+PLANNER_EPOCHS=$(get_config "PLANNER_EPOCHS")
+FIRST_CYCLE_PLANNER_EPOCHS=$(get_config "FIRST_CYCLE_PLANNER_EPOCHS")
 
-# --- Planner Early Stopping (within each cycle) ---
-# Stop planner training early if score doesn't improve for PATIENCE epochs
-# Set to 0 or empty to disable early stopping
-PLANNER_EARLY_STOP_PATIENCE=20    # Number of epochs without improvement to trigger early stop
-PLANNER_EARLY_STOP_THRESHOLD=0.1  # Minimum improvement threshold
-
-# --- Generator Early Stopping (within each cycle) ---
-# Stop generator training early if gen_reward doesn't improve for PATIENCE epochs
-# Set to 0 or empty to disable early stopping
-GENERATOR_EARLY_STOP_PATIENCE=20   # Number of epochs without improvement to trigger early stop (0 = disabled)
-GENERATOR_EARLY_STOP_THRESHOLD=1  # Minimum improvement threshold for gen_reward
-
-# --- Batch Settings ---
-BATCH_SIZE=512            # Batch size for training
-POMO_SIZE=100            # POMO parallel rollouts
-EPISODES_PER_EPOCH=10240   # Episodes per epoch
-
-# --- Problem Cache Settings ---
-# Memory usage: ~0.6 MB per 1000 problems per version (num_nodes=50)
-CACHE_REUSE_RATIO=0.7        # Probability of using cached problems (0.0=always generate, 1.0=always cache)
-MAX_PROBLEMS_PER_VERSION=30000 # Max problems to cache per generator version
-MIN_CACHE_SIZE_FOR_REUSE=5000  # Minimum cache size before enabling reuse
-
-# --- Version Sampling (to prevent policy cycling) ---
-VERSION_POLICY="uniform"  # "uniform", "latest_biased", "all"
-LATEST_BIAS=0.3          # P(sample latest) when latest_biased
+# --- Batch and Episode Settings ---
+BATCH_SIZE=$(get_config "BATCH_SIZE")
+EPISODES_PER_EPOCH=$(get_config "EPISODES_PER_EPOCH")
+POMO_SIZE=$(get_config "POMO_SIZE")
 
 # --- Environment Settings ---
-# map_size: Side length of the square map (map is map_size × map_size)
-MAP_SIZE=30              # Square map side length
-NUM_AGENTS=2             # Number of vehicles
-CAPACITY=30              # Vehicle capacity (fixed at 30 = DEMAND_NORM)
-MAX_TIME=1000             # Max simulation time
-MAX_END_TIME=1200        # Max deadline for static demands (when nodes disappear)
+NUM_AGENTS=$(get_config "NUM_AGENTS")
+NUM_NODES=$(get_config "NUM_NODES")
+TOTAL_DEMAND=$(get_config "TOTAL_DEMAND")
+MAP_SIZE=$(get_config "MAP_SIZE")
+MAX_C=$(get_config "MAX_C")
+CAPACITY=$(get_config "CAPACITY")
+MAX_TIME=$(get_config "MAX_TIME")
+MIN_LIFETIME=$(get_config "MIN_LIFETIME")
+MAX_LIFETIME=$(get_config "MAX_LIFETIME")
+RANDOMIZE_DEPOT=$(get_config "RANDOMIZE_DEPOT")
 
-# --- Demand Generation (for Generator) ---
-# TERMINOLOGY:
-#   - NUM_NODES: Actual number of demand nodes (for tensor shapes)
-#   - TOTAL_DEMAND: Upper limit of sum of all demands (capacity constraint, NOT node count)
-NUM_NODES=20             # Number of demand nodes (reduce for limited VRAM)
-TOTAL_DEMAND=60          # Upper limit of sum of all demands
-MAX_C=5                  # Max demand per node (demands 1 to max_c)
-MIN_LIFETIME=10          # Min demand lifetime
-MAX_LIFETIME=50          # Max demand lifetime
-RANDOMIZE_DEPOT="true"   # Randomize depot location ("true" or "false")
+# --- Early Stopping ---
+PLANNER_EARLY_STOP_PATIENCE=$(get_config "PLANNER_EARLY_STOP_PATIENCE")
+PLANNER_EARLY_STOP_THRESHOLD=$(get_config "PLANNER_EARLY_STOP_THRESHOLD")
+GENERATOR_EARLY_STOP_PATIENCE=$(get_config "GENERATOR_EARLY_STOP_PATIENCE")
+GENERATOR_EARLY_STOP_THRESHOLD=$(get_config "GENERATOR_EARLY_STOP_THRESHOLD")
+
+# --- Problem Cache Settings ---
+CACHE_REUSE_RATIO=$(get_config "CACHE_REUSE_RATIO")
+MAX_PROBLEMS_PER_VERSION=$(get_config "MAX_PROBLEMS_PER_VERSION")
+MIN_CACHE_SIZE_FOR_REUSE=$(get_config "MIN_CACHE_SIZE_FOR_REUSE")
+
+# --- Version Sampling ---
+VERSION_POLICY=$(get_config "VERSION_POLICY")
+LATEST_BIAS=$(get_config "LATEST_BIAS")
 
 # --- Hardware ---
-DEVICE="cuda"            # "cuda" or "cpu"
-SEED=42                  # Random seed
+DEVICE=$(get_config "DEVICE")
+SEED=$(get_config "SEED")
 
-# --- Checkpoints (optional, for loading pretrained models) ---
-PLANNER_INITIALIZE="checkpoints/static_vrp_v2/best_n20.pt"    # Path to pretrained planner (leave empty if none)
-# Path to pretrained diffusion generator checkpoint
-# Recommended: use a supervised-trained model to avoid random initialization
-# Example: "checkpoints/diffusion_model.pth"
-GENERATOR_INITIALIZE="checkpoints/rl_generator/greedy_static_20251205-142015/best.pth"
-RESUME_FROM=""           # Resume from checkpoint directory (leave empty if none)
-
-# --- Output ---
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-SAVE_DIR="checkpoints/cotrain/${MODE}_${TIMESTAMP}"
+# --- Checkpoints ---
+PLANNER_INITIALIZE=$(get_config "PLANNER_INITIALIZE")
+GENERATOR_INITIALIZE=$(get_config "GENERATOR_INITIALIZE")
+COTRAIN_RESUME_FROM=$(get_config "COTRAIN_RESUME_FROM")
 
 # =============================================================================
-# END OF CONFIGURATION
+# Display Configuration
 # =============================================================================
 
-echo "=============================================="
-echo "Co-evolution Training Configuration"
-echo "=============================================="
+echo "=========================================="
+echo "Co-Training Configuration"
+echo "=========================================="
 echo ""
-echo "MODE:               ${MODE}"
-echo "NUM_GPUS:           ${NUM_GPUS}"
-echo ""
-echo "CO-EVOLUTION:"
-echo "  Cycles:           ${NUM_CYCLES}"
-echo "  Planner epochs:   ${PLANNER_EPOCHS}"
-if [[ -n "${FIRST_CYCLE_PLANNER_EPOCHS}" ]]; then
-    echo "  First cycle epochs: ${FIRST_CYCLE_PLANNER_EPOCHS}"
+echo "  CO-TRAINING:"
+echo "    Mode:               $MODE"
+echo "    Cycles:             $NUM_CYCLES"
+echo "    Num GPUs:           $NUM_GPUS"
+if [[ -n "$COTRAIN_RESUME_FROM" ]]; then
+    echo "    Resume from:        $COTRAIN_RESUME_FROM"
 fi
-echo "  Generator epochs: ${GENERATOR_EPOCHS}"
 echo ""
-echo "BATCH SETTINGS:"
-echo "  Batch size:       ${BATCH_SIZE}"
-echo "  POMO size:        ${POMO_SIZE}"
-echo "  Episodes/epoch:   ${EPISODES_PER_EPOCH}"
-echo "  Version policy:   ${VERSION_POLICY}"
+echo "  TRAINING:"
+echo "    Generator epochs:   $GENERATOR_EPOCHS"
+echo "    Planner epochs:     $PLANNER_EPOCHS"
+echo "    First cycle epochs: $FIRST_CYCLE_PLANNER_EPOCHS"
+echo "    Batch size:         $BATCH_SIZE"
+echo "    Episodes/epoch:     $EPISODES_PER_EPOCH"
+echo "    POMO size:          $POMO_SIZE"
 echo ""
-echo "PROBLEM CACHE:"
-echo "  Reuse ratio:      ${CACHE_REUSE_RATIO} (${CACHE_REUSE_RATIO}=80% from cache)"
-echo "  Max per version:  ${MAX_PROBLEMS_PER_VERSION}"
-echo "  Min for reuse:    ${MIN_CACHE_SIZE_FOR_REUSE}"
+echo "  ENVIRONMENT:"
+echo "    Num agents:         $NUM_AGENTS"
+echo "    Num nodes:          $NUM_NODES"
+echo "    Total demand:       $TOTAL_DEMAND"
+echo "    Map size:           ${MAP_SIZE}x${MAP_SIZE}"
+echo "    Max C:              $MAX_C"
+echo "    Capacity:           $CAPACITY"
+echo "    Max time:           $MAX_TIME"
 echo ""
-echo "ENVIRONMENT:"
-echo "  Map size:         ${MAP_SIZE}x${MAP_SIZE}"
-echo "  Num agents:       ${NUM_AGENTS}"
-echo "  Capacity:         ${CAPACITY}"
-echo "  Max time:         ${MAX_TIME}"
-echo "  Max end time:     ${MAX_END_TIME}"
-echo ""
-echo "DEMAND GENERATION:"
-echo "  Num nodes:        ${NUM_NODES}"
-echo "  Total demand:     ${TOTAL_DEMAND} (upper limit of sum of all demands)"
-echo "  Max demand/node:  ${MAX_C}"
-echo "  Lifetime:         ${MIN_LIFETIME}-${MAX_LIFETIME}"
-echo "  Randomize depot:  ${RANDOMIZE_DEPOT}"
-echo ""
-echo "HARDWARE:"
-echo "  Device:           ${DEVICE}"
-echo "  Seed:             ${SEED}"
-echo ""
-echo "INITIALIZE:"
-echo "  Save directory:   ${SAVE_DIR}"
-if [[ -n "${PLANNER_INITIALIZE}" ]]; then
-    echo "  Planner initialize:     ${PLANNER_INITIALIZE}"
-fi
-if [[ -n "${GENERATOR_INITIALIZE}" ]]; then
-    echo "  Generator initialize:   ${GENERATOR_INITIALIZE}"
-fi
-if [[ -n "${RESUME_FROM}" ]]; then
-    echo "  Resume from:      ${RESUME_FROM}"
-fi
-echo "=============================================="
+echo "  HARDWARE:"
+echo "    Device:             $DEVICE"
+echo "    Seed:               $SEED"
 echo ""
 
-# ==============================================================================
+# =============================================================================
+# Validate Checkpoints
+# =============================================================================
+
+if [[ -n "$GENERATOR_INITIALIZE" && ! -f "$GENERATOR_INITIALIZE" ]]; then
+    echo "ERROR: Generator checkpoint not found: $GENERATOR_INITIALIZE"
+    exit 1
+fi
+
+if [[ -n "$PLANNER_INITIALIZE" && ! -f "$PLANNER_INITIALIZE" ]]; then
+    echo "ERROR: Planner checkpoint not found: $PLANNER_INITIALIZE"
+    exit 1
+fi
+
+if [[ -n "$COTRAIN_RESUME_FROM" && ! -d "$COTRAIN_RESUME_FROM" ]]; then
+    echo "ERROR: Resume directory not found: $COTRAIN_RESUME_FROM"
+    exit 1
+fi
+
+# =============================================================================
 # Build Command
-# ==============================================================================
+# =============================================================================
 
-# Build common arguments
-ARGS=(
-    --mode "${MODE}"
-    --num-cycles "${NUM_CYCLES}"
-    --planner-epochs "${PLANNER_EPOCHS}"
-    --generator-epochs "${GENERATOR_EPOCHS}"
-    --batch-size "${BATCH_SIZE}"
-    --pomo-size "${POMO_SIZE}"
-    --episodes-per-epoch "${EPISODES_PER_EPOCH}"
-    --version-policy "${VERSION_POLICY}"
-    --latest-bias "${LATEST_BIAS}"
-    --cache-reuse-ratio "${CACHE_REUSE_RATIO}"
-    --max-problems-per-version "${MAX_PROBLEMS_PER_VERSION}"
-    --min-cache-size-for-reuse "${MIN_CACHE_SIZE_FOR_REUSE}"
-    --map-size "${MAP_SIZE}"
-    --num-agents "${NUM_AGENTS}"
-    --capacity "${CAPACITY}"
-    --max-time "${MAX_TIME}"
-    --max-end-time "${MAX_END_TIME}"
-    --num-nodes "${NUM_NODES}"
-    --total-demand "${TOTAL_DEMAND}"
-    --max-c "${MAX_C}"
-    --min-lifetime "${MIN_LIFETIME}"
-    --max-lifetime "${MAX_LIFETIME}"
-    --device "${DEVICE}"
-    --seed "${SEED}"
-    --save-dir "${SAVE_DIR}"
-    --num-gpus "${NUM_GPUS}"
+cmd=(
+    python3 -m adversarial_v2.cotrain
+    --mode "$MODE"
+    --num-cycles "$NUM_CYCLES"
+    --num-gpus "$NUM_GPUS"
+    --num-agents "$NUM_AGENTS"
+    --num-nodes "$NUM_NODES"
+    --total-demand "$TOTAL_DEMAND"
+    --map-size "$MAP_SIZE"
+    --max-c "$MAX_C"
+    --capacity "$CAPACITY"
+    --max-time "$MAX_TIME"
+    --min-lifetime "$MIN_LIFETIME"
+    --max-lifetime "$MAX_LIFETIME"
+    --pomo-size "$POMO_SIZE"
+    --device "$DEVICE"
+    --seed "$SEED"
+    --generator-epochs "$GENERATOR_EPOCHS"
+    --planner-epochs "$PLANNER_EPOCHS"
+    --batch-size "$BATCH_SIZE"
+    --episodes-per-epoch "$EPISODES_PER_EPOCH"
+    --planner-early-stop-patience "$PLANNER_EARLY_STOP_PATIENCE"
+    --planner-early-stop-threshold "$PLANNER_EARLY_STOP_THRESHOLD"
+    --generator-early-stop-patience "$GENERATOR_EARLY_STOP_PATIENCE"
+    --generator-early-stop-threshold "$GENERATOR_EARLY_STOP_THRESHOLD"
+    --cache-reuse-ratio "$CACHE_REUSE_RATIO"
+    --max-problems-per-version "$MAX_PROBLEMS_PER_VERSION"
+    --min-cache-size-for-reuse "$MIN_CACHE_SIZE_FOR_REUSE"
+    --version-policy "$VERSION_POLICY"
+    --latest-bias "$LATEST_BIAS"
 )
 
-# Add first cycle planner epochs if specified
-if [[ -n "${FIRST_CYCLE_PLANNER_EPOCHS}" ]]; then
-    ARGS+=(--first-cycle-planner-epochs "${FIRST_CYCLE_PLANNER_EPOCHS}")
+# Optional arguments
+if [[ -n "$FIRST_CYCLE_PLANNER_EPOCHS" && "$FIRST_CYCLE_PLANNER_EPOCHS" != "None" ]]; then
+    cmd+=(--first-cycle-planner-epochs "$FIRST_CYCLE_PLANNER_EPOCHS")
 fi
 
-# Add planner early stopping if specified
-if [[ -n "${PLANNER_EARLY_STOP_PATIENCE}" ]] && [[ "${PLANNER_EARLY_STOP_PATIENCE}" != "0" ]]; then
-    ARGS+=(--planner-early-stop-patience "${PLANNER_EARLY_STOP_PATIENCE}")
-fi
-if [[ -n "${PLANNER_EARLY_STOP_THRESHOLD}" ]]; then
-    ARGS+=(--planner-early-stop-threshold "${PLANNER_EARLY_STOP_THRESHOLD}")
+if [[ "$RANDOMIZE_DEPOT" == "True" ]]; then
+    cmd+=(--randomize-depot)
 fi
 
-# Add generator early stopping if specified
-if [[ -n "${GENERATOR_EARLY_STOP_PATIENCE}" ]] && [[ "${GENERATOR_EARLY_STOP_PATIENCE}" != "0" ]]; then
-    ARGS+=(--generator-early-stop-patience "${GENERATOR_EARLY_STOP_PATIENCE}")
-fi
-if [[ -n "${GENERATOR_EARLY_STOP_THRESHOLD}" ]]; then
-    ARGS+=(--generator-early-stop-threshold "${GENERATOR_EARLY_STOP_THRESHOLD}")
+if [[ -n "$GENERATOR_INITIALIZE" ]]; then
+    cmd+=(--generator-checkpoint "$GENERATOR_INITIALIZE")
 fi
 
-# Add optional flags
-if [[ "${RANDOMIZE_DEPOT}" == "true" ]]; then
-    ARGS+=(--randomize-depot)
+if [[ -n "$PLANNER_INITIALIZE" ]]; then
+    cmd+=(--planner-checkpoint "$PLANNER_INITIALIZE")
 fi
 
-# Add optional checkpoints (initialization paths)
-if [[ -n "${PLANNER_INITIALIZE}" ]]; then
-    ARGS+=(--planner-checkpoint "${PLANNER_INITIALIZE}")
+if [[ -n "$COTRAIN_RESUME_FROM" ]]; then
+    cmd+=(--resume "$COTRAIN_RESUME_FROM")
 fi
 
-if [[ -n "${GENERATOR_INITIALIZE}" ]]; then
-    ARGS+=(--generator-checkpoint "${GENERATOR_INITIALIZE}")
-fi
-
-if [[ -n "${RESUME_FROM}" ]]; then
-    ARGS+=(--resume "${RESUME_FROM}")
-fi
-
-# =============================================================================
-# Run Training
-# =============================================================================
-
-if [[ "${NUM_GPUS}" -gt 1 ]]; then
-    echo "Launching multi-GPU training with ${NUM_GPUS} GPUs using torchrun..."
-    torchrun --nproc_per_node="${NUM_GPUS}" -m adversarial_v2.cotrain "${ARGS[@]}"
-else
-    echo "Launching single-GPU training..."
-    python3 -m adversarial_v2.cotrain "${ARGS[@]}"
-fi
-
-echo ""
-echo "=============================================="
-echo "Training complete!"
-echo "Checkpoints saved to: ${SAVE_DIR}"
-echo "=============================================="
+"${cmd[@]}"
