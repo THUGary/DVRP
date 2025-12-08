@@ -217,9 +217,6 @@ def run_episode(
 			serve_mark=planning_state.global_nodes.serve_mark,  # 新增：服务标记
 			unserved_count=planning_state.get_unserved_count(),  # 新增：未服务节点数量
 		)
-		cleaned_targets = _clean_for_print([list(target) for target in targets])
-		print(f"[PLANNER] step={step} selections={cleaned_targets}")
-
 		# 更新规划结果到状态管理器
 		# Note: update_plans stores a copy, but we need controller to modify the same deques
 		# So we update first, then use current_plans for controller actions

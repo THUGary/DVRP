@@ -41,7 +41,7 @@ TOTAL_DEMAND: int = 60            # Upper limit of sum of all demands (evaluate_
 MAX_C: int = 5                    # Max demand per node, 1 to max_c (evaluate_distributions.sh, run_cotrain.sh, run_dvrp.sh, configs.py)
 MIN_LIFETIME: int = 10            # Min demand lifetime (run_cotrain.sh, configs.py)
 MAX_LIFETIME: int = 50            # Max demand lifetime (run_cotrain.sh, configs.py)
-RANDOMIZE_DEPOT: bool = True      # Randomize depot location in cotrain (run_cotrain.sh)
+RANDOMIZE_DEPOT: bool = True      # Randomize depot location (run_cotrain.sh, train_diffusion_v2.sh)
 
 
 # ==============================================================================
@@ -85,8 +85,8 @@ GLOBAL_OPT_MODES: str = ""
 # TODO: 不同文件使用不同参数
 # Model checkpoint paths
 MODEL_CHECKPOINTS: str = "checkpoints/cotrain/static_20251205_144853/planner_cycle_1_best.pt"  # (evaluate_distributions.sh)
-STATIC_CKPT: str = "checkpoints/cotrain/static_20251207_131359/planner_cycle_1_best.pt"        # (run_dvrp.sh)
-RULE_MODE: str = ""               # Rule-based planner mode: "greedy", "exact", "heuristic" (run_dvrp.sh)
+STATIC_CKPT: str = ""        # (run_dvrp.sh)
+RULE_MODE: str = "greedy"               # Rule-based planner mode: "greedy", "exact", "heuristic" (run_dvrp.sh)
 
 
 # ==============================================================================
@@ -106,7 +106,7 @@ DIFFUSION_CHECKPOINTS: str = (
     "version4=checkpoints/cotrain/static_20251205_144853/generator_cycle_4.pth,"
     "version5=checkpoints/cotrain/static_20251205_144853/generator_cycle_5.pth"
 )
-DIFFUSION_CKPT: str = "checkpoints/cotrain/static_20251207_131359/generator_cycle_5.pth"  # (run_dvrp.sh)
+DIFFUSION_CKPT: str = "checkpoints/rl_generator/greedy_20251208-091258/best.pth"  # (run_dvrp.sh)
 SHOW_DIFFUSION_CHECKPOINT: str = "checkpoints/cotrain/static_20251205_065614/generator_cycle_1.pth"  # (show_diffusion.sh)
 
 # Generator model path in configs (configs.py)：run.py
@@ -165,7 +165,7 @@ EPISODES_PER_EPOCH: int = 1  # Episodes per epoch (run_cotrain.sh)
 
 TRAIN_EPISODES_PER_EPOCH: int = 10000  # Episodes per epoch for static training (train_static.sh)
 TRAIN_BATCH_SIZE: int = 4        # Batch size for static training (train_static.sh)
-LR: str = "1e-4"                  # Learning rate (train_static.sh)
+LR: float = 1e-4                  # Learning rate (train_static.sh)
 EPOCHS: int = 2000                # Training epochs (train_static.sh)
 
 
@@ -328,6 +328,37 @@ GENERATOR_PARAM_SPACE = {
     "min_lifetime": [30, 60],
     "max_lifetime": [61, 100],
 }
+
+
+# ==============================================================================
+# 24. DIFFUSION V2 SETTINGS
+# ==============================================================================
+# Settings for Diffusion V2 generator training and visualization
+# (train_diffusion_v2.sh, visualize_diffusion_v2.sh)
+
+# --- Training Settings ---
+DIFFUSION_V2_EPOCHS: int = 100                # Number of training epochs
+DIFFUSION_V2_EPISODES_PER_EPOCH: int = 1024      # Episodes per epoch
+DIFFUSION_V2_LR: float = 3e-4                  # Learning rate
+
+# --- Depot Position ---
+DIFFUSION_V2_DEPOT_X: int = 15                 # Depot X coordinate
+DIFFUSION_V2_DEPOT_Y: int = 15                 # Depot Y coordinate
+
+# --- Sampling Settings ---
+DIFFUSION_V2_DDIM_STEPS: int = 15              # DDIM sampling steps
+
+# --- Output Paths ---
+DIFFUSION_V2_OUTPUT_DIR: str = "checkpoints/diffusion_v2"  # Checkpoint directory
+DIFFUSION_V2_LOG_DIR: str = "runs/diffusion_v2"            # TensorBoard log directory
+
+# --- Resume Training ---
+DIFFUSION_V2_RESUME: str = ""                  # Resume from checkpoint path (empty = train from scratch)
+
+# --- Visualization Settings ---
+DIFFUSION_V2_VIZ_CHECKPOINT: str = "checkpoints/diffusion_v2/run_20251209-013905/best.pth"          # Checkpoint for visualization (empty = random model)
+DIFFUSION_V2_VIZ_SAMPLES: int = 4              # Number of samples to visualize
+DIFFUSION_V2_VIZ_SAVE_PATH: str = "outputs/diffusion_v2_viz.png"  # Visualization save path
 
 
 # ==============================================================================
