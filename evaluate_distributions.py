@@ -14,7 +14,6 @@ from datetime import datetime
 from run_evaluate import run_episode_return_metrics
 from configs import get_default_config, Config
 from agent.generator.distribution_sets import SUPPORTED_DEMAND_DISTRIBUTIONS
-from agent.generator.data_utils import CONDITION_DIM, prepare_condition
 
 # 支持的分布名称
 DISTRIBUTIONS = list(SUPPORTED_DEMAND_DISTRIBUTIONS)
@@ -197,6 +196,7 @@ class DiffusionDistributionGenerator:
         map_size: int = 30,
         max_time: int = 5000,
         max_c: int = 5,
+        total_demand: int = 60,
         device: str = "cuda",
     ):
         import torch
@@ -208,6 +208,7 @@ class DiffusionDistributionGenerator:
         self.map_size = map_size
         self.max_time = max_time
         self.max_c = max_c
+        self.total_demand = total_demand
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         
         # Initialize diffusion model
@@ -226,9 +227,8 @@ class DiffusionDistributionGenerator:
             self.model.load_state_dict(ckpt, strict=False)
         self.model.eval()
         
-        # NOTE: condition depends on requested number of nodes (num_demands).
-        # We construct condition dynamically in `generate_demands` below.
-        self.condition = None
+        # Prepare condition with total_demand and max_c (other params use defaults)
+        self.condition = prepare_condition(total_demand=total_demand, max_c=max_c).unsqueeze(0).to(self.device)
         
         # Demand converter
         self.converter = DemandConverter(
@@ -262,16 +262,10 @@ class DiffusionDistributionGenerator:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         
-        # Build condition for this call (ensure param_ prefixes)
-        cond_params = {
-            "param_total_demand": int(num_nodes),
-            "param_max_c": int(self.max_c),
-        }
-        condition = prepare_condition(cond_params).unsqueeze(0).to(self.device)
-
+        # Use pre-computed condition (total_demand and max_c set at init)
         with torch.no_grad():
             output = self.model.sample(
-                condition=condition,
+                condition=self.condition,
                 num_demands=num_nodes,
                 grid_size=(self.map_size, self.map_size),
             )
@@ -290,6 +284,7 @@ def load_diffusion_generators(
     map_size: int,
     max_time: int,
     max_c: int,
+    total_demand: int = 60,
     device: str = "cuda",
 ) -> List[DiffusionDistributionGenerator]:
     """Load multiple diffusion generators from checkpoints."""
@@ -304,6 +299,7 @@ def load_diffusion_generators(
                 map_size=map_size,
                 max_time=max_time,
                 max_c=max_c,
+                total_demand=total_demand,
                 device=device,
             )
             generators.append(gen)
@@ -965,6 +961,7 @@ if __name__ == "__main__":
                     map_size=cfg.width,
                     max_time=cfg.max_time,
                     max_c=cfg.generator_params.get("max_c", 5),
+                    total_demand=cfg.generator_params.get("total_demand", 60),
                     device="cuda",
                 )
                 if label:

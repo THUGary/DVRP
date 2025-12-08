@@ -2,7 +2,6 @@
 Generator Trainer Module
 
 Adversarial training for diffusion generator to find planner weaknesses.
-Uses RLGeneratorTrainer from training/generator/train_rl_diffusion_generator.py
 
 Supports multi-GPU training with DDP:
 - When num_gpus > 1, wraps model with DistributedDataParallel
@@ -36,7 +35,6 @@ from .utils.distributed import (
 from models.generator_model.diffusion_model import DemandDiffusionModel
 from agent.generator.data_utils import CONDITION_DIM, prepare_condition
 from environment.env import GridEnvironment
-from training.generator.train_rl_diffusion_generator import RLGeneratorTrainer
 from training.generator.rl_utils import (
     make_environment,
     calculate_spatial_entropy,
@@ -132,13 +130,11 @@ class GeneratorTrainer:
             max_time=config.env.max_time,
         )
         
-        # Prepare default condition using merged generator params (with 'param_' prefix)
-        gen_params = getattr(self, 'trainer_cfg_obj', None)
-        if gen_params is not None and hasattr(self.trainer_cfg_obj, 'generator_params'):
-            cond_dict = {f"param_{k}": v for k, v in self.trainer_cfg_obj.generator_params.items()}
-        else:
-            cond_dict = {}
-        self.condition = prepare_condition(cond_dict).unsqueeze(0).to(self.device)
+        # Prepare default condition using merged generator params
+        cfg = self.config
+        _total_demand = getattr(cfg.env, 'total_demand', 60) if hasattr(cfg, 'env') else 60
+        _max_c = getattr(cfg.env, 'max_c', 5) if hasattr(cfg, 'env') else 5
+        self.condition = prepare_condition(total_demand=_total_demand, max_c=_max_c).unsqueeze(0).to(self.device)
     
     def _init_optimizer(self):
         """Initialize optimizer."""
@@ -268,12 +264,11 @@ class GeneratorTrainer:
         
         cfg = self.config
         
-        # Update condition with generator params (depot is not part of condition)
-        if hasattr(self, 'trainer_cfg_obj') and hasattr(self.trainer_cfg_obj, 'generator_params'):
-            cond_dict = {f"param_{k}": v for k, v in self.trainer_cfg_obj.generator_params.items()}
-        else:
-            cond_dict = {}
-        condition = prepare_condition(cond_dict).unsqueeze(0).to(self.device)
+        # Update condition with generator params
+        cfg = self.config
+        _total_demand = getattr(cfg.env, 'total_demand', 60)
+        _max_c = getattr(cfg.env, 'max_c', 5)
+        condition = prepare_condition(total_demand=_total_demand, max_c=_max_c).unsqueeze(0).to(self.device)
 
         # Get underlying model for sampling
         model_for_sample = unwrap_model(self.model) if self.distributed else self.model
@@ -371,12 +366,9 @@ class GeneratorTrainer:
             depots.append(depot)
             
             # Generate demands with DDIM
-            # cond_params = {"depot": depot}
-            if hasattr(self, 'trainer_cfg_obj') and hasattr(self.trainer_cfg_obj, 'generator_params'):
-                cond_dict = {f"param_{k}": v for k, v in self.trainer_cfg_obj.generator_params.items()}
-            else:
-                cond_dict = {}
-            condition = prepare_condition(cond_dict).unsqueeze(0).to(self.device)
+            _total_demand = getattr(cfg.env, 'total_demand', 60)
+            _max_c = getattr(cfg.env, 'max_c', 5)
+            condition = prepare_condition(total_demand=_total_demand, max_c=_max_c).unsqueeze(0).to(self.device)
 
             with torch.no_grad():
                 model_for_sample.eval()

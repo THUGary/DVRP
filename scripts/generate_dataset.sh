@@ -57,6 +57,8 @@ echo ""
 echo "  PROBLEM SETTINGS:"
 echo "    Num nodes:          $NUM_NODES"
 echo "    Target vehicles:    $TARGET_VEHICLES"
+echo "    Total demand:       $TOTAL_DEMAND"
+echo "    Max C:              $MAX_C"
 echo "    Random seed:        $SEED"
 echo ""
 if [[ "$MODE" == "diffusion" ]]; then
@@ -64,6 +66,7 @@ if [[ "$MODE" == "diffusion" ]]; then
     echo "    Checkpoint:         $DIFFUSION_CKPT"
     echo "    DDIM steps:         $DDIM_STEPS"
     echo "    Batch size:         $BATCH_SIZE"
+    echo "    Condition params:   total_demand=$TOTAL_DEMAND, max_c=$MAX_C"
     echo ""
 fi
 echo "  HARDWARE:"

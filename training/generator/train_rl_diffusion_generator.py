@@ -76,6 +76,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--planner", type=str, default="greedy", choices=["greedy", "model"])
     p.add_argument("--planner_ckpt", type=str, default="checkpoints/planner/planner_dynamic_20_2_200.pt")
     p.add_argument("--total_demand", type=int, default=60)
+    p.add_argument("--max_c", type=int, default=5, help="Max capacity per demand node")
     p.add_argument("--lr", type=float, default=2e-6)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--init_diffusion_ckpt", type=str, default="checkpoints/diffusion_model.pth")
@@ -97,7 +98,7 @@ def build_argparser() -> argparse.ArgumentParser:
     # [NEW] Control visualization frequency
     p.add_argument("--log_image_every", type=int, default=100, help="Log heatmaps every N episodes")
     # [NEW] Early Stopping
-    p.add_argument("--patience", type=int, default=2000, help="Stop if no improvement in generator reward for N episodes")
+    p.add_argument("--patience", type=int, default=1000, help="Stop if no improvement in generator reward for N episodes")
     return p
 
 def _init_planner(planner_type: str, cfg, device: torch.device, ckpt_path: str | None) -> Any:
@@ -252,309 +253,6 @@ def _plan_episode(planner, env: GridEnvironment, demands: List[Tuple[int,int,int
 
 
 # ==============================================================================
-# Reusable RLGeneratorTrainer Class
-# ==============================================================================
-
-class RLGeneratorTrainer:
-    """
-    Reusable RL-based adversarial trainer for diffusion demand generator.
-    
-    Can be used standalone or integrated into coevolution pipelines (adversarial_v2).
-    
-    Usage:
-        trainer = RLGeneratorTrainer(
-            model=diffusion_model,
-            planner=planner,
-            env=grid_env,
-            cfg=config,
-            device=device,
-        )
-        for ep in range(episodes):
-            metrics = trainer.train_step(ep)
-    """
-    
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        planner,
-        env: GridEnvironment,
-        cfg,
-        device: torch.device,
-        lr: float = 2e-6,
-        baseline_beta: float = 0.9,
-        normalize_reward: bool = False,
-        entropy_weight: float = 0.80,
-        time_entropy_weight: float = 0.05,
-        sl_weight: float = 0.1,
-        diff_loss_clip: float = 10.0,
-        static_mode: bool = False,
-        randomize_depot: bool = True,
-    ):
-        self.model = model
-        self.planner = planner
-        self.env = env
-        self.cfg = cfg
-        self.device = device
-        
-        # Hyperparameters
-        self.lr = lr
-        self.baseline_beta = baseline_beta
-        self.normalize_reward = normalize_reward
-        self.entropy_weight = entropy_weight
-        self.time_entropy_weight = time_entropy_weight
-        self.sl_weight = sl_weight
-        self.diff_loss_clip = diff_loss_clip
-        self.static_mode = static_mode
-        self.randomize_depot = randomize_depot
-        
-        # Initialize optimizer
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
-        
-        # Baseline for variance reduction
-        self.baseline = None
-        
-        # Prepare condition tensor from generator params
-        from agent.generator.data_utils import prepare_condition
-        cond_params = {f"param_{k}": v for k, v in cfg.generator_params.items()}
-        self.condition = prepare_condition(cond_params).unsqueeze(0).to(device)
-        
-        # Best reward tracking (for early stopping)
-        self.best_gen_reward = -float('inf')
-        self.patience_counter = 0
-    
-    def update_planner(self, planner):
-        """Update planner reference (for coevolution)."""
-        self.planner = planner
-    
-    def generate_demands(self, seed: int = None) -> List[Tuple[int, int, int, int, int]]:
-        """Generate demands using diffusion model."""
-        if seed is not None:
-            torch.manual_seed(seed)
-        
-        self.model.eval()
-        with torch.no_grad():
-            gen_tensor = self.model.sample(
-                condition=self.condition,
-                num_demands=int(self.cfg.generator_params["total_demand"]),
-                grid_size=(self.cfg.width, self.cfg.height)
-            )
-        
-        # Decode demands
-        demands = decode_demands_from_tensor(gen_tensor, {
-            'width': self.cfg.width,
-            'height': self.cfg.height,
-            'max_time': self.cfg.max_time,
-            'max_c': self.cfg.generator_params['max_c'],
-            'min_lifetime': self.cfg.generator_params['min_lifetime'],
-            'max_lifetime': self.cfg.generator_params['max_lifetime']
-        })
-        
-        # Apply static constraints if needed
-        if self.static_mode:
-            demands = apply_static_constraints(demands, self.cfg.max_time)
-        
-        return demands
-    
-    def rollout(
-        self,
-        demands: List[Tuple[int, int, int, int, int]],
-        renderer=None,
-        fps: int = 10,
-    ) -> Tuple[float, float, float]:
-        """
-        Rollout episode and return (env_reward, total_demand_cap, failed_cap).
-        """
-        return _plan_episode(
-            self.planner, self.env, demands,
-            renderer=renderer, fps=fps
-        )
-    
-    def compute_loss(
-        self,
-        demands: List[Tuple[int, int, int, int, int]],
-        serviced_reward: float,
-        total_demand_cap: float,
-        total_failed_cap: float,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Compute adversarial loss for generator update.
-        
-        Returns:
-            loss: Tensor to backprop
-            metrics: Dict with detailed metrics
-        
-        Note: The order matches main() exactly:
-            1. gen_reward = failed - serviced
-            2. Add entropy bonuses
-            3. gen_reward_for_early_stop = gen_reward (BEFORE demand cap penalty)
-            4. Apply demand cap penalty
-            5. Compute advantage and loss
-        """
-        # Generator reward = failed capacity - serviced reward
-        gen_reward = total_failed_cap - serviced_reward
-        
-        # Entropy bonuses
-        entropy_bonus = self.entropy_weight * calculate_spatial_entropy(demands)
-        time_bonus = self.time_entropy_weight * calculate_temporal_entropy(demands)
-        gen_reward += entropy_bonus + time_bonus
-        
-        # Store gen_reward BEFORE demand cap penalty (for early stopping)
-        gen_reward_for_early_stop = gen_reward
-        
-        # Penalty for too few demands (applied AFTER early stop check in main())
-        if total_demand_cap < 10:
-            gen_reward -= 100
-        
-        # Advantage computation
-        if self.baseline is None:
-            self.baseline = gen_reward
-        adv = gen_reward - self.baseline
-        self.baseline = self.baseline_beta * self.baseline + (1 - self.baseline_beta) * gen_reward
-        
-        # Scale advantage
-        if self.normalize_reward:
-            adv_scaled = torch.tanh(torch.tensor(
-                adv / (abs(self.baseline) + 1e-6),
-                dtype=torch.float32, device=self.device
-            ))
-        else:
-            adv_scaled = torch.tensor(adv, dtype=torch.float32, device=self.device)
-        
-        # Normalize demands for training
-        x_start = normalize_demands_for_training(demands, self.cfg).to(self.device).unsqueeze(0)
-        
-        # Forward diffusion loss
-        self.model.train()
-        noise, predicted_noise = self.model(x_start, self.condition)
-        diff_loss = F.mse_loss(predicted_noise, noise)
-        diff_loss_clipped = torch.clamp(diff_loss, max=self.diff_loss_clip)
-        
-        # Final loss
-        loss = diff_loss_clipped * (adv_scaled + self.sl_weight)
-        
-        metrics = {
-            "serviced_reward": serviced_reward,
-            "gen_reward": gen_reward,
-            "gen_reward_for_early_stop": gen_reward_for_early_stop,  # Before demand cap penalty
-            "entropy_bonus": entropy_bonus,
-            "time_bonus": time_bonus,
-            "advantage": adv,
-            "diff_loss": diff_loss.item(),
-            "diff_loss_clipped": diff_loss_clipped.item(),
-            "loss": loss.item(),
-            "baseline": self.baseline,
-        }
-        
-        return loss, metrics
-    
-    def train_step(
-        self,
-        episode: int,
-        seed: int = 1,
-        renderer=None,
-        fps: int = 10,
-    ) -> Dict[str, float]:
-        """
-        One full training step: generate -> rollout -> update.
-        
-        Args:
-            episode: Current episode number
-            seed: Random seed
-            renderer: Optional PygameRenderer
-            fps: Frames per second for rendering
-        
-        Returns:
-            metrics: Dict with training metrics
-        """
-        # Randomize depot
-        if self.randomize_depot:
-            import random
-            rng = random.Random(seed + episode)
-            new_depot = (
-                rng.randint(0, self.cfg.width - 1),
-                rng.randint(0, self.cfg.height - 1)
-            )
-            self.cfg.depot = new_depot
-            self.env.depot = new_depot
-            self.cfg.generator_params = {**self.cfg.generator_params, "depot": new_depot}
-            # Update condition
-            from agent.generator.data_utils import prepare_condition
-            cond_params = {f"param_{k}": v for k, v in self.cfg.generator_params.items()}
-            self.condition = prepare_condition(cond_params).unsqueeze(0).to(self.device)
-        
-        # Generate demands
-        demands = self.generate_demands(seed=seed + episode)
-        
-        # Rollout
-        serviced_reward, total_demand_cap, total_failed_cap = self.rollout(
-            demands, renderer=renderer, fps=fps
-        )
-        
-        # Compute loss
-        loss, metrics = self.compute_loss(
-            demands, serviced_reward, total_demand_cap, total_failed_cap
-        )
-        
-        # Backward pass
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
-        
-        return metrics
-    
-    def check_early_stopping(self, gen_reward: float, patience: int = 500) -> bool:
-        """
-        Check if training should stop early.
-        
-        Returns:
-            True if should stop, False otherwise
-        """
-        if gen_reward > self.best_gen_reward:
-            self.best_gen_reward = gen_reward
-            self.patience_counter = 0
-            return False
-        else:
-            self.patience_counter += 1
-            return self.patience_counter >= patience
-    
-    def save_checkpoint(self, path: str, epoch: int = 0, extra_state: Dict = None):
-        """Save model checkpoint."""
-        import os
-        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-        
-        state = {
-            "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "baseline": self.baseline,
-            "best_gen_reward": self.best_gen_reward,
-        }
-        if extra_state:
-            state.update(extra_state)
-        
-        torch.save(state, path)
-    
-    def load_checkpoint(self, path: str) -> int:
-        """Load model checkpoint. Returns epoch number."""
-        ckpt = torch.load(path, map_location=self.device)
-        
-        self.model.load_state_dict(ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if "baseline" in ckpt:
-            self.baseline = ckpt["baseline"]
-        if "best_gen_reward" in ckpt:
-            self.best_gen_reward = ckpt["best_gen_reward"]
-        
-        return ckpt.get("epoch", 0)
-    
-    def get_model_state_dict(self) -> Dict[str, torch.Tensor]:
-        """Get model state dict."""
-        return self.model.state_dict()
-
-
-# ==============================================================================
 # CLI Main Function
 # ==============================================================================
 
@@ -565,6 +263,7 @@ def main():
 
     cfg = get_default_config()
     cfg.generator_params["total_demand"] = args.total_demand
+    cfg.generator_params["max_c"] = args.max_c
 
     run_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     static_tag = "_static" if args.static else ""
@@ -618,8 +317,9 @@ def main():
             cfg.generator_params = {**cfg.generator_params, "depot": new_depot}
 
         # Prepare Condition (use current cfg.generator_params)
-        cond_params = {f"param_{k}": v for k, v in cfg.generator_params.items()}
-        condition = prepare_condition(cond_params).unsqueeze(0).to(device)
+        _total_demand = cfg.generator_params.get("total_demand", 60)
+        _max_c = cfg.generator_params.get("max_c", 5)
+        condition = prepare_condition(total_demand=_total_demand, max_c=_max_c).unsqueeze(0).to(device)
 
         # Generate Demands
         model.eval()
@@ -724,3 +424,309 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ==============================================================================
+# Reusable RLGeneratorTrainer Class
+# ==============================================================================
+
+# class RLGeneratorTrainer:
+#     """
+#     Reusable RL-based adversarial trainer for diffusion demand generator.
+    
+#     Can be used standalone or integrated into coevolution pipelines (adversarial_v2).
+    
+#     Usage:
+#         trainer = RLGeneratorTrainer(
+#             model=diffusion_model,
+#             planner=planner,
+#             env=grid_env,
+#             cfg=config,
+#             device=device,
+#         )
+#         for ep in range(episodes):
+#             metrics = trainer.train_step(ep)
+#     """
+    
+#     def __init__(
+#         self,
+#         model: torch.nn.Module,
+#         planner,
+#         env: GridEnvironment,
+#         cfg,
+#         device: torch.device,
+#         lr: float = 2e-6,
+#         baseline_beta: float = 0.9,
+#         normalize_reward: bool = False,
+#         entropy_weight: float = 0.80,
+#         time_entropy_weight: float = 0.05,
+#         sl_weight: float = 0.1,
+#         diff_loss_clip: float = 10.0,
+#         static_mode: bool = False,
+#         randomize_depot: bool = True,
+#     ):
+#         self.model = model
+#         self.planner = planner
+#         self.env = env
+#         self.cfg = cfg
+#         self.device = device
+        
+#         # Hyperparameters
+#         self.lr = lr
+#         self.baseline_beta = baseline_beta
+#         self.normalize_reward = normalize_reward
+#         self.entropy_weight = entropy_weight
+#         self.time_entropy_weight = time_entropy_weight
+#         self.sl_weight = sl_weight
+#         self.diff_loss_clip = diff_loss_clip
+#         self.static_mode = static_mode
+#         self.randomize_depot = randomize_depot
+        
+#         # Initialize optimizer
+#         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
+        
+#         # Baseline for variance reduction
+#         self.baseline = None
+        
+#         # Prepare condition tensor from generator params
+#         from agent.generator.data_utils import prepare_condition
+#         _total_demand = cfg.generator_params.get("total_demand", 60)
+#         _max_c = cfg.generator_params.get("max_c", 5)
+#         self.condition = prepare_condition(total_demand=_total_demand, max_c=_max_c).unsqueeze(0).to(device)
+        
+#         # Best reward tracking (for early stopping)
+#         self.best_gen_reward = -float('inf')
+#         self.patience_counter = 0
+    
+#     def update_planner(self, planner):
+#         """Update planner reference (for coevolution)."""
+#         self.planner = planner
+    
+#     def generate_demands(self, seed: int = None) -> List[Tuple[int, int, int, int, int]]:
+#         """Generate demands using diffusion model."""
+#         if seed is not None:
+#             torch.manual_seed(seed)
+        
+#         self.model.eval()
+#         with torch.no_grad():
+#             gen_tensor = self.model.sample(
+#                 condition=self.condition,
+#                 num_demands=int(self.cfg.generator_params["total_demand"]),
+#                 grid_size=(self.cfg.width, self.cfg.height)
+#             )
+        
+#         # Decode demands
+#         demands = decode_demands_from_tensor(gen_tensor, {
+#             'width': self.cfg.width,
+#             'height': self.cfg.height,
+#             'max_time': self.cfg.max_time,
+#             'max_c': self.cfg.generator_params['max_c'],
+#             'min_lifetime': self.cfg.generator_params['min_lifetime'],
+#             'max_lifetime': self.cfg.generator_params['max_lifetime']
+#         })
+        
+#         # Apply static constraints if needed
+#         if self.static_mode:
+#             demands = apply_static_constraints(demands, self.cfg.max_time)
+        
+#         return demands
+    
+#     def rollout(
+#         self,
+#         demands: List[Tuple[int, int, int, int, int]],
+#         renderer=None,
+#         fps: int = 10,
+#     ) -> Tuple[float, float, float]:
+#         """
+#         Rollout episode and return (env_reward, total_demand_cap, failed_cap).
+#         """
+#         return _plan_episode(
+#             self.planner, self.env, demands,
+#             renderer=renderer, fps=fps
+#         )
+    
+#     def compute_loss(
+#         self,
+#         demands: List[Tuple[int, int, int, int, int]],
+#         serviced_reward: float,
+#         total_demand_cap: float,
+#         total_failed_cap: float,
+#     ) -> Tuple[torch.Tensor, Dict[str, float]]:
+#         """
+#         Compute adversarial loss for generator update.
+        
+#         Returns:
+#             loss: Tensor to backprop
+#             metrics: Dict with detailed metrics
+        
+#         Note: The order matches main() exactly:
+#             1. gen_reward = failed - serviced
+#             2. Add entropy bonuses
+#             3. gen_reward_for_early_stop = gen_reward (BEFORE demand cap penalty)
+#             4. Apply demand cap penalty
+#             5. Compute advantage and loss
+#         """
+#         # Generator reward = failed capacity - serviced reward
+#         gen_reward = total_failed_cap - serviced_reward
+        
+#         # Entropy bonuses
+#         entropy_bonus = self.entropy_weight * calculate_spatial_entropy(demands)
+#         time_bonus = self.time_entropy_weight * calculate_temporal_entropy(demands)
+#         gen_reward += entropy_bonus + time_bonus
+        
+#         # Store gen_reward BEFORE demand cap penalty (for early stopping)
+#         gen_reward_for_early_stop = gen_reward
+        
+#         # Penalty for too few demands (applied AFTER early stop check in main())
+#         if total_demand_cap < 10:
+#             gen_reward -= 100
+        
+#         # Advantage computation
+#         if self.baseline is None:
+#             self.baseline = gen_reward
+#         adv = gen_reward - self.baseline
+#         self.baseline = self.baseline_beta * self.baseline + (1 - self.baseline_beta) * gen_reward
+        
+#         # Scale advantage
+#         if self.normalize_reward:
+#             adv_scaled = torch.tanh(torch.tensor(
+#                 adv / (abs(self.baseline) + 1e-6),
+#                 dtype=torch.float32, device=self.device
+#             ))
+#         else:
+#             adv_scaled = torch.tensor(adv, dtype=torch.float32, device=self.device)
+        
+#         # Normalize demands for training
+#         x_start = normalize_demands_for_training(demands, self.cfg).to(self.device).unsqueeze(0)
+        
+#         # Forward diffusion loss
+#         self.model.train()
+#         noise, predicted_noise = self.model(x_start, self.condition)
+#         diff_loss = F.mse_loss(predicted_noise, noise)
+#         diff_loss_clipped = torch.clamp(diff_loss, max=self.diff_loss_clip)
+        
+#         # Final loss
+#         loss = diff_loss_clipped * (adv_scaled + self.sl_weight)
+        
+#         metrics = {
+#             "serviced_reward": serviced_reward,
+#             "gen_reward": gen_reward,
+#             "gen_reward_for_early_stop": gen_reward_for_early_stop,  # Before demand cap penalty
+#             "entropy_bonus": entropy_bonus,
+#             "time_bonus": time_bonus,
+#             "advantage": adv,
+#             "diff_loss": diff_loss.item(),
+#             "diff_loss_clipped": diff_loss_clipped.item(),
+#             "loss": loss.item(),
+#             "baseline": self.baseline,
+#         }
+        
+#         return loss, metrics
+    
+#     def train_step(
+#         self,
+#         episode: int,
+#         seed: int = 1,
+#         renderer=None,
+#         fps: int = 10,
+#     ) -> Dict[str, float]:
+#         """
+#         One full training step: generate -> rollout -> update.
+        
+#         Args:
+#             episode: Current episode number
+#             seed: Random seed
+#             renderer: Optional PygameRenderer
+#             fps: Frames per second for rendering
+        
+#         Returns:
+#             metrics: Dict with training metrics
+#         """
+#         # Randomize depot
+#         if self.randomize_depot:
+#             import random
+#             rng = random.Random(seed + episode)
+#             new_depot = (
+#                 rng.randint(0, self.cfg.width - 1),
+#                 rng.randint(0, self.cfg.height - 1)
+#             )
+#             self.cfg.depot = new_depot
+#             self.env.depot = new_depot
+#             self.cfg.generator_params = {**self.cfg.generator_params, "depot": new_depot}
+#             # Update condition
+#             from agent.generator.data_utils import prepare_condition
+#             _total_demand = self.cfg.generator_params.get("total_demand", 60)
+#             _max_c = self.cfg.generator_params.get("max_c", 5)
+#             self.condition = prepare_condition(total_demand=_total_demand, max_c=_max_c).unsqueeze(0).to(self.device)
+        
+#         # Generate demands
+#         demands = self.generate_demands(seed=seed + episode)
+        
+#         # Rollout
+#         serviced_reward, total_demand_cap, total_failed_cap = self.rollout(
+#             demands, renderer=renderer, fps=fps
+#         )
+        
+#         # Compute loss
+#         loss, metrics = self.compute_loss(
+#             demands, serviced_reward, total_demand_cap, total_failed_cap
+#         )
+        
+#         # Backward pass
+#         self.optimizer.zero_grad()
+#         loss.backward()
+#         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+#         self.optimizer.step()
+        
+#         return metrics
+    
+#     def check_early_stopping(self, gen_reward: float, patience: int = 500) -> bool:
+#         """
+#         Check if training should stop early.
+        
+#         Returns:
+#             True if should stop, False otherwise
+#         """
+#         if gen_reward > self.best_gen_reward:
+#             self.best_gen_reward = gen_reward
+#             self.patience_counter = 0
+#             return False
+#         else:
+#             self.patience_counter += 1
+#             return self.patience_counter >= patience
+    
+#     def save_checkpoint(self, path: str, epoch: int = 0, extra_state: Dict = None):
+#         """Save model checkpoint."""
+#         import os
+#         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        
+#         state = {
+#             "epoch": epoch,
+#             "model_state_dict": self.model.state_dict(),
+#             "optimizer_state_dict": self.optimizer.state_dict(),
+#             "baseline": self.baseline,
+#             "best_gen_reward": self.best_gen_reward,
+#         }
+#         if extra_state:
+#             state.update(extra_state)
+        
+#         torch.save(state, path)
+    
+#     def load_checkpoint(self, path: str) -> int:
+#         """Load model checkpoint. Returns epoch number."""
+#         ckpt = torch.load(path, map_location=self.device)
+        
+#         self.model.load_state_dict(ckpt["model_state_dict"])
+#         if "optimizer_state_dict" in ckpt:
+#             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+#         if "baseline" in ckpt:
+#             self.baseline = ckpt["baseline"]
+#         if "best_gen_reward" in ckpt:
+#             self.best_gen_reward = ckpt["best_gen_reward"]
+        
+#         return ckpt.get("epoch", 0)
+    
+#     def get_model_state_dict(self) -> Dict[str, torch.Tensor]:
+#         """Get model state dict."""
+#         return self.model.state_dict()
+

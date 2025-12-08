@@ -93,7 +93,8 @@ def generate_diffusion_problems(
     num_problems: int,
     num_nodes: int,
     device: torch.device,
-    generator_params: Optional[Dict[str, Any]] = None,
+    total_demand: int = 60,
+    max_c: int = DEFAULT_MAX_DEMAND,
     batch_size: int = 100,
     use_ddim: bool = True,
     ddim_steps: int = 50,
@@ -112,7 +113,8 @@ def generate_diffusion_problems(
         num_problems: Number of problems to generate
         num_nodes: Number of customer nodes per problem
         device: Torch device
-        generator_params: Parameters for conditional generation
+        total_demand: Total demand for conditional generation
+        max_c: Maximum demand per node
         batch_size: Batch size for generation
         use_ddim: Use DDIM sampling (faster)
         ddim_steps: Number of DDIM steps
@@ -135,10 +137,8 @@ def generate_diffusion_problems(
     model.to(device)
     model.eval()
     
-    # Prepare condition (pass generator parameters such as total_demand / max_c)
-    cond_params = generator_params if generator_params is not None else {}
-    cond_prefixed = {f"param_{k}": v for k, v in cond_params.items()}
-    condition = prepare_condition(cond_prefixed).unsqueeze(0).to(device)
+    # Prepare condition with only total_demand and max_c (other params use defaults)
+    condition = prepare_condition(total_demand=total_demand, max_c=max_c).unsqueeze(0).to(device)
     
     # Generate problems in batches
     all_depot_xy = []
@@ -149,6 +149,7 @@ def generate_diffusion_problems(
     
     print(f"Generating {num_problems} problems with diffusion model...")
     print(f"  Model: {model_path}")
+    print(f"  Condition: total_demand={total_demand}, max_c={max_c}")
     print(f"  Batch size: {batch_size}, Num batches: {num_batches}")
     print(f"  DDIM: {use_ddim}, Steps: {ddim_steps if use_ddim else 1000}")
     
@@ -185,7 +186,6 @@ def generate_diffusion_problems(
                 node_xy = torch.stack([node_x, node_y], dim=-1)  # (num_nodes, 2)
                 
                 # Convert demand back to [1, max_c] then re-normalize
-                max_c = generator_params.get('max_c', DEFAULT_MAX_DEMAND) if generator_params else DEFAULT_MAX_DEMAND
                 raw_demand = node_c * max_c
                 raw_demand = raw_demand.clamp(1, max_c)
                 node_demand = raw_demand / DEMAND_NORM
@@ -393,7 +393,7 @@ def main():
     else:
         train_depot, train_nodes, train_demand = generate_diffusion_problems(
             args.diffusion_checkpoint, num_train, args.num_nodes, device,
-            generator_params={"total_demand": args.total_demand, "max_c": args.max_c},
+            total_demand=args.total_demand, max_c=args.max_c,
             batch_size=args.batch_size, use_ddim=args.use_ddim, ddim_steps=args.ddim_steps
         )
     
@@ -406,7 +406,7 @@ def main():
     else:
         test_depot, test_nodes, test_demand = generate_diffusion_problems(
             args.diffusion_checkpoint, num_test, args.num_nodes, device,
-            generator_params={"total_demand": args.total_demand, "max_c": args.max_c},
+            total_demand=args.total_demand, max_c=args.max_c,
             batch_size=args.batch_size, use_ddim=args.use_ddim, ddim_steps=args.ddim_steps
         )
     

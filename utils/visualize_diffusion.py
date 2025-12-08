@@ -43,10 +43,11 @@ def load_diffusion_model(
 
 def sample_demands(
     model: DemandDiffusionModel,
-    condition_params: Dict[str, Any],
     num_samples: int = 1000,
     num_demands_per_sample: int = 50,
     map_size: Tuple[int, int] = (40, 40),
+    total_demand: int = 60,
+    max_c: int = 5,
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 ) -> np.ndarray:
     """
@@ -54,16 +55,17 @@ def sample_demands(
     
     Args:
         model: Trained diffusion model
-        condition_params: Parameters for conditional generation
         num_samples: Number of sampling iterations
         num_demands_per_sample: Number of demands per sample
         map_size: Grid size for the map (width, height)
+        total_demand: Total demand for conditional generation
+        max_c: Maximum capacity per node
         device: Device for computation
         
     Returns:
         Array of shape (total_demands, 5) with [t, x, y, c, lifetime]
     """
-    condition = prepare_condition(condition_params).to(device)
+    condition = prepare_condition(total_demand=total_demand, max_c=max_c).to(device)
     
     all_demands = []
     
@@ -192,11 +194,12 @@ def create_heatmap(
 
 def visualize_distribution(
     checkpoint_path: str,
-    condition_params: Optional[Dict[str, Any]] = None,
     num_samples: int = 100,
     num_demands_per_sample: int = 50,
     grid_size: int = 50,
     map_size: Tuple[int, int] = (40, 40),
+    total_demand: int = 60,
+    max_c: int = 5,
     save_path: Optional[str] = None,
     show: bool = True,
     figsize: Tuple[int, int] = (12, 10),
@@ -207,11 +210,12 @@ def visualize_distribution(
     
     Args:
         checkpoint_path: Path to model checkpoint
-        condition_params: Parameters for conditional generation (uses defaults if None)
         num_samples: Number of sampling iterations
         num_demands_per_sample: Demands generated per iteration
         grid_size: Resolution of the heatmap
         map_size: Grid size for the map (width, height)
+        total_demand: Total demand for conditional generation
+        max_c: Maximum capacity per node
         save_path: Path to save the figure (optional)
         show: Whether to display the plot
         figsize: Figure size
@@ -220,16 +224,6 @@ def visualize_distribution(
     Returns:
         Heatmap array
     """
-    # Default condition parameters
-    if condition_params is None:
-        condition_params = {
-            "param_distribution": "uniform",
-            "param_total_demand": 50,
-            "param_num_centers": 6,
-            "param_neighborhood_size": 3,
-            "param_max_c": 5
-        }
-    
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
@@ -239,12 +233,13 @@ def visualize_distribution(
     
     # Sample demands
     print(f"Sampling {num_samples * num_demands_per_sample} demands...")
+    print(f"  Condition: total_demand={total_demand}, max_c={max_c}")
     demands = sample_demands(
-        model, condition_params, num_samples, num_demands_per_sample, map_size, device
+        model, num_samples, num_demands_per_sample, map_size, 
+        total_demand=total_demand, max_c=max_c, device=device
     )
     
     # Normalize samples to proper ranges
-    max_c = condition_params.get("param_max_c", 5)
     max_time = 100.0
     demands = normalize_samples(demands, max_time=max_time, max_c=max_c)
     
@@ -302,14 +297,9 @@ def visualize_distribution(
     ax4.set_ylabel('Count')
     ax4.set_xlim(1, max_c)
     
-    # Add condition info
-    dist_type = condition_params.get("param_distribution", "uniform")
-    total_demand = condition_params.get("param_total_demand", 50)
-    num_centers = condition_params.get("param_num_centers", 6)
-    
     fig.suptitle(
         f'Diffusion Generator Distribution Analysis\n'
-        f'Condition: {dist_type}, total_demand={total_demand}, centers={num_centers}',
+        f'Condition: total_demand={total_demand}, max_c={max_c}',
         fontsize=16, y=1.02
     )
     
@@ -329,9 +319,10 @@ def visualize_distribution(
 
 def visualize_episode_structure(
     checkpoint_path: str,
-    condition_params: Optional[Dict[str, Any]] = None,
     num_demands: int = 50,
     map_size: Tuple[int, int] = (40, 40),
+    total_demand: int = 60,
+    max_c: int = 5,
     depot: Tuple[float, float] = (0.5, 0.5),
     save_path: Optional[str] = None,
     show: bool = True,
@@ -349,9 +340,10 @@ def visualize_episode_structure(
     
     Args:
         checkpoint_path: Path to model checkpoint
-        condition_params: Parameters for conditional generation
         num_demands: Number of demands to generate
         map_size: Grid size for the map
+        total_demand: Total demand for conditional generation
+        max_c: Maximum capacity per node
         depot: Depot position (normalized 0-1)
         save_path: Path to save figure
         show: Whether to display
@@ -363,24 +355,15 @@ def visualize_episode_structure(
     from scipy import ndimage
     from scipy.spatial.distance import cdist
     
-    # Default condition parameters (matching training)
-    if condition_params is None:
-        condition_params = {
-            "param_distribution": "uniform",
-            "param_total_demand": 50,
-            "param_num_centers": 6,
-            "param_neighborhood_size": 3,
-            "param_max_c": 5
-        }
-    
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
     # Load model and sample ONE episode
     model = load_diffusion_model(checkpoint_path, device)
-    condition = prepare_condition(condition_params).to(device)
+    condition = prepare_condition(total_demand=total_demand, max_c=max_c).to(device)
     
     print(f"Generating {num_demands} demands for one episode...")
+    print(f"  Condition: total_demand={total_demand}, max_c={max_c}")
     with torch.no_grad():
         samples = model.sample(
             condition=condition,
@@ -389,7 +372,6 @@ def visualize_episode_structure(
         )
     
     demands = samples.cpu().numpy()
-    max_c = condition_params.get("param_max_c", 5)
     max_time = 100.0
     demands = normalize_samples(demands, max_time=max_time, max_c=max_c)
     
@@ -571,24 +553,26 @@ def visualize_episode_structure(
 
 def compare_distributions(
     checkpoint_path: str,
-    distribution_types: list = ["uniform", "gaussian", "cluster"],
     num_samples: int = 50,
     num_demands_per_sample: int = 50,
     grid_size: int = 40,
     map_size: Tuple[int, int] = (40, 40),
+    total_demand: int = 60,
+    max_c: int = 5,
     save_path: Optional[str] = None,
     show: bool = True
 ) -> Dict[str, np.ndarray]:
     """
-    Compare heatmaps for different distribution types.
+    Generate heatmap for diffusion model distribution.
     
     Args:
         checkpoint_path: Path to model checkpoint
-        distribution_types: List of distribution types to compare
         num_samples: Samples per distribution
         num_demands_per_sample: Demands per sample
         grid_size: Heatmap resolution
         map_size: Grid size for the map (width, height)
+        total_demand: Total demand for conditional generation
+        max_c: Maximum capacity per node
         save_path: Path to save figure
         show: Whether to display
         
@@ -599,44 +583,32 @@ def compare_distributions(
     model = load_diffusion_model(checkpoint_path, device)
     
     heatmaps = {}
-    n_dists = len(distribution_types)
     
-    fig, axes = plt.subplots(1, n_dists, figsize=(5 * n_dists, 5))
-    if n_dists == 1:
-        axes = [axes]
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
     
-    for idx, dist_type in enumerate(distribution_types):
-        condition_params = {
-            "param_distribution": dist_type,
-            "param_total_demand": 50,
-            "param_num_centers": 6,
-            "param_neighborhood_size": 3,
-            "param_max_c": 5
-        }
-        
-        print(f"Sampling for distribution: {dist_type}")
-        demands = sample_demands(
-            model, condition_params, num_samples, num_demands_per_sample, map_size, device
-        )
-        
-        # Normalize samples
-        demands = normalize_samples(demands, max_time=100.0, max_c=5.0)
-        
-        heatmap = create_heatmap(demands, grid_size)
-        heatmaps[dist_type] = heatmap
-        
-        ax = axes[idx]
-        im = ax.imshow(
-            heatmap.T,
-            origin='lower',
-            cmap='hot',
-            extent=[0, 1, 0, 1],
-            aspect='equal'
-        )
-        ax.set_title(f'{dist_type.capitalize()} Distribution', fontsize=12)
-        ax.set_xlabel('X Coordinate')
-        ax.set_ylabel('Y Coordinate')
-        plt.colorbar(im, ax=ax, label='Probability')
+    print(f"Sampling with condition: total_demand={total_demand}, max_c={max_c}")
+    demands = sample_demands(
+        model, num_samples, num_demands_per_sample, map_size,
+        total_demand=total_demand, max_c=max_c, device=device
+    )
+    
+    # Normalize samples
+    demands = normalize_samples(demands, max_time=100.0, max_c=max_c)
+    
+    heatmap = create_heatmap(demands, grid_size)
+    heatmaps["diffusion"] = heatmap
+    
+    im = ax.imshow(
+        heatmap.T,
+        origin='lower',
+        cmap='hot',
+        extent=[0, 1, 0, 1],
+        aspect='equal'
+    )
+    ax.set_title(f'Diffusion Distribution\n(total_demand={total_demand}, max_c={max_c})', fontsize=12)
+    ax.set_xlabel('X Coordinate')
+    ax.set_ylabel('Y Coordinate')
+    plt.colorbar(im, ax=ax, label='Probability')
     
     fig.suptitle('Distribution Comparison', fontsize=14)
     plt.tight_layout()
@@ -664,6 +636,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_demands", type=int, default=50)
     parser.add_argument("--grid_size", type=int, default=50)
     parser.add_argument("--map_size", type=int, default=40, help="Map size (square grid)")
+    parser.add_argument("--total-demand", type=int, default=60, help="Total demand")
+    parser.add_argument("--max-c", type=int, default=5, help="Max capacity")
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--compare", action="store_true", help="Compare all distribution types")
     parser.add_argument("--episode", action="store_true", help="Visualize single episode structure")
@@ -673,12 +647,16 @@ if __name__ == "__main__":
     
     map_size = (args.map_size, args.map_size)
     show = not args.no_show
+    total_demand = getattr(args, 'total_demand', 60)
+    max_c = getattr(args, 'max_c', 5)
     
     if args.episode:
         visualize_episode_structure(
             checkpoint_path=args.checkpoint,
             num_demands=args.num_demands,
             map_size=map_size,
+            total_demand=total_demand,
+            max_c=max_c,
             save_path=args.save_path,
             show=show
         )
@@ -689,21 +667,20 @@ if __name__ == "__main__":
             num_demands_per_sample=args.num_demands,
             grid_size=args.grid_size,
             map_size=map_size,
+            total_demand=total_demand,
+            max_c=max_c,
             save_path=args.save_path,
             show=show
         )
     else:
-        condition_params = {
-            "param_distribution": args.distribution,
-        }
-        
         visualize_distribution(
             checkpoint_path=args.checkpoint,
-            condition_params=condition_params,
             num_samples=args.num_samples,
             num_demands_per_sample=args.num_demands,
             grid_size=args.grid_size,
             map_size=map_size,
+            total_demand=total_demand,
+            max_c=max_c,
             save_path=args.save_path,
             show=show
         )
