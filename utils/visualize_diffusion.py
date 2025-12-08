@@ -695,10 +695,6 @@ if __name__ == "__main__":
     else:
         condition_params = {
             "param_distribution": args.distribution,
-            "param_total_demand": 50,
-            "param_num_centers": 6,
-            "param_neighborhood_size": 3,
-            "param_max_c": 5
         }
         
         visualize_distribution(

@@ -201,8 +201,19 @@ class PlannerTrainer:
             num_steps=1000,
         ).to(self.device)
         
-        # Prepare default condition
-        self.condition = prepare_condition({}).unsqueeze(0).to(self.device)
+        # Prepare default condition using environment-level generator params
+        # so that diffusion sampling respects total_demand / max_c settings
+        env = getattr(self.config, 'env', None)
+        cond_params = {}
+        if env is not None:
+            cond_params = {
+                'total_demand': getattr(env, 'total_demand', None),
+                'max_c': getattr(env, 'max_c', None),
+            }
+        # Filter out None values and prefix keys for prepare_condition
+        cond_params = {k: v for k, v in cond_params.items() if v is not None}
+        cond_prefixed = {f"param_{k}": v for k, v in cond_params.items()}
+        self.condition = prepare_condition(cond_prefixed).unsqueeze(0).to(self.device)
     
     def _init_optimizer(self):
         """Initialize optimizer using default hyperparameters from train_static.py."""

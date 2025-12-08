@@ -33,7 +33,7 @@ def prepare_condition(params: Dict[str, Any]) -> torch.Tensor:
     This is the single source of truth for creating condition vectors.
     """
     dist_map = {"uniform": 0, "gaussian": 1, "cluster": 2}
-    dist_type = params.get("param_distribution", "uniform")
+    dist_type = params.get("param_distribution", "gaussian")
     dist_one_hot = np.zeros(3)
     dist_one_hot[dist_map.get(dist_type, 0)] = 1
 

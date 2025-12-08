@@ -14,6 +14,7 @@ from datetime import datetime
 from run_evaluate import run_episode_return_metrics
 from configs import get_default_config, Config
 from agent.generator.distribution_sets import SUPPORTED_DEMAND_DISTRIBUTIONS
+from agent.generator.data_utils import CONDITION_DIM, prepare_condition
 
 # 支持的分布名称
 DISTRIBUTIONS = list(SUPPORTED_DEMAND_DISTRIBUTIONS)
@@ -225,8 +226,9 @@ class DiffusionDistributionGenerator:
             self.model.load_state_dict(ckpt, strict=False)
         self.model.eval()
         
-        # Prepare condition
-        self.condition = prepare_condition({}).unsqueeze(0).to(self.device)
+        # NOTE: condition depends on requested number of nodes (num_demands).
+        # We construct condition dynamically in `generate_demands` below.
+        self.condition = None
         
         # Demand converter
         self.converter = DemandConverter(
@@ -260,9 +262,16 @@ class DiffusionDistributionGenerator:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         
+        # Build condition for this call (ensure param_ prefixes)
+        cond_params = {
+            "param_total_demand": int(num_nodes),
+            "param_max_c": int(self.max_c),
+        }
+        condition = prepare_condition(cond_params).unsqueeze(0).to(self.device)
+
         with torch.no_grad():
             output = self.model.sample(
-                condition=self.condition,
+                condition=condition,
                 num_demands=num_nodes,
                 grid_size=(self.map_size, self.map_size),
             )
@@ -421,6 +430,7 @@ def evaluate_distributions(
     start_time = time_module.time()
 
     seed_values = [seed + idx for idx in range(num_runs)]
+    # TODO: num_nodes to total_demand
     num_nodes = int(cfg.generator_params.get("num_nodes", 30))
     precomputed_diffusion = _precompute_diffusion_demands(
         diffusion_gen_map,

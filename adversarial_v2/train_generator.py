@@ -132,8 +132,13 @@ class GeneratorTrainer:
             max_time=config.env.max_time,
         )
         
-        # Prepare default condition
-        self.condition = prepare_condition({}).unsqueeze(0).to(self.device)
+        # Prepare default condition using merged generator params (with 'param_' prefix)
+        gen_params = getattr(self, 'trainer_cfg_obj', None)
+        if gen_params is not None and hasattr(self.trainer_cfg_obj, 'generator_params'):
+            cond_dict = {f"param_{k}": v for k, v in self.trainer_cfg_obj.generator_params.items()}
+        else:
+            cond_dict = {}
+        self.condition = prepare_condition(cond_dict).unsqueeze(0).to(self.device)
     
     def _init_optimizer(self):
         """Initialize optimizer."""
@@ -150,13 +155,23 @@ class GeneratorTrainer:
         gen_params = default_cfg.generator_params
         
         # Build dict for decode_demands_from_tensor
+        # Merge defaults with environment overrides (total_demand, max_c)
+        env_params = {}
+        if hasattr(cfg, 'env') and cfg.env is not None:
+            if hasattr(cfg.env, 'total_demand'):
+                env_params['total_demand'] = cfg.env.total_demand
+            if hasattr(cfg.env, 'max_c'):
+                env_params['max_c'] = cfg.env.max_c
+
+        merged_params = {**gen_params, **env_params}
+
         self.trainer_cfg = {
             "width": cfg.env.map_size,
             "height": cfg.env.map_size,
             "max_time": cfg.env.max_time,
-            "max_c": gen_params.get("max_demand", 5),
-            "min_lifetime": gen_params.get("lifetime_min", 10),
-            "max_lifetime": gen_params.get("lifetime_max", 50),
+            "max_c": merged_params.get("max_c", gen_params.get("max_demand", 5)),
+            "min_lifetime": merged_params.get("min_lifetime", gen_params.get("lifetime_min", 10)),
+            "max_lifetime": merged_params.get("max_lifetime", gen_params.get("lifetime_max", 50)),
         }
         
         # Also keep object-style for normalize_demands_for_training
@@ -167,7 +182,8 @@ class GeneratorTrainer:
         self.trainer_cfg_obj.height = cfg.env.map_size
         self.trainer_cfg_obj.max_time = cfg.env.max_time
         self.trainer_cfg_obj.depot = cfg.env.depot
-        self.trainer_cfg_obj.generator_params = gen_params
+        # Expose merged generator params to downstream trainers
+        self.trainer_cfg_obj.generator_params = merged_params
         
     
     def _init_diffusion(self):
@@ -252,9 +268,12 @@ class GeneratorTrainer:
         
         cfg = self.config
         
-        # Update condition with depot
-        # cond_params = {"depot": depot}
-        condition = prepare_condition({}).unsqueeze(0).to(self.device)
+        # Update condition with generator params (depot is not part of condition)
+        if hasattr(self, 'trainer_cfg_obj') and hasattr(self.trainer_cfg_obj, 'generator_params'):
+            cond_dict = {f"param_{k}": v for k, v in self.trainer_cfg_obj.generator_params.items()}
+        else:
+            cond_dict = {}
+        condition = prepare_condition(cond_dict).unsqueeze(0).to(self.device)
 
         # Get underlying model for sampling
         model_for_sample = unwrap_model(self.model) if self.distributed else self.model
@@ -353,7 +372,11 @@ class GeneratorTrainer:
             
             # Generate demands with DDIM
             # cond_params = {"depot": depot}
-            condition = prepare_condition({}).unsqueeze(0).to(self.device)
+            if hasattr(self, 'trainer_cfg_obj') and hasattr(self.trainer_cfg_obj, 'generator_params'):
+                cond_dict = {f"param_{k}": v for k, v in self.trainer_cfg_obj.generator_params.items()}
+            else:
+                cond_dict = {}
+            condition = prepare_condition(cond_dict).unsqueeze(0).to(self.device)
 
             with torch.no_grad():
                 model_for_sample.eval()

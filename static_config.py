@@ -211,12 +211,12 @@ TEST_DATA_PATH: str = "data/static_diffusion_vrp/test.pt"          # Path to pre
 
 # Dataset generation settings (generate_dataset.py)
 DATASET_OUTPUT_DIR: str = "data/static_diffusion_vrp"  # Output directory for generated datasets
-DATASET_TOTAL_EPISODES: int = 10          # Total number of problems to generate
+DATASET_TOTAL_EPISODES: int = int(3e6)          # Total number of problems to generate
 DATASET_TEST_RATIO: float = 0.1              # Ratio of problems for test set (0.0 to 1.0)
 DATASET_MODE: str = "diffusion"                 # Generation mode: "random" or "diffusion"
-DATASET_DIFFUSION_CKPT: str = "checkpoints/rl_generator/greedy_static_20251205-142015/best.pth"             # Diffusion model checkpoint for dataset generation
+DATASET_DIFFUSION_CKPT: str = "checkpoints/rl_generator/greedy_20251207-181737/best.pth"             # Diffusion model checkpoint for dataset generation
 DATASET_DDIM_STEPS: int = 50                 # DDIM sampling steps for diffusion generation
-DATASET_BATCH_SIZE: int = 10                # Batch size for diffusion generation
+DATASET_BATCH_SIZE: int = 64                # Batch size for diffusion generation
 
 
 # ==============================================================================

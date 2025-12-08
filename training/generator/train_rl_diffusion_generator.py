@@ -97,7 +97,7 @@ def build_argparser() -> argparse.ArgumentParser:
     # [NEW] Control visualization frequency
     p.add_argument("--log_image_every", type=int, default=100, help="Log heatmaps every N episodes")
     # [NEW] Early Stopping
-    p.add_argument("--patience", type=int, default=500, help="Stop if no improvement in generator reward for N episodes")
+    p.add_argument("--patience", type=int, default=2000, help="Stop if no improvement in generator reward for N episodes")
     return p
 
 def _init_planner(planner_type: str, cfg, device: torch.device, ckpt_path: str | None) -> Any:
@@ -313,7 +313,7 @@ class RLGeneratorTrainer:
         # Baseline for variance reduction
         self.baseline = None
         
-        # Prepare condition tensor
+        # Prepare condition tensor from generator params
         from agent.generator.data_utils import prepare_condition
         cond_params = {f"param_{k}": v for k, v in cfg.generator_params.items()}
         self.condition = prepare_condition(cond_params).unsqueeze(0).to(device)
@@ -617,7 +617,7 @@ def main():
             env.depot = new_depot
             cfg.generator_params = {**cfg.generator_params, "depot": new_depot}
 
-        # Prepare Condition
+        # Prepare Condition (use current cfg.generator_params)
         cond_params = {f"param_{k}": v for k, v in cfg.generator_params.items()}
         condition = prepare_condition(cond_params).unsqueeze(0).to(device)
 

@@ -44,6 +44,7 @@ def generate_random_problems(
     num_nodes: int,
     device: torch.device,
     target_num_vehicles: int = 4,
+    max_c: int = DEFAULT_MAX_DEMAND,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Generate random VRP problems (uniform distribution).
@@ -65,7 +66,7 @@ def generate_random_problems(
     
     # Generate demands: [1, MAX_DEMAND] then normalize
     raw_demand = torch.randint(
-        1, DEFAULT_MAX_DEMAND + 1, 
+        1, max_c + 1, 
         (num_problems, num_nodes), 
         device=device, 
         dtype=torch.float
@@ -73,13 +74,13 @@ def generate_random_problems(
     
     # Scale demands to match target vehicles
     # Average total demand ≈ target_num_vehicles * capacity
-    avg_demand = (1 + DEFAULT_MAX_DEMAND) / 2.0  # Expected single node demand
+    avg_demand = (1 + max_c) / 2.0  # Expected single node demand
     expected_total = avg_demand * num_nodes
     target_total = target_num_vehicles  # In normalized units (capacity = 1.0)
     
     # Scale factor
     scale = target_total / (expected_total / DEMAND_NORM)
-    raw_demand = (raw_demand * scale).clamp(1, DEFAULT_MAX_DEMAND)
+    raw_demand = (raw_demand * scale).clamp(1, max_c)
     
     # Normalize by capacity
     node_demand = raw_demand / DEMAND_NORM
@@ -134,8 +135,10 @@ def generate_diffusion_problems(
     model.to(device)
     model.eval()
     
-    # Prepare condition
-    condition = prepare_condition({}).unsqueeze(0).to(device)
+    # Prepare condition (pass generator parameters such as total_demand / max_c)
+    cond_params = generator_params if generator_params is not None else {}
+    cond_prefixed = {f"param_{k}": v for k, v in cond_params.items()}
+    condition = prepare_condition(cond_prefixed).unsqueeze(0).to(device)
     
     # Generate problems in batches
     all_depot_xy = []
@@ -182,8 +185,9 @@ def generate_diffusion_problems(
                 node_xy = torch.stack([node_x, node_y], dim=-1)  # (num_nodes, 2)
                 
                 # Convert demand back to [1, max_c] then re-normalize
-                raw_demand = node_c * DEFAULT_MAX_DEMAND
-                raw_demand = raw_demand.clamp(1, DEFAULT_MAX_DEMAND)
+                max_c = generator_params.get('max_c', DEFAULT_MAX_DEMAND) if generator_params else DEFAULT_MAX_DEMAND
+                raw_demand = node_c * max_c
+                raw_demand = raw_demand.clamp(1, max_c)
                 node_demand = raw_demand / DEMAND_NORM
                 
                 # Random depot (separate from nodes)
@@ -314,6 +318,14 @@ def main():
         "--target-vehicles", type=int, default=4,
         help="Target number of vehicles (controls demand scaling)"
     )
+    parser.add_argument(
+        "--total-demand", type=int, default=60,
+        help="Target total demand (sum of node capacities) per problem before normalization"
+    )
+    parser.add_argument(
+        "--max-c", type=int, default=DEFAULT_MAX_DEMAND,
+        help="Maximum demand per node (integer >=1)"
+    )
     
     # Output settings
     parser.add_argument(
@@ -376,11 +388,12 @@ def main():
     print(f"Generating {num_train} training problems...")
     if args.mode == "random":
         train_depot, train_nodes, train_demand = generate_random_problems(
-            num_train, args.num_nodes, device, args.target_vehicles
+            num_train, args.num_nodes, device, args.target_vehicles, max_c=args.max_c
         )
     else:
         train_depot, train_nodes, train_demand = generate_diffusion_problems(
             args.diffusion_checkpoint, num_train, args.num_nodes, device,
+            generator_params={"total_demand": args.total_demand, "max_c": args.max_c},
             batch_size=args.batch_size, use_ddim=args.use_ddim, ddim_steps=args.ddim_steps
         )
     
@@ -388,11 +401,12 @@ def main():
     print(f"\nGenerating {num_test} test problems...")
     if args.mode == "random":
         test_depot, test_nodes, test_demand = generate_random_problems(
-            num_test, args.num_nodes, device, args.target_vehicles
+            num_test, args.num_nodes, device, args.target_vehicles, max_c=args.max_c
         )
     else:
         test_depot, test_nodes, test_demand = generate_diffusion_problems(
             args.diffusion_checkpoint, num_test, args.num_nodes, device,
+            generator_params={"total_demand": args.total_demand, "max_c": args.max_c},
             batch_size=args.batch_size, use_ddim=args.use_ddim, ddim_steps=args.ddim_steps
         )
     

@@ -37,6 +37,8 @@ NUM_NODES=$(get_config "NUM_NODES")
 TARGET_VEHICLES=$(get_config "TARGET_VEHICLES")
 SEED=$(get_config "SEED")
 DEVICE=$(get_config "DEVICE")
+TOTAL_DEMAND=$(get_config "TOTAL_DEMAND")
+MAX_C=$(get_config "MAX_C")
 
 # =============================================================================
 # Display Configuration
@@ -102,6 +104,8 @@ if [[ "$MODE" == "diffusion" ]]; then
         --use-ddim
         --ddim-steps "$DDIM_STEPS"
         --batch-size "$BATCH_SIZE"
+        --total-demand "$TOTAL_DEMAND"
+        --max-c "$MAX_C"
     )
 fi
 
