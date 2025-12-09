@@ -18,6 +18,7 @@ from agent.planner import RuleBasedPlanner
 from agent.planner import FastReactiveInserter
 from agent.planner import RepairBasedStabilityOptimizer
 from agent.planner import DistributedCooperativePlanner
+from agent.planner import PromptPlanner
 from agent.planner import V2Planner, create_v2_planner
 # reuse tracker & helpers from run_evaluate for run-mode outputs
 from run_evaluate import EvaluationTracker, convert_all, create_output_run_dir
@@ -78,6 +79,15 @@ def build_env(
 		planner_params = dict(cfg.planner_params)
 		planner_params.pop("mode", None)
 		planner = RuleBasedPlanner(full_capacity=cfg.capacity, mode=mode, **planner_params)
+	elif planner_type == "prompt":
+		prompt_params = dict(cfg.prompt_planner_params) if hasattr(cfg, 'prompt_planner_params') else {}
+		planner = PromptPlanner(
+			grid_width=cfg.width,
+			grid_height=cfg.height,
+			full_capacity=cfg.capacity,
+			max_time=cfg.max_time,
+			**prompt_params,
+		)
 	elif planner_type == "fri":
 		# 使用 Fast Reactive Inserter
 		planner = FastReactiveInserter()
@@ -382,6 +392,7 @@ def main() -> None:
 	# Rule-based planner mode (greedy or optimize)
 	parser.add_argument("--rule-mode", choices=["greedy", "optimize"], default=None, 
 						help="Use rule-based planner with specified mode (greedy/optimize)")
+	parser.add_argument("--prompt-planner", action="store_true", help="Use prompt-based planner")
 	parser.add_argument("--gmodel", action="store_true", help="Use neural net demand generator; otherwise rule")
 	parser.add_argument("--service-time", action="store_true", help="Enable service times for demands (vehicles must remain on-site before completion)")
 	parser.add_argument("--num-agents", type=int, default=2, help="Override number of agents for the episode (overrides config)")
@@ -443,12 +454,17 @@ def main() -> None:
 		planner_choice = args.rule_mode
 		planner_kwargs["mode"] = args.rule_mode
 		print(f"[AUTO] Using rule-based planner ({args.rule_mode})")
+	elif args.prompt_planner:
+		# Prompt-based planner
+		planner_choice = "prompt"
+		print(f"[AUTO] Using prompt-based planner")
 	else:
 		# Default: greedy
 		planner_choice = "greedy"
 		planner_kwargs["mode"] = "greedy"
 		print(f"[AUTO] Using default greedy planner")
-	
+
+
 	# Set config planner_type
 	cfg.planner_type = planner_choice
 

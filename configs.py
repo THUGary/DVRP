@@ -116,6 +116,12 @@ class Config:
     # Planner params
     planner_type: str = "rule"  # "rule" | "net" (ATTENTION: this is overwritten in run.py based on args)
     planner_params: Dict[str, Any] = field(default_factory=dict)
+
+    prompt_planner_params: Dict[str, Any] = field(default_factory=lambda: {
+        "model_path": "checkpoints/prompt_vrp/checkpoint-10000.pt",
+        "keys_path": "models_v2/keys_new_16",
+        "augmentation": True,
+    })
     
     # V2Planner params (POMO-based architecture)
     v2_planner_params: Dict[str, Any] = field(default_factory=lambda: {
