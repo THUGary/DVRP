@@ -184,7 +184,7 @@ class PromptPlanner(BasePlanner):
             node_demands = [n[3] for n in nodes]  # 需求
             node_demand_tensor = torch.tensor([node_demands], dtype=torch.float32, device=self.device)
             
-            print(f"Depot形状{depot_tensor.shape=}, Node形状{node_xy_tensor.shape=}, Demand形状{node_demand_tensor.shape=}")
+            # print(f"Depot形状{depot_tensor.shape=}, Node形状{node_xy_tensor.shape=}, Demand形状{node_demand_tensor.shape=}")
             # 解决VRP问题
             distances, routes = self._solver.solve_cvrp(
                 depot_xy=depot_tensor,

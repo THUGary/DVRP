@@ -19,13 +19,16 @@ class Neighborhood:
     """
     
     def __init__(self, center: tuple [float, float],  
-                 rng: random.Random, local_params: dict, env_params: dict, burst_params: dict) -> None:
+                 rng: random.Random, local_params: dict, env_params: dict, burst_params: dict,
+                 target_num_nodes: Optional[int] = None) -> None:
         self.center_x = center[0]
         self.center_y = center[1]
         self.rng = rng
         self.local_params= local_params
         self.env_params = env_params
         self.burst_params = burst_params
+        # If provided, generate exactly this many demands (used when limiting by total node count)
+        self.target_num_nodes = target_num_nodes
 
         # Poisson Process parameters
         self.lambda_param = local_params.get("lambda_param", 0.5)
@@ -40,8 +43,9 @@ class Neighborhood:
         
 
         # Generate Basic demands and Burst demands IN ADVANCE
+        # If `target_num_nodes` is provided, generate exactly that many demands evenly across time
         self.demands= self._generate_demands(self.local_params.get("distribution"),
-                                             burst_mode=self.burst_params.get("burst_mode"))
+                             burst_mode=self.burst_params.get("burst_mode"))
         # print(f"Generated total {len(self.demands)} demands in neighborhood centered at ({self.center_x}, {self.center_y}).")
 
     def sample(self, t: int) -> List[Demand]:
@@ -116,6 +120,10 @@ class Neighborhood:
         """Generate demands according to the specified distribution.\n
         returns basic_demands, burst_demands (empty if burst_mode is False)
         """
+        # If a fixed target number of nodes is requested, use deterministic sampling
+        if getattr(self, 'target_num_nodes', None) is not None:
+            return self._generate_given_num_demands(distribution, self.target_num_nodes)
+
         count, time_series=self._sample_poisson_process(
             max_time=self.max_time, lambda_param=self.lambda_param)
 
@@ -167,6 +175,72 @@ class Neighborhood:
         else:
             return basic_demands
 
+    def _generate_given_num_demands(self, distribution: str, n: int) -> List[Demand]:
+        """Generate exactly `n` demands by evenly sampling times in [0, max_time)
+        and sampling positions from the configured distribution. Excludes depot.
+        Demand quantities c are sampled uniformly from 1..max_c.
+        """
+        if n <= 0:
+            return []
+
+        # Sample integer times uniformly at random from [0, max_time] (inclusive),
+        # then shift the entire sequence so the minimum is 0.
+        mt = max(0, int(math.floor(self.max_time)))
+        # Use randint with high=mt+1 to include mt
+        time_series = np.random.randint(0, mt + 1, size=n).astype(int)
+        time_series.sort()
+        # Shift so the first timestamp is 0
+        t_min = int(time_series.min()) if len(time_series) > 0 else 0
+        time_series = (time_series - t_min).astype(int)
+
+        # Sample positions according to the neighborhood distribution
+        # Use the appropriate sampler requesting `n` points when possible
+        samples = None
+        try:
+            dist = self.local_params.get("distribution")
+            if dist == "uniform":
+                samples = self._sample_uniform_2d(n)
+            elif dist == "gaussian":
+                samples = self._sample_gaussian_2d(n)
+            elif dist == "cluster":
+                samples = self._sample_cluster_2d(n)
+            elif dist == "explosion":
+                samples = self._sample_explosion_2d(n)
+            elif dist == "implosion":
+                samples = self._sample_implosion_2d(n)
+        except Exception:
+            samples = None
+
+        # Fallback to uniform sampling if distribution failed
+        if samples is None:
+            samples = self._sample_uniform_2d(n)
+
+        # Remove any points coinciding with depot
+        samples = self.remove_in_depot(samples)
+
+        # If after removing depot we have fewer than n samples, resample the missing ones uniformly
+        if len(samples) < n:
+            missing = n - len(samples)
+            extra = self._sample_uniform_2d(missing)
+            extra = self.remove_in_depot(extra)
+            if len(extra) > 0:
+                samples = np.vstack((samples, extra)) if len(samples) > 0 else extra
+
+        # Ensure length is exactly n
+        if len(samples) > n:
+            samples = samples[:n]
+
+        demands: List[Demand] = []
+        for i in range(n):
+            px, py = int(samples[i, 0]), int(samples[i, 1])
+            c = int(self.rng.randint(1, self.max_c)) if hasattr(self.rng, 'randint') else int(np.random.randint(1, self.max_c + 1))
+            lifetime = int(self.rng.randint(self.min_lifetime, self.max_lifetime)) if hasattr(self.rng, 'randint') else int(np.random.randint(self.min_lifetime, self.max_lifetime + 1))
+            end_t = int(time_series[i]) + int(lifetime)
+            demand = Demand(x=px, y=py, t=int(time_series[i]), c=c, end_t=end_t)
+            demands.append(demand)
+
+        return demands
+
     def merge_list_by_ids(self,A:List, B:List, A_pos:List[int]) -> List:
         if len(A) != len(A_pos):
             raise ValueError("Length of A and A_pos must be the same.")
@@ -185,17 +259,17 @@ class Neighborhood:
         """Generate basic demands"""
 
         count=len(time_series)
-        sample_count=int(count*2)
+        
         if distribution == "uniform":
-            samples = self._sample_uniform_2d(sample_count)
+            samples = self._sample_uniform_2d(count)
         elif distribution == "gaussian":
-            samples= self._sample_gaussian_2d(sample_count)
+            samples= self._sample_gaussian_2d(count)
         elif distribution == "cluster":
-            samples = self._sample_cluster_2d(sample_count)
-        elif distribution == "explosion":###########
-            samples = self._sample_explosion_2d(sample_count)
+            samples = self._sample_cluster_2d(count)
+        elif distribution == "explosion":
+            samples = self._sample_explosion_2d(count)
         elif distribution == "implosion":
-            samples = self._sample_implosion_2d(sample_count)
+            samples = self._sample_implosion_2d(count)
         else:
             raise ValueError(f"Unknown distribution: {distribution}")
 
@@ -217,17 +291,17 @@ class Neighborhood:
         """Generate burst demands"""
 
         count=len(time_series)
-        sample_count=int(count*2)
+        
         if distribution == "uniform":
-            samples = self._sample_uniform_2d(sample_count,burst_mode=True)
+            samples = self._sample_uniform_2d(count,burst_mode=True)
         elif distribution == "gaussian":
-            samples= self._sample_gaussian_2d(sample_count,burst_mode=True)
+            samples= self._sample_gaussian_2d(count,burst_mode=True)
         elif distribution == "cluster":
-            samples = self._sample_cluster_2d(sample_count,burst_mode=True)
+            samples = self._sample_cluster_2d(count,burst_mode=True)
         elif distribution == "explosion":
-            samples = self._sample_explosion_2d(sample_count,burst_mode=True)
+            samples = self._sample_explosion_2d(count,burst_mode=True)
         elif distribution == "implosion":
-            samples = self._sample_implosion_2d(sample_count,burst_mode=True)
+            samples = self._sample_implosion_2d(count,burst_mode=True)
         else:
             raise ValueError(f"Unknown distribution: {distribution}")
         demands = []
@@ -244,7 +318,7 @@ class Neighborhood:
             demands.append(demand)
         return demands
 
-    def remove_in_depot(self, pts:List[Tuple[int,int]]) -> bool:
+    def remove_in_depot(self, pts:List[Tuple[int,int]]) -> List[Tuple[int,int]]:
         depot = self.env_params.get("depot")
         if depot is None:
             print("No depot info!")
@@ -268,10 +342,34 @@ class Neighborhood:
         x_high=min(self.width-1,math.ceil(self.center_x+size))
         y_low=max(0,math.floor(self.center_y-size))
         y_high=min(self.height-1,math.ceil(self.center_y+size))
-        gx = np.random.randint(int(x_low), int(x_high) + 1, size=n_points)
-        gy = np.random.randint(int(y_low), int(y_high) + 1, size=n_points)
-        # print(f"Uniform samples x in [{x_low},{x_high}], y in [{y_low},{y_high}]")
-        return np.column_stack((gx, gy))
+        # Resample until we have `n_points` that are not in depot
+        max_attempts = int(self.local_params.get("resample_attempts", 10))
+        samples = np.empty((0, 2), dtype=int)
+        attempts = 0
+        while samples.shape[0] < n_points and attempts < max_attempts:
+            need = n_points - samples.shape[0]
+            gx = np.random.randint(int(x_low), int(x_high) + 1, size=need)
+            gy = np.random.randint(int(y_low), int(y_high) + 1, size=need)
+            new = np.column_stack((gx, gy))
+            new = self.remove_in_depot(new)
+            if new is not None and len(new) > 0:
+                samples = np.vstack((samples, new)) if samples.shape[0] > 0 else new
+            attempts += 1
+
+        # Fallback: if still not enough, fill missing entries with neighborhood center
+        if samples.shape[0] < n_points:
+            missing = n_points - samples.shape[0]
+            cx = int(np.clip(int(math.floor(self.center_x)), 0, int(self.width) - 1))
+            cy = int(np.clip(int(math.floor(self.center_y)), 0, int(self.height) - 1))
+            center_pts = np.tile(np.array([cx, cy], dtype=int), (missing, 1))
+            center_pts = self.remove_in_depot(center_pts)
+            if center_pts is not None and len(center_pts) > 0:
+                samples = np.vstack((samples, center_pts)) if samples.shape[0] > 0 else center_pts
+            # If still short (should be rare now), leave as-is — do not fallback to whole-map sampling
+
+        if samples.shape[0] > n_points:
+            samples = samples[:n_points]
+        return samples
 
     def _sample_gaussian_2d(self,n_points:int, burst_mode: bool=False) -> tuple[float, float]:
         """sample a 2D Gaussian point around the center"""
@@ -291,12 +389,37 @@ class Neighborhood:
         cov=np.array([[sigma1**2, cov],
                       [cov, sigma2**2]])
 
-        points= np.random.multivariate_normal(mean, cov , size=n_points)
-        gx = np.floor(points[:, 0]).astype(int)
-        gy = np.floor(points[:, 1]).astype(int)
-        gx = np.clip(gx, 0, int(self.width) - 1)
-        gy = np.clip(gy, 0, int(self.height) - 1)
-        return np.column_stack((gx, gy))
+        # Resample until we have `n_points` that are not in depot
+        max_attempts = int(self.local_params.get("resample_attempts", 10))
+        samples = np.empty((0, 2), dtype=int)
+        attempts = 0
+        while samples.shape[0] < n_points and attempts < max_attempts:
+            need = n_points - samples.shape[0]
+            points = np.random.multivariate_normal(mean, cov, size=need)
+            gx = np.floor(points[:, 0]).astype(int)
+            gy = np.floor(points[:, 1]).astype(int)
+            gx = np.clip(gx, 0, int(self.width) - 1)
+            gy = np.clip(gy, 0, int(self.height) - 1)
+            new = np.column_stack((gx, gy))
+            new = self.remove_in_depot(new)
+            if new is not None and len(new) > 0:
+                samples = np.vstack((samples, new)) if samples.shape[0] > 0 else new
+            attempts += 1
+
+        # Fallback: if still not enough, fill missing entries with neighborhood center
+        if samples.shape[0] < n_points:
+            missing = n_points - samples.shape[0]
+            cx = int(np.clip(int(math.floor(self.center_x)), 0, int(self.width) - 1))
+            cy = int(np.clip(int(math.floor(self.center_y)), 0, int(self.height) - 1))
+            center_pts = np.tile(np.array([cx, cy], dtype=int), (missing, 1))
+            center_pts = self.remove_in_depot(center_pts)
+            if center_pts is not None and len(center_pts) > 0:
+                samples = np.vstack((samples, center_pts)) if samples.shape[0] > 0 else center_pts
+            # If still short (should be rare now), leave as-is — do not fallback to whole-map sampling
+
+        if samples.shape[0] > n_points:
+            samples = samples[:n_points]
+        return samples
     
     def _sample_cluster_2d(self, n_points: int, burst_mode:bool=False) -> np.ndarray:
         """sample points in 2D with exponential decay from center"""
@@ -321,13 +444,35 @@ class Neighborhood:
 
         # sample according to probabilities
         total_cells = W * H
-        indices = np.random.choice(total_cells, size=n_points, replace=(n_points > total_cells), p=probabilities)
+        # Resample until we have `n_points` that are not in depot
+        max_attempts = int(self.local_params.get("resample_attempts", 10))
+        samples = np.empty((0, 2), dtype=int)
+        attempts = 0
+        while samples.shape[0] < n_points and attempts < max_attempts:
+            need = n_points - samples.shape[0]
+            indices = np.random.choice(total_cells, size=need, replace=(need > total_cells), p=probabilities)
+            x_selected = indices % W
+            y_selected = indices // W
+            new = np.column_stack((x_selected, y_selected))
+            new = self.remove_in_depot(new)
+            if new is not None and len(new) > 0:
+                samples = np.vstack((samples, new)) if samples.shape[0] > 0 else new
+            attempts += 1
 
-        # index to (x,y)
-        x_selected = indices % W
-        y_selected = indices // W
+        # Fallback: if still not enough, fill missing entries with neighborhood center
+        if samples.shape[0] < n_points:
+            missing = n_points - samples.shape[0]
+            cx = int(np.clip(int(math.floor(self.center_x)), 0, int(self.width) - 1))
+            cy = int(np.clip(int(math.floor(self.center_y)), 0, int(self.height) - 1))
+            center_pts = np.tile(np.array([cx, cy], dtype=int), (missing, 1))
+            center_pts = self.remove_in_depot(center_pts)
+            if center_pts is not None and len(center_pts) > 0:
+                samples = np.vstack((samples, center_pts)) if samples.shape[0] > 0 else center_pts
+            # If still short (should be rare now), leave as-is — do not fallback to whole-map sampling
 
-        return np.column_stack((x_selected, y_selected))
+        if samples.shape[0] > n_points:
+            samples = samples[:n_points]
+        return samples
 
     def _sample_explosion_2d(self, n_points: int, burst_mode:bool=False) -> np.ndarray:  ##############
         """sample points in 2D with exponential decay from center"""
@@ -352,11 +497,35 @@ class Neighborhood:
         probabilities /= probabilities.sum()
 
         total_cells = W * H
-        indices = np.random.choice(total_cells, size=n_points, replace=(n_points > total_cells), p=probabilities)
-        
-        x_selected = indices % W
-        y_selected = indices // W
-        return np.column_stack((x_selected, y_selected))
+        # Resample until we have `n_points` that are not in depot
+        max_attempts = int(self.local_params.get("resample_attempts", 10))
+        samples = np.empty((0, 2), dtype=int)
+        attempts = 0
+        while samples.shape[0] < n_points and attempts < max_attempts:
+            need = n_points - samples.shape[0]
+            indices = np.random.choice(total_cells, size=need, replace=(need > total_cells), p=probabilities)
+            x_selected = indices % W
+            y_selected = indices // W
+            new = np.column_stack((x_selected, y_selected))
+            new = self.remove_in_depot(new)
+            if new is not None and len(new) > 0:
+                samples = np.vstack((samples, new)) if samples.shape[0] > 0 else new
+            attempts += 1
+
+        # Fallback: if still not enough, fill missing entries with neighborhood center
+        if samples.shape[0] < n_points:
+            missing = n_points - samples.shape[0]
+            cx = int(np.clip(int(math.floor(self.center_x)), 0, int(self.width) - 1))
+            cy = int(np.clip(int(math.floor(self.center_y)), 0, int(self.height) - 1))
+            center_pts = np.tile(np.array([cx, cy], dtype=int), (missing, 1))
+            center_pts = self.remove_in_depot(center_pts)
+            if center_pts is not None and len(center_pts) > 0:
+                samples = np.vstack((samples, center_pts)) if samples.shape[0] > 0 else center_pts
+            # If still short (should be rare now), leave as-is — do not fallback to whole-map sampling
+
+        if samples.shape[0] > n_points:
+            samples = samples[:n_points]
+        return samples
 
     def _sample_implosion_2d(self, n_points: int, burst_mode: bool = False) -> np.ndarray:
         """sample points in 2D with 'implosion' pattern (sharply decaying towards center)"""
@@ -380,11 +549,35 @@ class Neighborhood:
         probabilities /= probabilities.sum()
 
         total_cells = W * H
-        indices = np.random.choice(total_cells, size=n_points, replace=(n_points > total_cells), p=probabilities)
+        # Resample until we have `n_points` that are not in depot
+        max_attempts = int(self.local_params.get("resample_attempts", 10))
+        samples = np.empty((0, 2), dtype=int)
+        attempts = 0
+        while samples.shape[0] < n_points and attempts < max_attempts:
+            need = n_points - samples.shape[0]
+            indices = np.random.choice(total_cells, size=need, replace=(need > total_cells), p=probabilities)
+            x_selected = indices % W
+            y_selected = indices // W
+            new = np.column_stack((x_selected, y_selected))
+            new = self.remove_in_depot(new)
+            if new is not None and len(new) > 0:
+                samples = np.vstack((samples, new)) if samples.shape[0] > 0 else new
+            attempts += 1
 
-        x_selected = indices % W
-        y_selected = indices // W
-        return np.column_stack((x_selected, y_selected))
+        # Fallback: if still not enough, fill missing entries with neighborhood center
+        if samples.shape[0] < n_points:
+            missing = n_points - samples.shape[0]
+            cx = int(np.clip(int(math.floor(self.center_x)), 0, int(self.width) - 1))
+            cy = int(np.clip(int(math.floor(self.center_y)), 0, int(self.height) - 1))
+            center_pts = np.tile(np.array([cx, cy], dtype=int), (missing, 1))
+            center_pts = self.remove_in_depot(center_pts)
+            if center_pts is not None and len(center_pts) > 0:
+                samples = np.vstack((samples, center_pts)) if samples.shape[0] > 0 else center_pts
+            # If still short (should be rare now), leave as-is — do not fallback to whole-map sampling
+
+        if samples.shape[0] > n_points:
+            samples = samples[:n_points]
+        return samples
 
 
 class RuleBasedGenerator(BaseDemandGenerator):
@@ -435,19 +628,47 @@ class RuleBasedGenerator(BaseDemandGenerator):
         
         neighborhoods = []
         max_time = self.params.get("max_time", 100)  # Default max_time if not provided
-        for _ in range(num_centers):
+        # When limiting by number of nodes, distribute remaining nodes evenly across centers
+        assigned_counts = None
+        if self.limit_mode == "num_nodes":
+            total = int(self.remaining_nodes) if getattr(self, 'remaining_nodes', None) is not None else 0
+            # Assign each node independently to a neighborhood with equal probability.
+            # Use numpy multinomial for a concise allocation; numpy's RNG is seeded in reset().
+            if num_centers > 0 and total > 0:
+                probs = [1.0 / num_centers] * num_centers
+                assigned_counts = np.random.multinomial(total, probs).tolist()
+            else:
+                assigned_counts = [0] * num_centers
+
+        for i in range(num_centers):
            # Sample center coordinates
             center_x = self._rng.uniform(0, self.width)
             center_y = self._rng.uniform(0, self.height)
+            # Ensure neighborhood center is not equal to the depot (avoid creating a center exactly at depot)
+            depot_xy = tuple(self.depot) if getattr(self, "depot", None) is not None else None
+            if depot_xy is not None:
+                depot_x, depot_y = depot_xy
+                max_center_attempts = int(self.params.get("center_resample_attempts", 10))
+                attempts = 0
+                while int(center_x) == int(depot_x) and int(center_y) == int(depot_y) and attempts < max_center_attempts:
+                    center_x = self._rng.uniform(0, self.width)
+                    center_y = self._rng.uniform(0, self.height)
+                    attempts += 1
+                # If still equal after retries, nudge slightly away from depot
+                if int(center_x) == int(depot_x) and int(center_y) == int(depot_y):
+                    center_x = min(self.width - 1e-3, center_x + 0.5)
+                    center_y = min(self.height - 1e-3, center_y + 0.5)
             local_max_c=self.params.get("max_c", 50)  # Default max_c if not provided
             
             # Compute lambda_param based on limit mode
             if self.limit_mode == "num_nodes":
-                # Estimate demands per center based on num_nodes
-                lambda_param = self.remaining_nodes / num_centers / max_time
+                # We'll request a fixed number of nodes for this neighborhood instead of Poisson
+                lambda_param = None
+                target_n = assigned_counts[i] if assigned_counts is not None else 0
             else:
                 # Legacy: use total_demand
                 lambda_param = self.total_demand / num_centers / max_time / (1 + local_max_c / 2)
+                target_n = None
             
             distribution=self.params.get("distribution")
             size=self.params.get("neighborhood_size",3)
@@ -510,6 +731,7 @@ class RuleBasedGenerator(BaseDemandGenerator):
                 local_params=local_params,
                 env_params=env_params,
                 burst_params=burst_params,
+                target_num_nodes=target_n,
             )
             neighborhoods.append(neighborhood)
         

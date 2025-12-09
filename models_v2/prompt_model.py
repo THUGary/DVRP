@@ -75,7 +75,7 @@ def rescale_raw_problem(depot_xy:torch.Tensor,
         Demand_scaler = float(node_demand.reshape(-1).max())
         Demand_scaler = Demand_scaler / 10.0 * math.ceil(30 + problem_size / 5) if problem_size > 20 else 2.0 * Demand_scaler
 
-    print(f"Up_Bound: {Up_Bound}, Demand_scaler: {Demand_scaler}")
+    # print(f"Up_Bound: {Up_Bound}, Demand_scaler: {Demand_scaler}")
 
     if Up_Bound <= 0:
         raise ValueError("Up_Bound must be positive.")
