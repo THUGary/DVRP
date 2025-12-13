@@ -63,9 +63,9 @@ class PromptPlanner(BasePlanner):
         problem_size: int = None,
         pomo_size: int = None,
         device: str = "cuda",
-        grid_width: int = 20,
-        grid_height: int = 20,
-        full_capacity: int = 30,  # 固定车辆容量
+        grid_width: int = None,
+        grid_height: int = None,
+        full_capacity: int = None,
         max_time: int = 100,
         use_augmentation: bool = True,
         **params,
@@ -82,10 +82,18 @@ class PromptPlanner(BasePlanner):
         self.max_time = max_time
         self.use_augmentation = use_augmentation
         
-        # 标准化常量（使用与v2_planner相同的常量）
-        self.coord_norm = COORD_NORM
-        self.demand_norm = DEMAND_NORM
-        self.capacity_norm = float(full_capacity)
+        if grid_width is not None and grid_height is not None:
+            max_coord = max(grid_width, grid_height)
+            self.coord_norm = float(max_coord)
+        else:
+            self.coord_norm = float(COORD_NORM)
+        
+        if full_capacity is not None:
+            self.capacity_norm = float(full_capacity)
+            self.demand_norm = float(full_capacity)
+        else:
+            self.capacity_norm = float(DEMAND_NORM)
+            self.demand_norm = float(DEMAND_NORM)
         self.time_norm = float(max_time)
         
         # 模型车辆容量（用于归一化）

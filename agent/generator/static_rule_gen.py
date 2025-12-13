@@ -600,6 +600,7 @@ class StaticDemandGen(BaseDemandGenerator):
         
         # num_nodes takes priority if provided
         self.remaining_nodes = self.params.get("num_nodes", None)
+
         if self.remaining_nodes is not None:
             self.remaining_nodes = int(self.remaining_nodes)
             self.limit_mode = "num_nodes"
@@ -626,7 +627,7 @@ class StaticDemandGen(BaseDemandGenerator):
         # When limiting by number of nodes, distribute remaining nodes evenly across centers
         assigned_counts = None
         if self.limit_mode == "num_nodes":
-            total = int(self.remaining_nodes) if getattr(self, 'remaining_nodes', None) is not None else 0
+            total = int(self.remaining_nodes) if self.remaining_nodes is not None else 0
             # Assign each node independently to a neighborhood with equal probability.
             # Use numpy multinomial for a concise allocation; numpy's RNG is seeded in reset().
             if num_centers > 0 and total > 0:
@@ -739,6 +740,9 @@ class StaticDemandGen(BaseDemandGenerator):
         - num_nodes mode: limit by total number of demand nodes
         - total_demand mode: limit by sum of all demand capacities (legacy)
         """
+
+        if t>0:
+            return []
         # Check if we've exhausted our quota
         if self.limit_mode == "num_nodes":
             if getattr(self, "remaining_nodes", 0) <= 0:
@@ -751,7 +755,7 @@ class StaticDemandGen(BaseDemandGenerator):
 
         # Sample demand points from all concentrated generation areas
         # and resample those coinciding with depot or already-occupied positions
-        max_tries = int(self.params.get("resample_depot_overlap_max_tries", 8))
+        max_tries = int(self.width * self.height/len(self.neighborhoods))  # Max resample attempts per demand
         depot_xy = tuple(self.depot) if getattr(self, "depot", None) is not None else None
         occupied = getattr(self, "_occupied_positions", set())
         
@@ -782,9 +786,8 @@ class StaticDemandGen(BaseDemandGenerator):
                         occupied.add(new_xy)
                         all_demands.append(Demand(x=int(new_xy[0]), y=int(new_xy[1]), t=d.t, c=d.c, end_t=d.end_t))
                     else:
-                        # give up: drop this demand (rare)
-                        # print(f"Dropped overlapping demand at ({d.x}, {d.y}) after {max_tries} resample attempts.")
-                        continue
+                        # If resampling fails, keep original and let merge_demands_on_map handle it
+                        all_demands.append(d)
                 else:
                     occupied.add(pos)
                     all_demands.append(d)
@@ -792,6 +795,7 @@ class StaticDemandGen(BaseDemandGenerator):
         # Update occupied positions
         self._occupied_positions = occupied
 
+        
         # Merge demands fallen into the same grid cell (should be rare now)
         merged_demands = self.merge_demands_on_map(all_demands)
         

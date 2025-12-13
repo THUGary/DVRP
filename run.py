@@ -44,6 +44,7 @@ def build_env(
 		if cfg.generator_type =="rule":
 			from agent.generator.static_rule_gen import StaticDemandGen
 			gen = StaticDemandGen(cfg.width, cfg.height, **cfg.generator_params)
+			
 		else:
 			raise ValueError("Static demands only supported with 'rule' generator type.")
 
@@ -199,7 +200,7 @@ def run_episode(
 		return obj
 
 	if render:
-		renderer = PygameRenderer(cfg.width, cfg.height, cell_size=20)
+		renderer = PygameRenderer(cfg.width, cfg.height, cell_size=10)
 		renderer.init()
 
 	while not done:
@@ -404,7 +405,7 @@ def main() -> None:
 	parser.add_argument("--static-demands", action="store_true", help="Release all demands at time 0 to visualize static VRP instances")
 	parser.add_argument("--static-max-end", type=int, default=None, help="Max environment time for static demands (default: 2 * max_time)")
 	parser.add_argument("--max-steps", type=int, default=None, help="Maximum episode steps (default: no limit)")
-	parser.add_argument("--static-ckpt", type=str, help="Path to V2 static model checkpoint (enables model planner)")
+	parser.add_argument("--static-ckpt", type=str, default='./checkpoints/static_vrp_v2/best_n80.pt', help="Path to V2 static model checkpoint (enables model planner)")
 	parser.add_argument("--adapter-ckpt", type=str, default=None, help="Path to V2 dynamic adapter checkpoint (enables dynamic mode)")
 	args = parser.parse_args()
 

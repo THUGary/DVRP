@@ -5,11 +5,11 @@
 # Choose condition, condtion=0 for a single instance test,
 # condtion=2 for a single instance test with dynamic adapter,
 # condtion=1 for full benchmark (on solomon)
-condition=0
+condition=3
 
 # Another arguments
 FPS=${FPS:-10}
-Planner_Choice=${Planner_Choice:-static} # static | dcp | greedy | fri | rbso | dynamic (model) |
+Planner_Choice=${Planner_Choice:-static} # static| dcp | greedy | fri | rbso | dynamic (model) |
 Static_Ckpt=${Static_Ckpt:-./checkpoints/static_vrp_v2/best_n80.pt}
 Adapter_Ckpt=${Adapter_Ckpt:-./checkpoints/dynamic_adapter_v2_new/best_adapter_rl.pt}
 
@@ -18,8 +18,16 @@ if [ $condition -eq 0 ]; then
     python benchmark.py \
         --render --fps ${FPS} \
         --service-time \
-        --planner ${Planner_Choice} \
         --static-ckpt ${Static_Ckpt} \
+        --static-demands \
+    
+    exit 0
+elif [ $condition -eq 3 ]; then
+    echo "Running single instance test with prompt planner..."
+    python benchmark.py \
+        --render --fps ${FPS} \
+        --service-time \
+        --prompt-planner \
         --static-demands \
     
     exit 0
@@ -28,7 +36,6 @@ elif [ $condition -eq 2 ]; then
     python benchmark.py \
         --render --fps ${FPS} \
         --service-time \
-        --planner dynamic \
         --adapter-ckpt ${Adapter_Ckpt} \
     
     exit 0
@@ -38,7 +45,6 @@ elif [ $condition -eq 1 ]; then
     python benchmark.py \
         --static-demands \
         --service-time \
-        --planner ${Planner_Choice} \
         --static-ckpt ${Static_Ckpt} \
         --least-vehs \
         --test-all

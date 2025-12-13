@@ -58,9 +58,9 @@ DEFAULT_MAX_DEMAND: int = 5  # Fixed max demand per node (model sees 5/30=0.167)
 @dataclass
 class Config:
     # Environment
-    width: int = 20
-    height: int = 20
-    num_agents: int = 2
+    width: int = 100 #20
+    height: int = 100 #20
+    num_agents: int = 10 # 2
     capacity: int = DEFAULT_CAPACITY  # Use centralized default (30)
     depot: Tuple[int, int] = (0, 0)
     max_time: int = 100 # the value has to be consistent with generator_params' max_time
@@ -96,7 +96,7 @@ class Config:
         # Limiting modes (num_nodes takes priority if set):
         # - num_nodes: limit by number of demand nodes (preferred)
         # - total_demand: limit by sum of all demand capacities (legacy)
-        "num_nodes": 20,  # Number of demand nodes to generate
+        "num_nodes": 100,  # Number of demand nodes to generate
         "total_demand": 60,  # Legacy: upper limit of sum of all demands (used if num_nodes not set)
         "max_c": 5, # from 1 to 10
         "min_lifetime": 40,
@@ -106,7 +106,7 @@ class Config:
         "service_time_per_unit": 0.0,
 
         "num_centers": 6,
-        "distribution": "gaussian",  # "uniform" | "gaussian" | "cluster"
+        "distribution": "explosion",  # "uniform" | "gaussian" | "cluster" | "implosion" | "explosion"
         "neighborhood_size": 5, # 3-15, the average radius of the concentrated generation areas
         "burst_prob": 0.1, # 0.0 - 1.0, probability of bursting demands among all demands
         # Checkpoint path for the network-based generator (only used when generator_type="net")

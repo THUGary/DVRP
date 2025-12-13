@@ -3,7 +3,7 @@ import argparse
 import random
 import os
 import copy
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 import pandas as pd
 
 from configs import Config
@@ -17,6 +17,7 @@ from agent.planner import RuleBasedPlanner
 from agent.planner import FastReactiveInserter
 from agent.planner import RepairBasedStabilityOptimizer
 from agent.planner import DistributedCooperativePlanner
+from agent.planner import PromptPlanner
 from agent.planner import V2Planner, create_v2_planner
 from agent.generator.benchmark_gen import BenchmarkGenerator
 
@@ -50,7 +51,7 @@ def get_benchmark_config(dataset_basepath: str, problem_type: str,instance_info:
 	solution_summary=pd.read_csv(solution_summary_path)
 	solution_info=solution_summary[solution_summary['problem_name']==problem_name]
 	least_num_vehicles= solution_info['vehicle_number'].values[0]
-	print(f"Least number of vehicles used in known solution: {least_num_vehicles}")
+	print(f"Least number of vehicles used in the best known solution: {least_num_vehicles}")
 
 	env_map_size={
 		"solomon": (100,100),
@@ -127,6 +128,16 @@ def build_env(cfg: Config, planner_type: str, static_demands: bool) -> Tuple[Gri
 	elif planner_type == "dcp":
 		# 使用 Distributed Cooperative Planner（带参数）
 		planner = DistributedCooperativePlanner(auction_rounds=5, bid_strategy='time_urgency')
+	elif planner_type == "prompt":
+		prompt_params = dict(getattr(cfg, 'prompt_planner_params', {}))
+		print(f"PromptPlanner params: {prompt_params}")
+		planner = PromptPlanner(
+			grid_width=cfg.width,
+			grid_height=cfg.height,
+			full_capacity=cfg.capacity,
+			max_time=cfg.max_time,
+			**prompt_params,
+		)
 	elif planner_type in ("model", "static", "dynamic"):
 		# Use V2Planner for model/static/dynamic
 		v2_params = dict(getattr(cfg, 'v2_planner_params', {}))
@@ -241,27 +252,69 @@ def run_episode(cfg: Config, seed: int = 0, render: bool = False, fps: int = 10,
 	print(f"Total new demands so far: {total_demand_count}")
 
 
-def gen_plan_choice(args: argparse.Namespace, cfg)->str:
-	"""Simplified planner selection for V2Planner architecture"""
-	planner_choice = getattr(args, 'planner', 'greedy')
+def update_cfg_from_args(cfg: Config, args: argparse.Namespace) -> Tuple[Config, str]:
+	"""Update config from args and determine planner choice, similar to run.py logic"""
+	if args.num_agents is not None and args.num_agents > 0:
+		cfg.num_agents = int(args.num_agents)
+	# Handle map size: prefer --map-size over --map-wid/--map-hei
+	if args.map_size is not None and args.map_size > 0:
+		cfg.width = int(args.map_size)
+		cfg.height = int(args.map_size)
+	else:
+		if args.map_wid is not None and args.map_wid > 0:
+			cfg.width = int(args.map_wid)
+		if args.map_hei is not None and args.map_hei > 0:
+			cfg.height = int(args.map_hei)
+	if args.total_demand is not None and args.total_demand > 0:
+		cfg.generator_params["total_demand"] = int(args.total_demand)
+	if args.num_nodes is not None and args.num_nodes > 0:
+		cfg.generator_params["num_nodes"] = int(args.num_nodes)
+
+	# Override max_end_time for static demands if specified
+	if args.static_max_end is not None and args.static_max_end > 0:
+		cfg.max_end_time = int(args.static_max_end)
+
+	# Auto-detect planner based on checkpoint arguments
+	# Priority: model (with checkpoints) > rule-mode > greedy (default)
+	planner_choice: str
 	
-	# Map "model" to "dynamic" for backwards compatibility  
-	if planner_choice == "model":
-		planner_choice = "dynamic"
-	
-	cfg.planner_type = planner_choice
-	
-	# Handle V2Planner checkpoint overrides
-	if planner_choice in ("static", "dynamic"):
+	if args.static_ckpt:
+		# Model planner: static or dynamic based on adapter presence
+		if args.adapter_ckpt:
+			planner_choice = "dynamic"
+			print(f"[AUTO] Using dynamic model (static + adapter)")
+		else:
+			planner_choice = "static"
+			print(f"[AUTO] Using static model only")
+		# Set checkpoint paths
 		if not hasattr(cfg, 'v2_planner_params'):
 			cfg.v2_planner_params = {}
-		if hasattr(args, 'static_ckpt') and args.static_ckpt:
-			cfg.v2_planner_params["static_ckpt"] = args.static_ckpt
-		if hasattr(args, 'adapter_ckpt') and args.adapter_ckpt and planner_choice == "dynamic":
+		cfg.v2_planner_params["static_ckpt"] = args.static_ckpt
+		if args.adapter_ckpt:
 			cfg.v2_planner_params["adapter_ckpt"] = args.adapter_ckpt
+	elif args.rule_mode:
+		# Explicit rule-based planner mode
+		planner_choice = args.rule_mode
+		# planner_kwargs["mode"] = args.rule_mode # benchmark.py handles this differently usually
+		print(f"[AUTO] Using rule-based planner ({args.rule_mode})")
+	elif args.prompt_planner:
+		# Prompt-based planner
+		planner_choice = "prompt"
+		print(f"[AUTO] Using prompt-based planner")
+	else:
+		# Default: use args.planner (defaulting to greedy)
+		planner_choice = getattr(args, 'planner', 'greedy')
+		if planner_choice == "model":
+			planner_choice = "dynamic"
+		print(f"[AUTO] Using planner: {planner_choice}")
 
+	# Set config planner_type
+	cfg.planner_type = planner_choice
+
+	# Generator: net if --gmodel else keep default (rule)
 	if args.gmodel:
 		cfg.generator_type = "net"
+	
 	return cfg, planner_choice
 
 def main() -> None:
@@ -272,8 +325,8 @@ def main() -> None:
 	parser.add_argument("--seed", type=int, default=2025, help="Random seed (default: 2025)")
 	parser.add_argument("--render", action="store_true", help="Use pygame to visualize")
 	parser.add_argument("--fps", type=int, default=10, help="Render FPS when --render (default: 10)")
-	parser.add_argument("--planner", choices=["greedy", "model", "static", "dynamic", "fri", "rbso", "dcp"], 
-						default="greedy", help="Planner type: greedy (rule-based), model/static/dynamic (V2Planner), fri, rbso, dcp")
+	parser.add_argument("--rule-mode", choices=["greedy", "optimize"], default=None, help="Use rule-based planner with specified mode (greedy/optimize)")
+	parser.add_argument("--prompt-planner", action="store_true", help="Use prompt-based planner")
 	parser.add_argument("--gmodel", action="store_true", help="Use neural net demand generator; otherwise rule")
 	parser.add_argument("--service-time", action="store_true", help="Enable service times for demands (vehicles must remain on-site before completion)")
 	parser.add_argument("--test-all", action="store_true", help="Run all instances in the specified dataset (not implemented yet)")
@@ -282,6 +335,16 @@ def main() -> None:
 	parser.add_argument("--static-ckpt", type=str, default=None, help="Override path to V2 static model checkpoint")
 	parser.add_argument("--adapter-ckpt", type=str, default=None, help="Override path to V2 dynamic adapter checkpoint")
 	parser.add_argument("--static-demands", action="store_true", help="Use static demands for the benchmark instance")
+	# Added arguments from run.py
+	parser.add_argument("--num-agents", type=int, default=None, help="Override number of agents for the episode (overrides config)")
+	parser.add_argument("--map-size", type=int, default=None, help="Override map size (square map: map_size × map_size)")
+	parser.add_argument("--map-wid", type=int, default=None, help="Override map width (deprecated, use --map-size)")
+	parser.add_argument("--map-hei", type=int, default=None, help="Override map height (deprecated, use --map-size)")
+	parser.add_argument("--total-demand", type=int, default=None, help="Override total demand capacity (upper limit of sum of all demands)")
+	parser.add_argument("--num-nodes", type=int, default=None, help="Override number of demand nodes")
+	parser.add_argument("--static-max-end", type=int, default=None, help="Max environment time for static demands (default: 2 * max_time)")
+	
+
 	args = parser.parse_args()
 
 	dataset_basepath = "./VrptwDataset/solomon_reformed"  # specify your dataset base path here
@@ -300,7 +363,7 @@ def main() -> None:
 			cfg = get_benchmark_config(dataset_basepath, problem_type, instance_info, least_vehicles)
 			cfg.include_service_time = bool(args.service_time)
 			print(f"Service time enabled: {cfg.include_service_time}")
-			cfg, planner_choice = gen_plan_choice(args, cfg)
+			cfg, planner_choice = update_cfg_from_args(cfg, args)
 			# Run, here the seed does need to be set
 			run_episode(cfg, seed=args.seed, render=args.render, 
 			   fps=args.fps, planner=planner_choice, static_demands=static_demands)
@@ -315,7 +378,7 @@ def main() -> None:
 
 		cfg = get_benchmark_config(dataset_basepath, problem_type, instance_info, least_vehicles)
 		cfg.include_service_time = bool(args.service_time)
-		cfg, planner_choice = gen_plan_choice(args, cfg)
+		cfg, planner_choice = update_cfg_from_args(cfg, args)
 		run_episode(cfg, seed=args.seed, render=args.render, 
 			   fps=args.fps, planner=planner_choice, static_demands=static_demands)
 	

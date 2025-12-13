@@ -335,7 +335,7 @@ class GridEnvironment:
 					)
 					capacity_reward += float(demand.c)
 					served_count += 1
-					print(f"Agent {agent_idx} completed service of demand at ({demand.x}, {demand.y}) with capacity {demand.c}.")
+					# print(f"Agent {agent_idx} completed service of demand at ({demand.x}, {demand.y}) with capacity {demand.c}.")
 					served_capacity += float(demand.c)
 					served_details.append((demand.x, demand.y, float(demand.c)))
 					new_active_services.pop(agent_idx, None)
